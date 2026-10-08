@@ -64,6 +64,8 @@ pub struct AppConfig {
     pub user_id: Option<Uuid>,
     pub actor_type: ActorType,
     pub team_role: TeamRole,
+    /// Shared API tokens (CHUM_MEM_API_TOKENS, comma-separated). Empty = auth disabled.
+    pub api_tokens: Vec<String>,
     pub worker_poll_interval_ms: u64,
     pub worker_concurrency: usize,
     pub knowledge_graph_max_cluster_nodes: u32,
@@ -132,6 +134,14 @@ impl AppConfig {
             user_id: optional_parse(values, "CHUM_MEM_USER_ID")?,
             actor_type: parse_or_default(values, "CHUM_MEM_ACTOR_TYPE", ActorType::System)?,
             team_role: parse_or_default(values, "CHUM_MEM_TEAM_ROLE", TeamRole::Admin)?,
+            api_tokens: optional(values, "CHUM_MEM_API_TOKENS")
+                .map(|raw| {
+                    raw.split(',')
+                        .map(|token| token.trim().to_string())
+                        .filter(|token| !token.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
             worker_poll_interval_ms: parse_or_default(values, "WORKER_POLL_INTERVAL_MS", 5_000u64)?,
             worker_concurrency: parse_or_default(values, "WORKER_CONCURRENCY", 4usize)?,
             knowledge_graph_max_cluster_nodes: parse_or_default(

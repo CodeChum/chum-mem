@@ -372,6 +372,47 @@ async fn admin_reembed(
         .into_response())
 }
 
+/// Shared-token authentication. When `CHUM_MEM_API_TOKENS` is set, every request
+/// except `/health`, `/ready` and CORS preflight must carry one of the tokens in
+/// `X-Chum-Token` or `Authorization: Bearer …`. With no tokens configured the
+/// API is open (logged at startup) — acceptable only behind a private network.
+async fn require_api_token(
+    State(state): State<ApiState>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let tokens = &state.config.api_tokens;
+    if tokens.is_empty() {
+        return next.run(request).await;
+    }
+    let path = request.uri().path();
+    if request.method() == Method::OPTIONS || path == "/health" || path == "/ready" {
+        return next.run(request).await;
+    }
+    let presented = request
+        .headers()
+        .get("x-chum-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            request
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .map(str::trim)
+                .map(str::to_string)
+        });
+    match presented {
+        Some(token) if tokens.iter().any(|known| known == &token) => next.run(request).await,
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "missing or invalid API token (X-Chum-Token)"})),
+        )
+            .into_response(),
+    }
+}
+
 async fn session_start(
     State(state): State<ApiState>,
     Json(input): Json<StartSessionRequest>,
@@ -1111,6 +1152,10 @@ fn router(state: ApiState) -> Router {
         .route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_delete))
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .layer(cors)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_api_token,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -1155,6 +1200,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding API listener on {address}"))?;
 
+    if config.api_tokens.is_empty() {
+        tracing::warn!("CHUM_MEM_API_TOKENS is not set: the API accepts unauthenticated requests");
+    } else {
+        info!(tokens = config.api_tokens.len(), "API token authentication enabled");
+    }
     info!(address = %address, "starting Rust API");
 
     axum::serve(listener, router(state))

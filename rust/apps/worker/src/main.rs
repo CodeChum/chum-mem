@@ -392,9 +392,11 @@ async fn derive_session_memories_job(
         "defer": false,
     });
     let url = format!("{}v1/ingest/session/end", config.dashboard_api_url.as_str());
-    let response = http_client
-        .post(&url)
-        .json(&body)
+    let mut request = http_client.post(&url).json(&body);
+    if let Some(token) = config.api_tokens.first() {
+        request = request.header("X-Chum-Token", token);
+    }
+    let response = request
         .send()
         .await
         .map_err(|error| format!("derive-session-memories HTTP request failed: {error}"))?;

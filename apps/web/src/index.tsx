@@ -64,7 +64,11 @@ app.get('/', (_req, res) => {
 });
 
 async function proxyJson(target: string, init?: RequestInit): Promise<Response> {
-  const response = await fetch(`${env.DASHBOARD_API_URL}${target}`, init);
+  // Forward the shared API token when the API has CHUM_MEM_API_TOKENS set.
+  const token = process.env.CHUM_MEMORY_API_TOKEN;
+  const headers = new Headers(init?.headers ?? {});
+  if (token) headers.set('X-Chum-Token', token);
+  const response = await fetch(`${env.DASHBOARD_API_URL}${target}`, { ...init, headers });
   const body = await response.text();
   return new Response(body, {
     status: response.status,

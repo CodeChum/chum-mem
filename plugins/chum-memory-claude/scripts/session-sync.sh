@@ -16,6 +16,10 @@
 set -euo pipefail
 
 API_URL="${CHUM_MEMORY_API_URL:-http://localhost:63001}"
+# ── API token (optional): sent as X-Chum-Token on every call. Single-word
+# header so it can be expanded unquoted under bash 3.2 with `set -u`.
+AUTH_HEADER=""
+if [[ -n "${CHUM_MEMORY_API_TOKEN:-}" ]]; then AUTH_HEADER="-HX-Chum-Token:${CHUM_MEMORY_API_TOKEN}"; fi
 PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-${CODEX_PROJECT_DIR:-$PWD}}"
 CACHE_DIR="${PROJECT_ROOT}/.chum-cache"
 PROJECT_ID="${CHUM_MEM_PROJECT_ID:-}"
@@ -102,12 +106,12 @@ flush_one() {
     kind=$(printf '%s' "$line" | jq -r '.kind // "event"')
     start=$(printf '%s' "$line" | jq -c '.start')
     body=$(printf '%s' "$line" | jq -c '.body')
-    sid=$(curl -sS --max-time 10 -X POST -H 'Content-Type: application/json' -d "$start" \
+    sid=$(curl -sS $AUTH_HEADER --max-time 10 -X POST -H 'Content-Type: application/json' -d "$start" \
       "${API_URL}/v1/ingest/session/start" 2>/dev/null | jq -r '.sessionId // empty' 2>/dev/null) || sid=""
     [[ -n "$sid" ]] || break
     body=$(printf '%s' "$body" | jq -c --arg sid "$sid" '.sessionId = $sid')
     case "$kind" in end) ep="session/end" ;; *) ep="session/event" ;; esac
-    code=$(curl -sS --max-time 15 -o /dev/null -w "%{http_code}" -X POST \
+    code=$(curl -sS $AUTH_HEADER --max-time 15 -o /dev/null -w "%{http_code}" -X POST \
       -H 'Content-Type: application/json' -d "$body" "${API_URL}/v1/ingest/${ep}" 2>/dev/null) || code="000"
     [[ "$code" == 2* ]] || break
     sent=$((sent + 1))
@@ -145,7 +149,7 @@ ensure_session_started() {
   payload=$(session_start_payload)
 
   local response http_code
-  response=$(curl -sS --max-time 10 \
+  response=$(curl -sS $AUTH_HEADER --max-time 10 \
     -o /tmp/chum-session-start-resp.$$.json \
     -w "%{http_code}" \
     -X POST \
@@ -225,7 +229,7 @@ post_event() {
     spool_line event "$full_payload"
     return 0
   fi
-  http_code=$(curl -sS --max-time 10 \
+  http_code=$(curl -sS $AUTH_HEADER --max-time 10 \
     -o /tmp/chum-session-event-resp.$$.json \
     -w "%{http_code}" \
     -X POST \
@@ -281,7 +285,7 @@ end_session() {
     '{sessionId: $sessionId, summary: $summary}')
 
   local http_code
-  http_code=$(curl -sS --max-time 30 \
+  http_code=$(curl -sS $AUTH_HEADER --max-time 30 \
     -o /tmp/chum-session-end-resp.$$.json \
     -w "%{http_code}" \
     -X POST \

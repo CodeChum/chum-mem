@@ -18,6 +18,10 @@ set -uo pipefail
 
 ROOT_DIR="${1:-$PWD}"
 API_URL="${2:-${CHUM_MEMORY_API_URL:-http://localhost:63001}}"
+# ── API token (optional): sent as X-Chum-Token on every call. Single-word
+# header so it can be expanded unquoted under bash 3.2 with `set -u`.
+AUTH_HEADER=""
+if [[ -n "${CHUM_MEMORY_API_TOKEN:-}" ]]; then AUTH_HEADER="-HX-Chum-Token:${CHUM_MEMORY_API_TOKEN}"; fi
 CACHE_DIR="${ROOT_DIR}/.chum-cache"
 RULES_FILE="${CACHE_DIR}/sync-rules.json"
 PROJECT_ID="${CHUM_MEM_PROJECT_ID:-}"
@@ -33,7 +37,7 @@ if [[ -f "${ROOT_DIR}/.chum-sync-rules.json" ]]; then
 fi
 
 if [[ ! -f "$RULES_FILE" ]]; then
-  curl -sf --max-time 5 "${API_URL}/api/knowledge/sync-rules" > "$RULES_FILE" 2>/dev/null || {
+  curl -sf $AUTH_HEADER --max-time 5 "${API_URL}/api/knowledge/sync-rules" > "$RULES_FILE" 2>/dev/null || {
     cat > "$RULES_FILE" <<'RULES'
 {"codeExtensions":["ts","tsx","js","jsx","mjs","cjs","py","go","rs","java","c","cc","cpp","h","hpp","cxx","hxx","rb","cs","kt","kts","scala","php","swift","lua","zig","ps1","sh","sql","css","scss","sass","less","vue","svelte","astro","m","mm","jl","dart"],"docExtensions":["md","mdx","html","htm","txt","rst","yaml","yml","json","jsonc","docx","xlsx","pptx","pdf","png","jpg","jpeg","webp","gif","mp4","mov","m4v","mp3","wav"],"binaryExtensions":["docx","xlsx","pptx","pdf","png","jpg","jpeg","webp","gif","mp4","mov","m4v","mp3","wav"],"ignoreDirs":[".git","node_modules","dist","build","out","target","__pycache__","venv",".venv",".next",".nuxt","coverage",".turbo",".cache","graphify-out"],"ignoreFiles":[".DS_Store","package-lock.json","pnpm-lock.yaml","yarn.lock","bun.lockb","Cargo.lock"],"ignorePatterns":[".env*","*.pem","*.key","*.crt","*.min.js","*.min.css","*.map","*.d.ts","*.generated.ts","*.generated.js"],"maxFileSizeBytes":262144,"maxBinaryFileSizeBytes":16777216}
 RULES
@@ -163,8 +167,11 @@ for i, files in enumerate(chunks):
     if project_id:
         payload["projectId"] = project_id
     body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if os.environ.get("CHUM_MEMORY_API_TOKEN"):
+        headers["X-Chum-Token"] = os.environ["CHUM_MEMORY_API_TOKEN"]
     req = urllib.request.Request(f"{api_url}/api/knowledge/repository-sync", data=body,
-                                 headers={"Content-Type": "application/json"}, method="POST")
+                                 headers=headers, method="POST")
     t1 = time.time()
     try:
         with urllib.request.urlopen(req, timeout=timeout_secs) as resp:

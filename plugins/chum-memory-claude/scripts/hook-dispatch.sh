@@ -51,9 +51,19 @@ export CHUM_PROVIDER="$PROVIDER"
 # ── Health gate — if the API is slow or down, DO NOT drop the event: run the
 # session layer in spool mode (events go to .chum-cache/outbox.jsonl and are
 # flushed on a later hook), skip the repository layer, and tell the model.
-API_URL="${CHUM_MEMORY_API_URL:-http://localhost:63001}"
+# Server URL: env wins; else the committed .chum-mem "apiUrl"; else localhost.
+API_URL="${CHUM_MEMORY_API_URL:-}"
+if [[ -z "$API_URL" && -f "${PROJECT_DIR}/.chum-mem" ]]; then
+  API_URL=$(jq -r '.apiUrl // empty' "${PROJECT_DIR}/.chum-mem" 2>/dev/null || true)
+fi
+API_URL="${API_URL:-http://localhost:63001}"
+export CHUM_MEMORY_API_URL="$API_URL"
+# ── API token (optional): sent as X-Chum-Token on every call. Single-word
+# header so it can be expanded unquoted under bash 3.2 with `set -u`.
+AUTH_HEADER=""
+if [[ -n "${CHUM_MEMORY_API_TOKEN:-}" ]]; then AUTH_HEADER="-HX-Chum-Token:${CHUM_MEMORY_API_TOKEN}"; fi
 API_HEALTHY=1
-if ! curl -sf --max-time "${CHUM_HEALTH_TIMEOUT_SECS:-2}" "${API_URL}/health" >/dev/null 2>&1; then
+if ! curl -sf $AUTH_HEADER --max-time "${CHUM_HEALTH_TIMEOUT_SECS:-2}" "${API_URL}/health" >/dev/null 2>&1; then
   API_HEALTHY=0
 fi
 export CHUM_API_HEALTHY="$API_HEALTHY"
@@ -98,7 +108,7 @@ fi
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 RESOLVE_PAYLOAD=$(jq -n --arg projectId "$CANDIDATE_PROJECT_ID" --arg name "$PROJECT_NAME" \
   '{projectId: $projectId, name: $name}')
-RESOLVE_RESP=$(curl -sf --max-time 5 -X POST -H "Content-Type: application/json" \
+RESOLVE_RESP=$(curl -sf $AUTH_HEADER --max-time 5 -X POST -H "Content-Type: application/json" \
   -d "$RESOLVE_PAYLOAD" "${API_URL}/v1/projects/resolve" 2>/dev/null) || RESOLVE_RESP=""
 if [[ -n "$RESOLVE_RESP" ]]; then
   RESOLVED_PROJECT_ID=$(echo "$RESOLVE_RESP" | jq -r '.projectId // ""' 2>/dev/null || echo "")
@@ -172,7 +182,7 @@ fetch_prompt_memory_escaped() {
   [[ ${#prompt} -ge 12 && "$prompt" != /* ]] || return 1
   limit="${CHUM_AUTO_RECALL_LIMIT:-5}"
   body=$(jq -n --arg q "${prompt:0:800}" --arg pid "${CHUM_MEM_PROJECT_ID:-}" --argjson n "$limit"     '{query:$q, mode:"hybrid", limit:$n, disclosureLevel:"overview"} + (if $pid != "" then {projectId:$pid} else {} end)')
-  resp=$(curl -sf --max-time "${CHUM_AUTO_RECALL_TIMEOUT_SECS:-6}" -X POST -H 'Content-Type: application/json'     -d "$body" "${api_url}/api/search" 2>/dev/null) || return 1
+  resp=$(curl -sf $AUTH_HEADER --max-time "${CHUM_AUTO_RECALL_TIMEOUT_SECS:-6}" -X POST -H 'Content-Type: application/json'     -d "$body" "${api_url}/api/search" 2>/dev/null) || return 1
   md=$(printf '%s' "$resp" | jq -r '
     [.hits[]? | select(.verificationStatus != "contradicted")] | .[0:5] |
     if length == 0 then "" else
@@ -195,7 +205,7 @@ fetch_knowledge_report_escaped() {
   local qs="layer=unified"
   [[ -n "${CHUM_MEM_PROJECT_ID:-}" ]] && qs="${qs}&projectId=${CHUM_MEM_PROJECT_ID}"
   local report=""
-  report=$(curl -sf --max-time 5 "${api_url}/api/knowledge/report?${qs}" 2>/dev/null) || return 1
+  report=$(curl -sf $AUTH_HEADER --max-time 5 "${api_url}/api/knowledge/report?${qs}" 2>/dev/null) || return 1
   [[ -z "$report" ]] && return 1
   if echo "$report" | jq -e '.report.markdown? // empty' >/dev/null 2>&1; then
     report=$(printf '%s' "$report" | jq -r '.report.markdown')

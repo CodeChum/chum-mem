@@ -26,6 +26,7 @@ x-rust-env: &rust-env
   DASHBOARD_API_URL: ${DASHBOARD_API_URL:-http://api:63001}
   WEB_PORT: ${WEB_PORT:-63000}
   FASTEMBED_CACHE_DIR: ${FASTEMBED_CACHE_DIR:-/data/fastembed}
+  CHUM_MEM_API_TOKENS: ${CHUM_MEM_API_TOKENS:-}
 
 services:
   postgres:
@@ -152,6 +153,7 @@ services:
       CHUM_MEM_USER_ID: ${CHUM_MEM_USER_ID:-00000000-0000-0000-0000-000000000004}
       CHUM_MEM_ACTOR_TYPE: ${CHUM_MEM_ACTOR_TYPE:-system}
       CHUM_MEM_TEAM_ROLE: ${CHUM_MEM_TEAM_ROLE:-admin}
+      CHUM_MEMORY_API_TOKEN: ${CHUM_MEMORY_API_TOKEN:-}
     depends_on:
       api:
         condition: service_healthy
