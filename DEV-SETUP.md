@@ -44,32 +44,33 @@ pnpm sessions:import --roots ~/.claude/projects/<your-monorepo-folders> \
 
 Then call `POST /api/admin/reembed {"projectId": ...}` once.
 
-## 3. Each engineer (5 minutes)
+## 3. Each engineer (one-time, about 5 minutes)
 
-The plugin talks to `localhost:63001`; an IAP tunnel forwards that to the VM.
+Prerequisites: Claude Code, `gh`, the Google Cloud SDK, and an admin has given
+your @codechum.com account **IAP-secured Tunnel User** + **Compute Viewer** on
+project `gradechum`.
 
 ```bash
-gcloud auth login                                 # your @codechum.com account
-gh repo clone CodeChum/chum-mem ~/chum-mem
-cd ~/chum-mem && export CHUM_MEMORY_API_URL=http://localhost:63001
-./plugin-install.sh claude production
-
-# keep this running (a second terminal, or wrap it in a launchd agent):
-gcloud compute start-iap-tunnel gradechum-chum-mem 63001 \
-  --local-host-port=localhost:63001 --zone=asia-east1-b --project=gradechum
+gcloud auth login                                   # once; tokens refresh on their own
+gh repo clone CodeChum/chum-mem ~/chum-mem && cd ~/chum-mem
+deploy/gcp/install-tunnel-agent.sh install          # launchd agent: tunnel to the VM, auto-restarts, survives reboots
+echo 'export CHUM_MEMORY_API_URL=http://localhost:63001' >> ~/.zshrc && export CHUM_MEMORY_API_URL=http://localhost:63001
+./plugin-install.sh claude production               # registers the plugin + MCP server in Claude Code
 ```
 
-Then start Claude Code from the **monorepo root** (the hooks resolve the project
-id from `.chum-mem` there). Check it works:
+That is the whole setup. From then on, every Claude Code session you start from
+the **monorepo root** is captured and auto-searched. Nothing to run per session.
 
-- `/mcp` shows `chum-memory` connected
-- a prompt such as "is anyone working on the bonus toggle?" answers from team
-  memory with the author's email
+Check it works:
+
+- `deploy/gcp/install-tunnel-agent.sh status` shows the tunnel up and `/ready`
+- in Claude Code, `/mcp` shows `chum-memory` connected
+- ask "is anyone working on the bonus toggle?" and the answer cites team memory with an author email
 - `.chum-cache/` appears in the repo root (ignored); if the tunnel is down,
   events spool to `.chum-cache/outbox/` and replay on the next prompt
 
 Identity is your git `user.email` in that checkout — make sure it is your work
-address.
+address. Updates: `git -C ~/chum-mem pull` then `/reload-plugins` in Claude Code.
 
 ## What you get, and what you do not (yet)
 
