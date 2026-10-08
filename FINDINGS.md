@@ -154,6 +154,20 @@ Target: `gemma-box` (Mac Studio, 32 cores, 96 GB, macOS 26.5, 710 GB free). Toda
 7. **Clients**: each engineer installs the plugin from the fork (`./plugin-install.sh claude production` with the Access-protected URL; the hooks need `cloudflared access` token headers or a WARP client, which is the open item), commits nothing but uses the shared `.chum-mem` in the monorepo.
 8. **Operate**: nightly `pnpm volumes:backup`, watch `docker stats` memory on the API (F8/F12 retention), and keep repository sync docs-only until F8 is fixed server-side.
 
+## F27 — Two-actor scenarios with REAL sessions (fixed build, 2026-10-08 10:55–11:01 UTC)
+Actor 1 = real headless Claude Code session on the monorepo checkout (git email cymmer@codechum.com). Actor 2 = real session on the second checkout (engineer2@codechum.com), run twice: "neutral" (never mentions memory) and "explicit" (asked to use chum-memory). Nine sessions, runs 50–58.
+
+| TC | Actor 1 did | Actor 2 asked | Neutral | Explicit |
+|---|---|---|---|---|
+| 1 | Decided: raise `RUBRICS_REQUEST_TIMEOUT_SECONDS` 45→60 because Vertex p99 is 107 s | "About to change the rubrics timeout, anything recent from teammates?" | **Found**: cited the decision, value, reason, time, and linked it to PR #2692 (called `mem_search` + `knowledge_query` on its own) | **Found**: decision + reason + session id 794d7a93; "no person name stored" |
+| 2 | Decided (CODECHUM-99901): bonus toggle in `TaskSettingsModal`, field `is_bonus_enabled`; "starting this now" | "Need to add a bonus toggle; is anyone already on it, any naming decision?" | **Found**: "a teammate … said they are starting the work now", widget + field names, session id | **Found**: same, session id f2d3f4d1 |
+| 3 | Confirmed fix: answer-sheet 502 on 40+ pages = Puppeteer 30 s timeout → `PUPPETEER_TIMEOUT_MS=90000`, deployed | "Teacher reports 502 downloading long-exam answer sheets; known fix?" | **Missed**: did not consult memory, guessed a Cloud Run timeout | **Found**: cause + fix + session id 400932d1 |
+
+- 5/6 Actor-2 sessions knew Actor 1's session within a minute of it ending. Captured `tool_result` events prove the retrieval path: runs 51, 52, 54, 55, 58 called `mcp__plugin_chum-memory_chum-memory__mem_search`; run 57 called nothing.
+- The model consults memory unprompted when the question is about *people* ("teammates", "anyone working on this") and not for plain factual questions (0/40 in the series, 0/1 here). The skill text does not change that; prompt wording does.
+- Attribution gap: `mem_search` hits carry the session id but not the session's `userEmail`, so Actor 2 says "a teammate" / "no person name stored" even though the store knows it was cymmer@codechum.com. One-line server fix (join session metadata into hits).
+- False "contradicted" flags: all three fresh decisions were marked contradicted/superseded within a minute. The contradiction engine linked them to unrelated claims, e.g. the baseline prompt "Which production database host pattern must never receive a session-level SET…" (a question captured as a *constraint* because it contains "must never"). Actor 2 relayed the warning each time ("confirm with the team"), which is wrong but at least visible.
+
 ## Measurements table (updated as runs complete)
 | Run | What | Result |
 |---|---|---|
