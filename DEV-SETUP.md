@@ -34,15 +34,22 @@ Merge branch `chum-mem-pilot/shared-project-id` in `CodeChum/gradechum`. It adds
 - `docs-mirror/` — memory notes mirrored as repository docs
 - `.gitignore` — `.chum-cache/`
 
-Backfill history once from each engineer's machine, with the IAP tunnel running (cheap, FINDINGS F10):
+Backfill history once per engineer. Do it **on the VM over SSH**, not through
+the IAP tunnel: a tunnel reset mid-import leaves sessions partial and the
+bulk-import indexes dropped (FINDINGS F31). Copy the transcript folders up, then:
 
 ```bash
-cd chum-mem && pnpm install
-pnpm sessions:import --roots ~/.claude/projects/<your-monorepo-folders> \
-  --server http://localhost:63001 --project $(jq -r .projectId <monorepo>/.chum-mem) --yes
+# on your laptop: copy your monorepo session folders to the VM
+gcloud compute scp --recurse --tunnel-through-iap --zone=asia-east1-b --project=gradechum \
+  ~/.claude/projects/-Users-<you>-gradechum-gradechum* gradechum-chum-mem:/tmp/sessions/
+# on the VM (deploy/gcp/deploy-vm.sh ssh), from /opt/chum-mem/src:
+pnpm sessions:import --roots /tmp/sessions --server http://10.140.0.9:63001 \
+  --project $(jq -r .projectId <monorepo>/.chum-mem) --yes
+curl -s -X POST -H 'Content-Type: application/json' -d '{"projectId":"<id>"}' http://10.140.0.9:63001/v1/ingest/bulk/create-indexes
 ```
 
-Then call `POST /api/admin/reembed {"projectId": ...}` once.
+Embeddings are computed on ingest with the local model, so no re-embed step is
+needed on the VM (`POST /api/admin/reembed` exists for model changes).
 
 ## 3. Each engineer (one-time, about 5 minutes)
 
