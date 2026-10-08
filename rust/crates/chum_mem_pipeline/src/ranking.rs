@@ -199,7 +199,7 @@ pub fn merge_hybrid_results(
                 session_ids: metadata_session_ids(&metadata),
                 provenance: Vec::new(),
                 proof_handles: Vec::new(),
-                author_email: None,
+                author_email: metadata_string(&metadata, "authorEmail"),
                 lexical_score: None,
                 semantic_score: Some(semantic_score),
                 exact_session_match: None,

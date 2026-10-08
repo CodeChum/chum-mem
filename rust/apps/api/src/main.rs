@@ -3694,6 +3694,7 @@ async fn semantic_search(
                 "sessionIds": row.session_id.into_iter().collect::<Vec<_>>(),
                 "sessionId": row.session_id,
                 "branch": row.branch,
+                "authorEmail": row.author_email,
                 "importanceScore": row.importance_score,
                 "confidenceScore": row.confidence_score,
                 "supersededAt": row.superseded_at.map(format_time),
