@@ -158,7 +158,10 @@ async fn reconcile_single_claim(
           and team_id = $2
           and project_id = $3
           and id <> $4
-          and (claim_key = $5 or subject = $6)
+          -- F27 fix: 'global' is the default subject of ~every claim; matching on it
+          -- linked unrelated claims as supersedes/contradicts. Require the same key, or a
+          -- specific shared subject AND the same claim type.
+          and (claim_key = $5 or (subject = $6 and subject not in ('global', '') and claim_type::text = $7))
           and admitted = true
         order by valid_from desc, created_at desc, id desc
         limit 12
@@ -170,6 +173,7 @@ async fn reconcile_single_claim(
     .bind(current.claim_id)
     .bind(&current.claim_key)
     .bind(&current.subject)
+    .bind(&current.claim_type)
     .fetch_all(&mut **tx)
     .await?;
 

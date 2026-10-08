@@ -460,7 +460,15 @@ fn extract_claims_from_text(
 }
 
 fn claim_segments(text: &str) -> Vec<String> {
-    text.split(['\n', '|'])
+    // F27 fix: split at sentence boundaries too, so "Decision: … . Do not change code."
+    // yields a decision claim and a separate constraint instead of one negative-polarity blob.
+    let normalized = text
+        .replace(". ", ".\n")
+        .replace("; ", ";\n")
+        .replace("? ", "?\n")
+        .replace("! ", "!\n");
+    normalized
+        .split(['\n', '|'])
         .flat_map(|line| line.split(" - "))
         .map(str::trim)
         .filter(|segment| segment.len() >= 12)
@@ -482,10 +490,17 @@ fn classify_claim_type(event: Option<&SessionEventRecord>, segment: &str) -> Opt
         || lower.contains("bug:");
     if lower.contains("open question:")
         || lower.contains("question:")
-        || lower.ends_with('?')
+        || lower.contains('?')
         || lower.contains("unknown whether")
     {
         return Some(MemoryType::OpenQuestion);
+    }
+    if lower.contains("decision:")
+        || lower.contains("decision update")
+        || lower.contains("we decided")
+        || lower.contains("policy:")
+    {
+        return Some(MemoryType::Decision);
     }
     if lower.contains("constraint:")
         || lower.contains("must ")
@@ -495,13 +510,6 @@ fn classify_claim_type(event: Option<&SessionEventRecord>, segment: &str) -> Opt
         || lower.contains("fallback only")
     {
         return Some(MemoryType::Constraint);
-    }
-    if lower.contains("decision:")
-        || lower.contains("decision update")
-        || lower.contains("we decided")
-        || lower.contains("policy:")
-    {
-        return Some(MemoryType::Decision);
     }
     if lower.contains("task:")
         || lower.contains("todo:")

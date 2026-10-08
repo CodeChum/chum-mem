@@ -101,6 +101,8 @@ Decisions in memory file `chum-mem-pilot.md`.
 - **Server, real embeddings** (F7/F16): `fastembed` (bge-small-en-v1.5, 384-dim, ONNX, CPU) replaces the FNV hash in `embed_text`; batch `embed_texts`; eager warm-up at API/worker start; migration `0023` drops the 1536-dim column and recreates `vector(384)` + HNSW; `POST /api/admin/reembed {projectId}` re-embeds every memory; compose gets a `fastembed_cache` volume and `FASTEMBED_CACHE_DIR`; Dockerfile adds OpenSSL. `cargo check` passes; Docker image rebuilding.
 - **Server, F17**: `sync_chroma_index` now syncs the whole project (`session_id = None`) whenever it bulk-completed sibling jobs.
 - **Server, F13**: lexical filter ORs the query's lexemes (`to_tsquery` joined with `|`) and keeps `ts_rank_cd` on the full websearch query for ranking.
+- **Server, attribution (F27)**: search hits now carry `authorEmail` (the session's git email) in both the lexical and semantic queries and in `RankedMemory`, so a teammate's decision comes back with who made it.
+- **Server, false contradictions (F27)**: `reconcile_single_claim` no longer matches candidates on the default subject `global` (14,275 of 14,2xx claims had it); a candidate must share the claim key, or share a specific subject AND the claim type. Claim extraction splits at sentence boundaries ("Decision: … . Do not change code." → one decision + one constraint instead of a negative-polarity blob), treats any segment containing "?" as an open question, and checks decision markers before constraint markers. Pipeline unit tests: 97 passed, 0 failed.
 - **Build note**: first Docker build on bookworm failed at link time (`undefined symbol: __cxa_call_terminate`, `_M_replace_cold` from onnxruntime_c_api.cc): the prebuilt ONNX Runtime needs libstdc++ ≥ GCC 13. Images moved to Debian trixie (`libssl3t64`).
 
 ## F21 — Fixed build: recall on the session layer, auto 5/32, manual strict 1/32 (observed, pass 22)
@@ -167,6 +169,20 @@ Actor 1 = real headless Claude Code session on the monorepo checkout (git email 
 - The model consults memory unprompted when the question is about *people* ("teammates", "anyone working on this") and not for plain factual questions (0/40 in the series, 0/1 here). The skill text does not change that; prompt wording does.
 - Attribution gap: `mem_search` hits carry the session id but not the session's `userEmail`, so Actor 2 says "a teammate" / "no person name stored" even though the store knows it was cymmer@codechum.com. One-line server fix (join session metadata into hits).
 - False "contradicted" flags: all three fresh decisions were marked contradicted/superseded within a minute. The contradiction engine linked them to unrelated claims, e.g. the baseline prompt "Which production database host pattern must never receive a session-level SET…" (a question captured as a *constraint* because it contains "must never"). Actor 2 relayed the warning each time ("confirm with the team"), which is wrong but at least visible.
+- One hour later the TC1 decision (stored as a *constraint*, because "do not change any code" in the same prompt made the constraint check win over "we decided") was `contradicted` + superseded, and the default search filter hides contradicted claims: the decision had become unfindable. On the stock reconcile logic every fresh decision decays this way within minutes. Both causes are fixed in the round-two server changes (sentence-level segmentation, decision-before-constraint, no `global`-subject matching); the five scenario repetitions below run on that build.
+
+## F28 — Two-actor scenarios ×5 on the round-two build (attribution + contradiction fixes), 45 real sessions, runs 60–148
+| TC | Actor 2 variant | Found Actor 1's fact | Named cymmer@codechum.com | Consulted memory | False "contradicted" warnings |
+|---|---|---|---|---|---|
+| 1 rubrics timeout decision | neutral | 5/5 | 5/5 | 5/5 | 0 |
+| 1 | explicit | 5/5 | 5/5 | 5/5 | 0 |
+| 2 bonus toggle, work started | neutral | 5/5 | 5/5 | 5/5 | 0 |
+| 2 | explicit | 5/5 | 5/5 | 5/5 | 0 |
+| 3 answer-sheet 502 fix | neutral | 1/5 | 0/5 | 1/5 | 0 |
+| 3 | explicit | 5/5 | 5/5 | 5/5 | 0 |
+- 26/30 Actor-2 sessions knew Actor 1's session; 25/30 named the person. All 15 Actor-1 sessions stored under cymmer@codechum.com, all 30 Actor-2 sessions under engineer2@codechum.com. Zero false contradiction warnings (was 6/6 in round one).
+- Sample answer (TC2, run 145): "a teammate (cymmer@codechum.com) already started this: under CODECHUM-99901 they decided the toggle lives in the TaskSettingsModal widget … came from session a83095c4-…, so coordinate with them before starting rather than duplicating the work."
+- The one systematic miss is TC3-neutral: a bug report phrased as "is this a known problem?" does not make the model consult memory (1/5); "is anyone working on this / anything from teammates" does (10/10). The fix is in the skill or system prompt wording ("check chum-memory before answering any 'is this known' question"), not in the server.
 
 ## Measurements table (updated as runs complete)
 | Run | What | Result |
