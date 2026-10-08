@@ -189,6 +189,17 @@ Actor 1 = real headless Claude Code session on the monorepo checkout (git email 
 - TC3 with the neutral phrasing ("is this a known problem with a known fix?"), five fresh Actor-1/Actor-2 pairs: **5/5 found the fix, 5/5 named cymmer@codechum.com** (was 1/5 found, 0/5 named). Every Actor-2 answer opened with "Yes, this is a known problem. Team memory recorded by cymmer@codechum.com …" and still called `mem_search` on its own for details.
 - Cost: UserPromptSubmit hook p50 ≈1.2 s (search + injection) versus 0.39 s without; roughly 400–900 extra input tokens per prompt when hits exist. Tunable via `CHUM_AUTO_RECALL_LIMIT` and `CHUM_AUTO_RECALL_TIMEOUT_SECS`.
 
+## F30 — Override scenario: Actor 1 decides, Actor 2 overrides, Actor 1 asks later (real sessions, runs 180–197)
+| Rep | Topic | Actor 2 phrasing | Actor 1 later told the new value | Named engineer2 | Flagged the change |
+|---|---|---|---|---|---|
+| A1 | page size A4→Letter | "Decision update … overrides" | yes | yes | yes |
+| A2 | QR corner | explicit | yes | yes | yes |
+| A3 | ID digits 6→8 | explicit | yes | yes | yes |
+| B1 | font Arial→Noto Sans | silent new decision | yes | yes | "the two conflict" |
+| B2, B3 | margin, orientation | silent | not run (Claude session limit hit mid-test) | | |
+- In every completed repetition Actor 1's neutral question ("what page size do we use?") returned Actor 2's newer value with engineer2@codechum.com named and Actor 1's own earlier decision cited next to it. The reconcile engine does NOT link the two (different text-derived claim keys), so this comes from automatic recall surfacing both with author + timestamp and the model reasoning "later wins / confirm with engineer2".
+- Side effect to know: the model's own project memory file (`~/.claude/projects/…/memory`) still held Actor 1's old value, and several answers offered to update it. Team memory and personal memory can drift; the auto-recall line makes the drift visible rather than silent.
+
 ## Measurements table (updated as runs complete)
 | Run | What | Result |
 |---|---|---|
