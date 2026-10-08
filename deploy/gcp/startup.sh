@@ -13,7 +13,7 @@ REPO_URL="https://github.com/CodeChum/chum-mem.git"
 
 if ! command -v docker >/dev/null 2>&1; then
   apt-get update -y
-  apt-get install -y --no-install-recommends ca-certificates curl gnupg git jq
+  apt-get install -y --no-install-recommends ca-certificates curl gnupg git jq openssl
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
@@ -36,7 +36,8 @@ chown -R "$APP_USER:$APP_USER" "$APP_HOME"
 
 cd "$APP_HOME/src"
 if [[ ! -f .env ]]; then
-  PGPASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)
+  # (no pipeline here: under `pipefail` a tr|head pipe exits 141/SIGPIPE and kills the script)
+  PGPASS=$(openssl rand -hex 16)
   cp .env.example .env
   sed -i "s#^POSTGRES_PASSWORD=.*#POSTGRES_PASSWORD=${PGPASS}#" .env
   sed -i "s#^DATABASE_URL=.*#DATABASE_URL=postgres://chum_mem:${PGPASS}@postgres:5432/chum_mem#" .env

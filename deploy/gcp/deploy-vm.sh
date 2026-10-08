@@ -5,8 +5,8 @@
 # Usage: deploy-vm.sh [create|status|tunnel|ssh|logs|delete]
 set -euo pipefail
 PROJECT="${CHUM_GCP_PROJECT:-gradechum}"
-ZONE="${CHUM_GCP_ZONE:-asia-southeast1-b}"
-NAME="${CHUM_GCP_VM:-chum-mem}"
+ZONE="${CHUM_GCP_ZONE:-asia-east1-b}"
+NAME="${CHUM_GCP_VM:-gradechum-chum-mem}"
 MACHINE="${CHUM_GCP_MACHINE:-e2-standard-4}"     # 4 vCPU / 16 GB (API peaked at 3.8 GB on syncs; re-embed + graph builds want headroom)
 DISK_GB="${CHUM_GCP_DISK_GB:-60}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

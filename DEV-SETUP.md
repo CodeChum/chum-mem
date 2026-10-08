@@ -1,33 +1,28 @@
 # chum-mem for GradeChum engineers — setup
 
-Status 2026-10-08: the memory logic is verified (see FINDINGS.md), but **no shared
-server is deployed yet**. Until the server step below is done, the only working
-instance is a local Docker stack on one laptop. Do steps 1–2 once as a team,
-then every engineer does step 3.
+Status 2026-10-08: the memory logic is verified (see FINDINGS.md) and a shared
+server is deployed on GCP (step 1). Do step 2 once as a team, then every
+engineer does step 3.
 
-## 1. Server (once, needs an owner)
+## 1. Server (deployed 2026-10-08: GCP VM `gradechum-chum-mem`)
 
-Target: Mac Studio proof of concept (runbook in FINDINGS.md) or a GCP VM. In short:
+Project `gradechum`, zone `asia-east1-b`, e2-standard-4, Debian 12, built from
+`deploy/gcp/startup.sh`. **Nothing is exposed to the internet**: the firewall
+admits only Google's IAP range on tcp/22, and the API, Postgres and dashboard
+bind to the VM's loopback. Access control is Google IAM on the project.
+
+Operate it with `deploy/gcp/deploy-vm.sh` (`status`, `logs`, `ssh`, `tunnel`):
 
 ```bash
-gh repo clone CodeChum/chum-mem && cd chum-mem
-cp .env.example .env            # change POSTGRES_PASSWORD + DATABASE_URL, keep ports on 127.0.0.1
-# VECTOR_STORE_BACKEND=chroma  -> pgvector path (recommended; no Chroma service needed)
-# FASTEMBED_CACHE_DIR=/data/fastembed
-docker compose up -d postgres
-docker compose up -d api        # downloads the embedding model (~1 min) — start API first
-docker compose up -d worker     # then the worker (concurrent first-run downloads corrupt the model copy)
-curl -s localhost:63001/ready
+export CHUM_GCP_ZONE=asia-east1-b CHUM_GCP_VM=gradechum-chum-mem
+deploy/gcp/deploy-vm.sh logs     # startup/build log
+deploy/gcp/deploy-vm.sh ssh      # IAP SSH; the stack lives in /opt/chum-mem/src
 ```
 
-Expose it **only** behind access control: a Cloudflare Tunnel ingress for
-`chum-mem.<domain>` → `http://localhost:63001` plus a Cloudflare Access policy
-limited to the engineers' emails. The API itself has no authentication
-(FINDINGS F5). Verify an unauthenticated `curl` is rejected before step 3.
+Engineers need the IAM role **IAP-secured Tunnel User** (`roles/iap.tunnelResourceAccessor`)
+plus `compute.instances.get` on the project (Compute Viewer is enough).
 
-Open item for the hooks: the plugin's `curl` calls must carry Access
-credentials (Cloudflare WARP on each laptop, or a service token added to the
-hook scripts). Pick one before rolling out.
+If you ever want to re-create it: `deploy/gcp/deploy-vm.sh create` (same env vars).
 
 ## 2. Monorepo (once)
 
@@ -39,22 +34,29 @@ Merge branch `chum-mem-pilot/shared-project-id` in `CodeChum/gradechum`. It adds
 - `docs-mirror/` — memory notes mirrored as repository docs
 - `.gitignore` — `.chum-cache/`
 
-Backfill history once from each engineer's machine (cheap, FINDINGS F10):
+Backfill history once from each engineer's machine, with the IAP tunnel running (cheap, FINDINGS F10):
 
 ```bash
 cd chum-mem && pnpm install
 pnpm sessions:import --roots ~/.claude/projects/<your-monorepo-folders> \
-  --server https://chum-mem.<domain> --project $(jq -r .projectId <monorepo>/.chum-mem) --yes
+  --server http://localhost:63001 --project $(jq -r .projectId <monorepo>/.chum-mem) --yes
 ```
 
 Then call `POST /api/admin/reembed {"projectId": ...}` once.
 
 ## 3. Each engineer (5 minutes)
 
+The plugin talks to `localhost:63001`; an IAP tunnel forwards that to the VM.
+
 ```bash
-export CHUM_MEMORY_API_URL=https://chum-mem.<domain>   # add to your shell profile
+gcloud auth login                                 # your @codechum.com account
 gh repo clone CodeChum/chum-mem ~/chum-mem
-cd ~/chum-mem && ./plugin-install.sh claude production
+cd ~/chum-mem && export CHUM_MEMORY_API_URL=http://localhost:63001
+./plugin-install.sh claude production
+
+# keep this running (a second terminal, or wrap it in a launchd agent):
+gcloud compute start-iap-tunnel gradechum-chum-mem 63001 \
+  --local-host-port=localhost:63001 --zone=asia-east1-b --project=gradechum
 ```
 
 Then start Claude Code from the **monorepo root** (the hooks resolve the project
@@ -63,7 +65,7 @@ id from `.chum-mem` there). Check it works:
 - `/mcp` shows `chum-memory` connected
 - a prompt such as "is anyone working on the bonus toggle?" answers from team
   memory with the author's email
-- `.chum-cache/` appears in the repo root (ignored); if the server is down,
+- `.chum-cache/` appears in the repo root (ignored); if the tunnel is down,
   events spool to `.chum-cache/outbox/` and replay on the next prompt
 
 Identity is your git `user.email` in that checkout — make sure it is your work
