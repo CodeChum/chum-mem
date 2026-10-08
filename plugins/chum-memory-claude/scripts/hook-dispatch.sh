@@ -157,8 +157,35 @@ emit_codex() {
   printf '{"systemMessage":"%s"}\n' "$message"
 }
 
-USER_PROMPT_MSG="ChumMemory graph is fresh (PCKC v2.2.3). Required retrieval order for any code-navigation or recall step: FIRST call MCP knowledge_report(layer:unified) and treat its compact markdown as primary high-level context; SECOND call repository-layer knowledge_query for architecture/components/relationships; THIRD call mem_search(mode:hybrid, disclosureLevel:overview, small limit); ONLY THEN Read/Grep/Glob/Edit. Before editing a file, call knowledge_query(neighbors, nodeId:'file:<path>', layer:repository) after the prelude. Grep/Glob is fallback only. Three-way hybrid search: lexical + pgvector + Chroma ML. Unified reports include repository digest, session communities, and cross-layer summary. Load the ChumMemory skill for the full cookbook if unsure."
+USER_PROMPT_MSG="ChumMemory is active. Relevant team memory for this prompt (if any) is appended below: ALWAYS read it before answering and attribute what you use. For deeper recall call mem_search; for code structure call knowledge_query(layer:repository). Original retrieval order for any code-navigation or recall step: FIRST call MCP knowledge_report(layer:unified) and treat its compact markdown as primary high-level context; SECOND call repository-layer knowledge_query for architecture/components/relationships; THIRD call mem_search(mode:hybrid, disclosureLevel:overview, small limit); ONLY THEN Read/Grep/Glob/Edit. Before editing a file, call knowledge_query(neighbors, nodeId:'file:<path>', layer:repository) after the prelude. Grep/Glob is fallback only. Three-way hybrid search: lexical + pgvector + Chroma ML. Unified reports include repository digest, session communities, and cross-layer summary. Load the ChumMemory skill for the full cookbook if unsure."
 SESSION_START_BASE="ChumMemory plugin active (PCKC v2.2.3, MCP server: chum-memory). Multi-project mode: each project folder has its own project ID (auto-resolved via .chum-mem). Repository layer (knowledge_query, knowledge_communities, layer-specific knowledge_report) is STRICTLY per-project — projectId is required, no global fallback. Unified knowledge_report keeps repository strict and uses session-layer global fallback for continuity signals. Session layer knowledge queries fall back to global project if no project-specific snapshot exists. mem_search falls back to global project for historical memories. The hook auto-runs repository_sync before every turn — do NOT call project_import or repository_sync manually. On every code-related prompt use this strict order: MCP knowledge_report(layer:unified) first; repository-layer knowledge_query second; mem_search third; Read/Grep/Glob/Edit last. Two layers: repository (code structure, AST) and session (interaction history); unified is report-only. Always pass layer. Three-way hybrid search (lexical + pgvector + Chroma). Typed partitions for per-type precision. Hierarchical communities (level-0 + level-1). Governance: use claim_govern to pin/archive/reject claims. Load the ChumMemory skill for the full cookbook and decision tree."
+
+
+# ── Automatic recall: search memory for the prompt itself and inject the top
+# hits, so retrieval does not depend on the model deciding to call a tool or on
+# how the user phrases the question. One REST call, bounded output.
+fetch_prompt_memory_escaped() {
+  local api_url="${CHUM_MEMORY_API_URL:-http://localhost:63001}"
+  local prompt limit body resp md
+  prompt=$(echo "$HOOK_PAYLOAD" | jq -r '.prompt // ""' 2>/dev/null)
+  # skip trivial prompts (slash commands, one-word replies)
+  [[ ${#prompt} -ge 12 && "$prompt" != /* ]] || return 1
+  limit="${CHUM_AUTO_RECALL_LIMIT:-5}"
+  body=$(jq -n --arg q "${prompt:0:800}" --arg pid "${CHUM_MEM_PROJECT_ID:-}" --argjson n "$limit"     '{query:$q, mode:"hybrid", limit:$n, disclosureLevel:"overview"} + (if $pid != "" then {projectId:$pid} else {} end)')
+  resp=$(curl -sf --max-time "${CHUM_AUTO_RECALL_TIMEOUT_SECS:-6}" -X POST -H 'Content-Type: application/json'     -d "$body" "${api_url}/api/search" 2>/dev/null) || return 1
+  md=$(printf '%s' "$resp" | jq -r '
+    [.hits[]? | select(.verificationStatus != "contradicted")] | .[0:5] |
+    if length == 0 then "" else
+      "--- Team memory (auto-recall for this prompt; hits from chum-memory, newest first within rank) ---\n" +
+      (map("- [" + (.memoryType // .type // "memory" | tostring) + "] "
+           + ((.title // "") | gsub("\n"; " ") | .[0:220])
+           + " (by " + (.authorEmail // "unknown") + ", " + ((.createdAt // "")[0:16]) + ", session " + ((.sessionIds[0] // "") | tostring | .[0:8]) + ")"
+          ) | join("\n"))
+      + "\nIf any of these bears on the request, use it and say who recorded it; call mem_search for details."
+    end' 2>/dev/null)
+  [[ -n "$md" ]] || return 1
+  printf '%s' "${md:0:3000}" | jq -Rs '.' 2>/dev/null | sed 's/^"//;s/"$//'
+}
 
 # ── Fetch knowledge report on session start for codebase context ──
 # Returns a JSON-safe string (newlines escaped) suitable for embedding in
@@ -178,10 +205,17 @@ fetch_knowledge_report_escaped() {
 
 case "$HOOK_EVENT" in
   UserPromptSubmit)
-    if [[ "$PROVIDER" == "codex" ]]; then
-      emit_codex "$USER_PROMPT_MSG"
+    RECALL=$(fetch_prompt_memory_escaped 2>/dev/null || echo "")
+    __tlog auto_recall 2>/dev/null || true
+    if [[ -n "$RECALL" ]]; then
+      PROMPT_MSG="${USER_PROMPT_MSG}\\n\\n${RECALL}"
     else
-      emit_claude "UserPromptSubmit" "$USER_PROMPT_MSG"
+      PROMPT_MSG="$USER_PROMPT_MSG"
+    fi
+    if [[ "$PROVIDER" == "codex" ]]; then
+      emit_codex "$PROMPT_MSG"
+    else
+      emit_claude "UserPromptSubmit" "$PROMPT_MSG"
     fi
     ;;
   SessionStart)

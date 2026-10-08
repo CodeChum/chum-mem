@@ -184,6 +184,11 @@ Actor 1 = real headless Claude Code session on the monorepo checkout (git email 
 - Sample answer (TC2, run 145): "a teammate (cymmer@codechum.com) already started this: under CODECHUM-99901 they decided the toggle lives in the TaskSettingsModal widget … came from session a83095c4-…, so coordinate with them before starting rather than duplicating the work."
 - The one systematic miss is TC3-neutral: a bug report phrased as "is this a known problem?" does not make the model consult memory (1/5); "is anyone working on this / anything from teammates" does (10/10). The fix is in the skill or system prompt wording ("check chum-memory before answering any 'is this known' question"), not in the server.
 
+## F29 — Automatic recall on every prompt removes the phrasing dependency (observed, runs 160–169)
+- User ask: do not make engineers phrase questions in a special way; the system should always search. Change: the UserPromptSubmit hook now runs `mem_search` itself (REST, hybrid, top 5, contradicted claims filtered) on the prompt text and injects the hits as context: type, title, author email, time, session id, plus one line telling the model to use and attribute them and to call `mem_search` for details. One bounded call per prompt (6 s cap, 3,000-char cap); skipped for slash commands and prompts under 12 chars. The model is no longer required to decide to search.
+- TC3 with the neutral phrasing ("is this a known problem with a known fix?"), five fresh Actor-1/Actor-2 pairs: **5/5 found the fix, 5/5 named cymmer@codechum.com** (was 1/5 found, 0/5 named). Every Actor-2 answer opened with "Yes, this is a known problem. Team memory recorded by cymmer@codechum.com …" and still called `mem_search` on its own for details.
+- Cost: UserPromptSubmit hook p50 ≈1.2 s (search + injection) versus 0.39 s without; roughly 400–900 extra input tokens per prompt when hits exist. Tunable via `CHUM_AUTO_RECALL_LIMIT` and `CHUM_AUTO_RECALL_TIMEOUT_SECS`.
+
 ## Measurements table (updated as runs complete)
 | Run | What | Result |
 |---|---|---|
