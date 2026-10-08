@@ -17,7 +17,7 @@ case "${1:-create}" in
     # Firewall: allow SSH only from Google's IAP range, tagged instances only.
     if ! $G compute firewall-rules describe chum-mem-allow-iap-ssh >/dev/null 2>&1; then
       $G compute firewall-rules create chum-mem-allow-iap-ssh \
-        --direction=INGRESS --action=ALLOW --rules=tcp:22 \
+        --direction=INGRESS --action=ALLOW --rules=tcp:22,tcp:63001 \
         --source-ranges=35.235.240.0/20 --target-tags=chum-mem \
         --description="IAP TCP forwarding (SSH + API tunnel) to chum-mem"
     fi

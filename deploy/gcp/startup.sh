@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # chum-mem VM startup script (Debian 12). Idempotent: safe to re-run on reboot.
 # Installs Docker, clones the CodeChum/chum-mem fork, writes .env, and starts the
-# stack with the API bound to 127.0.0.1 only. Access is via IAP TCP forwarding
+# stack with the API reachable only through IAP TCP forwarding. Access is via IAP TCP forwarding
 # (gcloud compute start-iap-tunnel), so nothing is exposed to the internet.
 set -euo pipefail
 exec > >(tee -a /var/log/chum-mem-startup.log) 2>&1
@@ -46,15 +46,18 @@ if [[ ! -f .env ]]; then
   chmod 600 .env; chown "$APP_USER:$APP_USER" .env
 fi
 
-# Bind every published port to loopback only (the compose file publishes 0.0.0.0).
-cat > docker-compose.override.yml <<'YML'
+# Postgres and the dashboard bind to loopback. The API binds to the VM's
+# INTERNAL NIC address: IAP TCP forwarding connects to that address, not to
+# loopback, and the firewall admits only Google's IAP range on 63001.
+INTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip)
+cat > docker-compose.override.yml <<YML
 services:
   postgres:
     ports: !override
       - "127.0.0.1:65432:5432"
   api:
     ports: !override
-      - "127.0.0.1:63001:63001"
+      - "${INTERNAL_IP}:63001:63001"
     deploy:
       resources:
         limits:
