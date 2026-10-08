@@ -282,26 +282,65 @@ pub fn event_text(event: &SessionEventRecord) -> String {
     .join(" | ")
 }
 
+/// Label stored in `embeddings.model`; bump when the model or dimension changes.
+pub const EMBEDDING_MODEL_LABEL: &str = "bge-small-en-v1.5-384";
+
+static EMBEDDER: std::sync::OnceLock<std::sync::Mutex<fastembed::TextEmbedding>> =
+    std::sync::OnceLock::new();
+
+fn embedder() -> &'static std::sync::Mutex<fastembed::TextEmbedding> {
+    EMBEDDER.get_or_init(|| {
+        let options = fastembed::TextInitOptions::new(fastembed::EmbeddingModel::BGESmallENV15)
+            .with_show_download_progress(false);
+        let model = fastembed::TextEmbedding::try_new(options).unwrap_or_else(|error| {
+            panic!(
+                "failed to initialise the local embedding model (bge-small-en-v1.5): {error}. \
+                 First run needs network access to download it; set FASTEMBED_CACHE_DIR to a \
+                 writable, persistent directory."
+            )
+        });
+        std::sync::Mutex::new(model)
+    })
+}
+
+/// Eagerly load the embedding model (downloads it on first use). Call once at
+/// service startup so the first request does not pay the download/warm-up.
+pub fn init_embedder() {
+    let _ = embed_text("warm-up");
+}
+
+/// Embed a batch of texts with the local sentence-embedding model. Output
+/// vectors are L2-normalised and `CHROMA_EMBEDDING_DIMENSIONS` wide.
+pub fn embed_texts(texts: &[&str]) -> Vec<Vec<f64>> {
+    if texts.is_empty() {
+        return Vec::new();
+    }
+    let mut model = embedder()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let embeddings = model
+        .embed(texts, Some(32))
+        .unwrap_or_else(|error| panic!("embedding {} texts failed: {error}", texts.len()));
+    embeddings
+        .into_iter()
+        .map(|embedding| {
+            let mut vector: Vec<f64> = embedding.into_iter().map(f64::from).collect();
+            debug_assert_eq!(vector.len(), CHROMA_EMBEDDING_DIMENSIONS);
+            let magnitude = vector.iter().map(|value| value * value).sum::<f64>().sqrt();
+            if magnitude > 0.0 {
+                for value in vector.iter_mut() {
+                    *value /= magnitude;
+                }
+            }
+            vector
+        })
+        .collect()
+}
+
 pub fn embed_text(text: &str) -> Vec<f64> {
-    let mut vector = vec![0.0_f64; CHROMA_EMBEDDING_DIMENSIONS];
-    let normalized = text.to_lowercase();
-    let tokens = normalized
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .filter(|token| !token.is_empty());
-
-    for token in tokens {
-        let hash = fnv1a32(token);
-        let index = (hash as usize) % CHROMA_EMBEDDING_DIMENSIONS;
-        let sign = if (hash >> 31) & 1 == 0 { 1.0 } else { -1.0 };
-        vector[index] += sign;
-    }
-
-    let magnitude = vector.iter().map(|value| value * value).sum::<f64>().sqrt();
-    if magnitude == 0.0 {
-        return vector;
-    }
-
-    vector.into_iter().map(|value| value / magnitude).collect()
+    embed_texts(&[text])
+        .pop()
+        .unwrap_or_else(|| vec![0.0_f64; CHROMA_EMBEDDING_DIMENSIONS])
 }
 
 fn provider_str(provider: &str) -> &str {
@@ -1100,14 +1139,6 @@ fn now_rfc3339() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
-fn fnv1a32(input: &str) -> u32 {
-    let mut hash = 0x811c_9dc5_u32;
-    for byte in input.as_bytes() {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
-}
 
 #[cfg(test)]
 mod tests {

@@ -25,6 +25,7 @@ x-rust-env: &rust-env
   KNOWLEDGE_GRAPH_MAX_CLUSTER_EDGES: ${KNOWLEDGE_GRAPH_MAX_CLUSTER_EDGES:-200000}
   DASHBOARD_API_URL: ${DASHBOARD_API_URL:-http://api:63001}
   WEB_PORT: ${WEB_PORT:-63000}
+  FASTEMBED_CACHE_DIR: ${FASTEMBED_CACHE_DIR:-/data/fastembed}
 
 services:
   postgres:
@@ -114,6 +115,7 @@ services:
         condition: service_healthy
     volumes:
       - turbovec_data:${TURBOVEC_PATH:-/data/turbovec}
+      - fastembed_cache:/data/fastembed
     ports:
       - "63001:63001"
     healthcheck:
@@ -134,6 +136,7 @@ services:
         condition: service_healthy
     volumes:
       - turbovec_data:${TURBOVEC_PATH:-/data/turbovec}
+      - fastembed_cache:/data/fastembed
 
   web:
     build:
@@ -158,3 +161,4 @@ services:
 volumes:
   postgres_data:
   turbovec_data:
+  fastembed_cache:

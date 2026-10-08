@@ -40,3 +40,4 @@ tree-sitter-lua.workspace = true
 tree-sitter-zig.workspace = true
 tree-sitter-elixir.workspace = true
 tree-sitter-julia.workspace = true
+fastembed = { version = "7", default-features = false, features = ["ort-download-binaries", "hf-hub-native-tls"] }

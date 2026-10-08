@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-pub const CHROMA_EMBEDDING_DIMENSIONS: usize = 1536;
+pub const CHROMA_EMBEDDING_DIMENSIONS: usize = 384;
 const CHROMA_DEFAULT_TENANT: &str = "default_tenant";
 const CHROMA_DEFAULT_DATABASE: &str = "default_database";
 

@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 # sync.sh — Client-side incremental repository sync for chum-memory.
 # Called by the plugin hook on every user prompt. Detects changed files,
-# sends only diffs plus a full manifest to the API, then reconciles the
-# local manifest using acceptedPaths/missingPaths from the response.
+# sends them in bounded chunks (the API rejects bodies over 32 MB), and
+# reconciles the local manifest after EVERY chunk so progress survives a
+# hook timeout mid-sync.
 #
 # Usage: sync.sh [ROOT_DIR] [API_URL]
+#
+# Env:
+#   CHUM_MEM_PROJECT_ID     project scope (required for per-project graphs)
+#   CHUM_SYNC_CHUNK_BYTES   max raw bytes of file content per request (default 8 MB)
+#   CHUM_SYNC_CHUNK_FILES   max files per request (default 1000) — server parse time scales with files
+#   CHUM_SYNC_TIMEOUT_SECS  per-request timeout (default 120)
+#   CHUM_SYNC_LOG           optional path; one JSON line per chunk is appended
 
 set -uo pipefail
 
@@ -24,18 +32,18 @@ RULES
   }
 fi
 
-cd "$ROOT_DIR"
+cd "$ROOT_DIR" || exit 1
 
-PAYLOAD_FILE=$(mktemp /tmp/chum-sync-payload.XXXXXX)
-STATE_FILE=$(mktemp /tmp/chum-sync-state.XXXXXX)
-trap 'rm -f "$PAYLOAD_FILE" "$STATE_FILE"' EXIT
+python3 -s - "$CACHE_DIR" "$RULES_FILE" "$PROJECT_ID" "$API_URL" <<'PYTHON'
+import base64, fnmatch, hashlib, json, mimetypes, os, sys, time, urllib.request, urllib.error
 
-RESULT=$(python3 -s - "$CACHE_DIR" "$RULES_FILE" "$PROJECT_ID" "$PAYLOAD_FILE" "$STATE_FILE" <<'PYTHON'
-import base64, hashlib, json, mimetypes, os, sys, fnmatch
-
-cache_dir, rules_file, project_id, payload_file, state_file = sys.argv[1:6]
+cache_dir, rules_file, project_id, api_url = sys.argv[1:5]
 manifest_file = os.path.join(cache_dir, "manifest.tsv")
 rejected_file = os.path.join(cache_dir, "rejected.tsv")
+chunk_bytes = int(os.environ.get("CHUM_SYNC_CHUNK_BYTES", str(8 * 1024 * 1024)))
+chunk_files = int(os.environ.get("CHUM_SYNC_CHUNK_FILES", "1000"))
+timeout_secs = int(os.environ.get("CHUM_SYNC_TIMEOUT_SECS", "120"))
+sync_log = os.environ.get("CHUM_SYNC_LOG", "")
 
 with open(rules_file) as f:
     rules = json.load(f)
@@ -49,12 +57,29 @@ ignore_patterns = rules.get("ignorePatterns", [])
 max_size = rules.get("maxFileSizeBytes", 262144)
 max_binary_size = rules.get("maxBinaryFileSizeBytes", 16 * 1024 * 1024)
 
+def load_tsv(path):
+    result = {}
+    if os.path.isfile(path):
+        with open(path) as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t", 1)
+                if len(parts) == 2:
+                    result[parts[0]] = parts[1]
+    return result
+
+def write_tsv(path, mapping):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        for key in sorted(mapping):
+            f.write(f"{key}\t{mapping[key]}\n")
+    os.replace(tmp, path)
+
+t0 = time.time()
 eligible = []
 for root, dirs, files in os.walk(".", topdown=True):
     dirs[:] = [
         d for d in dirs
-        if d not in ignore_dirs
-        and not any(fnmatch.fnmatch(d, pat) for pat in ignore_patterns)
+        if d not in ignore_dirs and not any(fnmatch.fnmatch(d, pat) for pat in ignore_patterns)
     ]
     rel_root = os.path.relpath(root, ".")
     for filename in files:
@@ -75,167 +100,107 @@ for root, dirs, files in os.walk(".", topdown=True):
                 continue
         except OSError:
             continue
-        eligible.append(filepath)
+        eligible.append((filepath, size))
 
 current = {}
-for filepath in eligible:
+for filepath, _ in eligible:
     try:
-        current[filepath] = hashlib.sha256(open(filepath, "rb").read()).hexdigest()
+        with open(filepath, "rb") as f:
+            current[filepath] = hashlib.sha256(f.read()).hexdigest()
     except Exception:
         pass
 
-def load_tsv(path):
-    result = {}
-    if os.path.isfile(path):
-        with open(path) as f:
-            for line in f:
-                parts = line.rstrip("\n").split("\t", 1)
-                if len(parts) == 2:
-                    result[parts[0]] = parts[1]
-    return result
-
-old_manifest = load_tsv(manifest_file)
+manifest = load_tsv(manifest_file)
 rejected = load_tsv(rejected_file)
+sizes = dict(eligible)
 
-# Send files whose content differs from server-confirmed state AND that we
-# haven't already been rejected for at this exact hash.
-to_send = [
-    p for p, h in current.items()
-    if old_manifest.get(p) != h and rejected.get(p) != h
-]
-removed = [p for p in old_manifest if p not in current]
+to_send = [p for p, h in current.items() if manifest.get(p) != h and rejected.get(p) != h]
+removed = [p for p in manifest if p not in current]
+walk_ms = int((time.time() - t0) * 1000)
 
 if not to_send and not removed:
-    print(json.dumps({"status": "NO_CHANGES", "filesAdded": 0, "filesRemoved": 0, "filesUnchanged": len(current)}))
+    print(json.dumps({"status": "NO_CHANGES", "filesAdded": 0, "filesRemoved": 0,
+                      "filesUnchanged": len(current), "walkMs": walk_ms}))
     sys.exit(0)
 
-files_payload = []
-for p in to_send:
+def file_entry(p):
     ext = p.rsplit(".", 1)[-1].lower() if "." in p else ""
-    size = os.path.getsize(p)
+    size = sizes.get(p, 0)
+    if ext in binary_exts:
+        with open(p, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("ascii")
+        return {"path": p, "hash": current[p], "bytesBase64": encoded,
+                "mediaType": mimetypes.guess_type(p)[0], "sizeBytes": size}, len(encoded)
+    with open(p, "r", errors="replace") as f:
+        content = f.read()
+    return {"path": p, "hash": current[p], "content": content, "sizeBytes": size}, len(content.encode("utf-8", "replace"))
+
+# Build chunks by raw payload bytes. Removed paths ride on the first chunk.
+chunks, cur, cur_bytes = [], [], 0
+for p in to_send:
     try:
-        if ext in binary_exts:
-            with open(p, "rb") as f:
-                encoded = base64.b64encode(f.read()).decode("ascii")
-            files_payload.append({
-                "path": p,
-                "hash": current[p],
-                "bytesBase64": encoded,
-                "mediaType": mimetypes.guess_type(p)[0],
-                "sizeBytes": size,
-            })
-        else:
-            content = open(p, "r", errors="replace").read()
-            files_payload.append({"path": p, "hash": current[p], "content": content, "sizeBytes": size})
+        entry, nbytes = file_entry(p)
     except Exception:
         continue
+    if cur and (cur_bytes + nbytes > chunk_bytes or len(cur) >= chunk_files):
+        chunks.append(cur); cur, cur_bytes = [], 0
+    cur.append(entry); cur_bytes += nbytes
+if cur or removed:
+    chunks.append(cur)
 
-payload = {
-    "files": files_payload,
-    "removedPaths": removed,
-    "manifest": current,
-    "mergeWithExisting": True,
-}
-if project_id:
-    payload["projectId"] = project_id
+accepted_total, missing_total, failed_chunks, status = 0, 0, 0, "SUCCESSFUL"
+for i, files in enumerate(chunks):
+    payload = {"files": files, "removedPaths": removed if i == 0 else [],
+               "manifest": current, "mergeWithExisting": True}
+    if project_id:
+        payload["projectId"] = project_id
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(f"{api_url}/api/knowledge/repository-sync", data=body,
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    t1 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_secs) as resp:
+            response = json.loads(resp.read().decode("utf-8") or "{}")
+            http = resp.status
+    except urllib.error.HTTPError as e:
+        response, http = {}, e.code
+    except Exception as e:
+        response, http = {"error": str(e)}, 0
+    ms = int((time.time() - t1) * 1000)
+    ok = http == 200 and response.get("status") == "SUCCESSFUL"
+    if ok:
+        sent = {f["path"] for f in files}
+        if "acceptedPaths" in response:
+            accepted = set(response.get("acceptedPaths") or [])
+            missing = set(response.get("missingPaths") or [])
+        else:
+            accepted, missing = sent, set()
+        # Reconcile NOW so a hook timeout after this point loses nothing.
+        if i == 0:
+            for p in removed:
+                manifest.pop(p, None)
+        for p in accepted:
+            if p in current:
+                manifest[p] = current[p]
+                rejected.pop(p, None)
+        for p in missing & sent:
+            manifest.pop(p, None)
+            rejected[p] = current[p]
+        write_tsv(manifest_file, manifest)
+        write_tsv(rejected_file, {p: h for p, h in rejected.items() if current.get(p) == h})
+        accepted_total += len(accepted); missing_total += len(missing)
+    else:
+        failed_chunks += 1
+        status = "PARTIAL"
+    if sync_log:
+        with open(sync_log, "a") as lf:
+            lf.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "chunk": i + 1,
+                                 "chunks": len(chunks), "files": len(files), "bytes": len(body),
+                                 "http": http, "ms": ms, "ok": ok,
+                                 "serverStatus": response.get("status"), "error": response.get("error")}) + "\n")
 
-with open(payload_file, "w") as f:
-    json.dump(payload, f)
-
-with open(state_file, "w") as f:
-    json.dump({
-        "current": current,
-        "old_manifest": old_manifest,
-        "rejected": rejected,
-        "sent_paths": [fp["path"] for fp in files_payload],
-        "removed_paths": removed,
-    }, f)
-
-print(f"SYNC:{len(files_payload)}:{len(removed)}:{len(current)}")
+print(json.dumps({"status": status, "chunks": len(chunks), "failedChunks": failed_chunks,
+                  "filesSent": len(to_send), "filesAccepted": accepted_total, "filesMissing": missing_total,
+                  "filesRemoved": len(removed), "filesUnchanged": len(current) - len(to_send), "walkMs": walk_ms}))
+sys.exit(0 if failed_chunks == 0 else 1)
 PYTHON
-)
-PHASE1_RC=$?
-
-if [[ $PHASE1_RC -ne 0 ]]; then
-  echo '{"status":"ERROR","error":"Sync script failed in phase 1"}' >&2
-  exit 1
-fi
-
-if echo "$RESULT" | grep -q '"NO_CHANGES"'; then
-  echo "$RESULT"
-  exit 0
-fi
-
-RESPONSE=$(curl -sf --max-time 20 \
-  -X POST \
-  -H "Content-Type: application/json" \
-  -d @"$PAYLOAD_FILE" \
-  "${API_URL}/api/knowledge/repository-sync" 2>/dev/null) || {
-  echo "{\"status\":\"ERROR\",\"error\":\"Failed to reach API at ${API_URL}\"}" >&2
-  exit 1
-}
-
-# Phase 2: reconcile local manifest + rejected tables with server response.
-python3 -s - "$CACHE_DIR" "$STATE_FILE" "$RESPONSE" <<'PYTHON'
-import json, os, sys
-
-cache_dir, state_file, response_json = sys.argv[1:4]
-manifest_file = os.path.join(cache_dir, "manifest.tsv")
-rejected_file = os.path.join(cache_dir, "rejected.tsv")
-
-try:
-    response = json.loads(response_json)
-except Exception:
-    response = {}
-
-if response.get("status") != "SUCCESSFUL":
-    sys.exit(0)
-
-with open(state_file) as f:
-    state = json.load(f)
-
-current = state["current"]
-old_manifest = state["old_manifest"]
-rejected = state["rejected"]
-sent_paths = set(state["sent_paths"])
-removed_paths = set(state["removed_paths"])
-
-# Old servers don't return acceptedPaths/missingPaths. Fall back to
-# "everything we sent was accepted" so the manifest still progresses.
-if "acceptedPaths" in response:
-    accepted = set(response.get("acceptedPaths") or [])
-    missing = set(response.get("missingPaths") or [])
-else:
-    accepted = set(sent_paths)
-    missing = set()
-
-# Start from old manifest, drop removed/missing, promote accepted to the hash
-# we just sent.
-new_manifest = {p: h for p, h in old_manifest.items() if p not in removed_paths and p not in missing}
-for p in accepted:
-    if p in current:
-        new_manifest[p] = current[p]
-
-# Rejected ledger: files server reported missing after we sent them get
-# recorded at the hash we tried. Stale entries (hash changed, file gone,
-# or now accepted) get pruned.
-new_rejected = {}
-for p, h in rejected.items():
-    if current.get(p) == h and p not in accepted:
-        new_rejected[p] = h
-for p in missing:
-    if p in sent_paths and p in current:
-        new_rejected[p] = current[p]
-
-def write_tsv(path, mapping):
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        for k, v in sorted(mapping.items()):
-            f.write(f"{k}\t{v}\n")
-    os.replace(tmp, path)
-
-write_tsv(manifest_file, new_manifest)
-write_tsv(rejected_file, new_rejected)
-PYTHON
-
-echo "$RESPONSE"

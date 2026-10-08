@@ -36,6 +36,9 @@ async fn main() -> anyhow::Result<()> {
     init_tracing("chum_mem_worker");
 
     let config = AppConfig::from_env().context("loading worker configuration")?;
+    tokio::task::spawn_blocking(chum_mem_pipeline::init_embedder)
+        .await
+        .context("initialising embedding model")?;
     let db = Database::connect(&config)
         .await
         .context("connecting worker database pool")?;
@@ -439,6 +442,10 @@ async fn sync_chroma_index(
             "bulk-completed redundant sync-chroma-index jobs"
         );
     }
+    // F17 fix: the completed siblings each covered a different session, so the
+    // surviving job has to sync the whole project (session_id = None), not
+    // just its own session.
+    let session_id = if deduped > 0 { None } else { session_id };
 
     let mut tx = db.pool().begin().await.map_err(|error| error.to_string())?;
     apply_repository_context(&mut *tx, &scoped)

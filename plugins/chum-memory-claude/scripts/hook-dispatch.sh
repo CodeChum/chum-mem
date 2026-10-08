@@ -15,6 +15,9 @@
 #   3. dirname $0 (fallback — works when called with an absolute path)
 
 set -uo pipefail
+__T0=$(python3 -c "import time;print(int(time.time()*1000))")
+__TLOG="${CHUM_HOOK_TIMING_LOG:-}"
+__tlog(){ [[ -n "$__TLOG" ]] && printf "%s\t%s\t%s\t%s\n" "$(date -u +%FT%TZ)" "${HOOK_EVENT:-?}" "$1" "$(( $(python3 -c "import time;print(int(time.time()*1000))") - __T0 ))" >> "$__TLOG"; }
 
 PROVIDER="$(printf '%s' "${CHUM_PROVIDER:-claude}" | tr '[:upper:]' '[:lower:]')"
 
@@ -45,10 +48,25 @@ fi
 export CLAUDE_PROJECT_DIR="$PROJECT_DIR"
 export CHUM_PROVIDER="$PROVIDER"
 
-# ── Fast health gate — bail immediately if API is unreachable ──
+# ── Health gate — if the API is slow or down, DO NOT drop the event: run the
+# session layer in spool mode (events go to .chum-cache/outbox.jsonl and are
+# flushed on a later hook), skip the repository layer, and tell the model.
 API_URL="${CHUM_MEMORY_API_URL:-http://localhost:63001}"
-if ! curl -sf --max-time 2 "${API_URL}/health" >/dev/null 2>&1; then
-  UNAVAIL_MSG="ChumMemory API unreachable at ${API_URL} — memory features unavailable this turn."
+API_HEALTHY=1
+if ! curl -sf --max-time "${CHUM_HEALTH_TIMEOUT_SECS:-2}" "${API_URL}/health" >/dev/null 2>&1; then
+  API_HEALTHY=0
+fi
+export CHUM_API_HEALTHY="$API_HEALTHY"
+if [[ "$API_HEALTHY" -eq 0 ]]; then
+  UNAVAIL_MSG="ChumMemory API unreachable at ${API_URL} — memory retrieval unavailable this turn; session events are being spooled locally and will sync later."
+  if [[ -x "${SCRIPTS_DIR}/session-sync.sh" ]]; then
+    CHUM_MEM_FILE_PRE="${PROJECT_DIR}/.chum-mem"
+    if [[ -f "$CHUM_MEM_FILE_PRE" ]]; then
+      export CHUM_MEM_PROJECT_ID="$(jq -r '.projectId // ""' "$CHUM_MEM_FILE_PRE" 2>/dev/null || echo "")"
+    fi
+    printf '%s' "$HOOK_PAYLOAD" | CHUM_SPOOL_ONLY=1 bash "${SCRIPTS_DIR}/session-sync.sh" >/dev/null 2>&1 || true
+  fi
+  __tlog spooled 2>/dev/null || true
   case "$PROVIDER" in
     codex) printf '{"systemMessage":"%s"}\n' "$UNAVAIL_MSG" ;;
     *)     printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"%s"}}\n' "$HOOK_EVENT" "$UNAVAIL_MSG" ;;
@@ -115,6 +133,7 @@ if [[ -x "${SCRIPTS_DIR}/session-sync.sh" ]]; then
   }
 fi
 
+__tlog session_layer
 # ── Repository layer (only on turn-boundary events) ──
 case "$HOOK_EVENT" in
   UserPromptSubmit|SessionStart)
@@ -124,6 +143,7 @@ case "$HOOK_EVENT" in
     ;;
 esac
 
+__tlog repo_layer
 # ── Emit provider-appropriate control JSON ──
 emit_claude() {
   local event="$1" message="$2"
@@ -180,4 +200,5 @@ case "$HOOK_EVENT" in
     ;;
 esac
 
+__tlog done
 exit 0

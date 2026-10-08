@@ -2055,7 +2055,15 @@ pub async fn load_memory_search_rows(
               and coalesce(c.governance_state, 'active') not in ('archived', 'rejected')
             )
           )
-          and m.search_vector @@ websearch_to_tsquery('english', $4)
+          and m.search_vector @@ (
+            -- F13 fix: OR the query terms; a natural-language question must not
+            -- require every word to match. Phrase/AND semantics still rank higher
+            -- via ts_rank_cd on the full websearch query below.
+            select coalesce(
+              (select to_tsquery('english', string_agg(lexeme, ' | '))
+                 from unnest(tsvector_to_array(to_tsvector('english', $4))) as lexeme),
+              websearch_to_tsquery('english', $4))
+          )
         order by lexical_score desc, m.created_at desc
         limit $12
         "#,

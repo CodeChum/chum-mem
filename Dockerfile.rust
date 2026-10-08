@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1.7
 
 ARG RUST_VERSION=1
-ARG DEBIAN_VERSION=bookworm
+# trixie: the prebuilt onnxruntime (ort download-binaries) needs libstdc++ >= GCC 13
+ARG DEBIAN_VERSION=trixie
 ARG APP_UID=10001
 
 FROM rust:${RUST_VERSION}-slim-${DEBIAN_VERSION} AS build
@@ -15,6 +16,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       ca-certificates \
       lld \
       libopenblas-dev \
+      libssl-dev \
       perl \
       pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -47,9 +49,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       curl \
       dumb-init \
       libopenblas0-pthread \
+      libssl3t64 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid "${APP_UID}" --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin appuser \
-    && mkdir -p /data/turbovec \
+    && mkdir -p /data/turbovec /data/fastembed \
     && chown -R appuser:appuser /data
 
 WORKDIR /app

@@ -28,6 +28,7 @@ use chum_mem_contracts::{
     StartSessionResponse, SyncRulesResponse, ValidateInput, VerificationStatus,
 };
 use chum_mem_db::{
+    load_memories_for_chroma_scoped,
     AppendSessionEventParams, ClaimProofInsertParams, ClaimProofRow, ClaimRelationRow,
     ClaimUpsertParams, DashboardGraphEdgeRow, DashboardGraphNodeRow, Database, DbError,
     MemoryInsertParams, MemoryProvenanceRow, MemorySearchRow, RepositoryContext, SessionEventRow,
@@ -297,6 +298,78 @@ async fn search(
         .await
         .map_err(map_domain_error)?;
     Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReembedRequest {
+    project_id: Uuid,
+    #[serde(default)]
+    batch_size: Option<usize>,
+}
+
+/// Rebuild pgvector embeddings for every memory of a project with the current
+/// embedding model. Used after migration 0023 (model/dimension change).
+async fn admin_reembed(
+    State(state): State<ApiState>,
+    Json(input): Json<ReembedRequest>,
+) -> Result<Response, ApiError> {
+    let started = Instant::now();
+    let scoped = RepositoryContext {
+        project_id: Some(input.project_id),
+        ..state.scope.clone()
+    };
+    let mut tx = begin_tx(&state, &scoped).await.map_err(map_domain_error)?;
+    let memories = load_memories_for_chroma_scoped(&mut tx, &scoped, input.project_id, None)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let batch_size = input.batch_size.unwrap_or(64).clamp(1, 512);
+    let total = memories.len();
+    let mut written = 0usize;
+    for chunk in memories.chunks(batch_size) {
+        let texts: Vec<String> = chunk
+            .iter()
+            .map(|memory| format!("{}\n{}\n{}", memory.title, memory.summary, memory.content))
+            .collect();
+        let vectors = tokio::task::spawn_blocking(move || {
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            chum_mem_pipeline::embed_texts(&refs)
+        })
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+        let mut tx = begin_tx(&state, &scoped).await.map_err(map_domain_error)?;
+        for (memory, vector) in chunk.iter().zip(vectors.iter()) {
+            upsert_embedding(
+                &mut tx,
+                &scoped,
+                input.project_id,
+                memory.id,
+                chum_mem_pipeline::EMBEDDING_MODEL_LABEL,
+                &to_pgvector_literal(vector),
+            )
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+            written += 1;
+        }
+        tx.commit()
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "projectId": input.project_id,
+            "model": chum_mem_pipeline::EMBEDDING_MODEL_LABEL,
+            "memories": total,
+            "embeddingsWritten": written,
+            "elapsedMs": started.elapsed().as_millis() as u64,
+        })),
+    )
+        .into_response())
 }
 
 async fn session_start(
@@ -1026,6 +1099,7 @@ fn router(state: ApiState) -> Router {
         .route("/api/memory/batch", post(memory_batch))
         .route("/api/context/build", post(context_build))
         .route("/api/claims/{id}/govern", post(claim_govern))
+        .route("/api/admin/reembed", post(admin_reembed))
         .route("/v1/projects/resolve", post(project_resolve))
         .route("/v1/ingest/session/start", post(session_start))
         .route("/v1/ingest/session/event", post(session_event))
@@ -1052,6 +1126,9 @@ async fn main() -> anyhow::Result<()> {
     db.migrate_if_enabled(config.as_ref())
         .await
         .context("running API startup migrations")?;
+    tokio::task::spawn_blocking(chum_mem_pipeline::init_embedder)
+        .await
+        .context("initialising embedding model")?;
 
     let metadata = ServiceMetadata {
         name: "chum-mem-api",
@@ -3295,7 +3372,7 @@ async fn derive_and_persist_session_memories(
             context,
             project_id,
             memory_id,
-            "local-hash-1536-v1",
+            chum_mem_pipeline::EMBEDDING_MODEL_LABEL,
             &to_pgvector_literal(&embedding),
         )
         .await?;
