@@ -10,7 +10,13 @@ chum_memory_profile_url() {
       printf '%s\n' "http://localhost:63001/mcp"
       ;;
     production|prod)
-      printf '%s\n' "https://api.mcp.codechum.com/mcp"
+      # Team server. Set CHUM_MEMORY_API_URL (e.g. https://chum-mem.gradechum.com)
+      # before running the installer; the plugin hooks read the same variable.
+      if [[ -z "${CHUM_MEMORY_API_URL:-}" ]]; then
+        echo "CHUM_MEMORY_API_URL is not set; export it to your team's chum-mem server URL first" >&2
+        exit 1
+      fi
+      printf '%s\n' "${CHUM_MEMORY_API_URL%/}/mcp"
       ;;
     *)
       echo "Unsupported profile: $profile (use: local|production)" >&2

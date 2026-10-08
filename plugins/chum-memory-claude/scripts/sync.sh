@@ -24,6 +24,14 @@ PROJECT_ID="${CHUM_MEM_PROJECT_ID:-}"
 
 mkdir -p "$CACHE_DIR"
 
+# Rules precedence: a committed `.chum-sync-rules.json` at the repo root (team-wide,
+# versioned) wins over the per-machine cache, which wins over the server default.
+# The server default is "all code + all docs", which on a large monorepo means a
+# multi-hundred-MB first upload; the committed file is how a team scopes that.
+if [[ -f "${ROOT_DIR}/.chum-sync-rules.json" ]]; then
+  cp "${ROOT_DIR}/.chum-sync-rules.json" "$RULES_FILE"
+fi
+
 if [[ ! -f "$RULES_FILE" ]]; then
   curl -sf --max-time 5 "${API_URL}/api/knowledge/sync-rules" > "$RULES_FILE" 2>/dev/null || {
     cat > "$RULES_FILE" <<'RULES'
