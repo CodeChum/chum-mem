@@ -130,6 +130,14 @@ error in Claude Code):
 - `.chum-cache/quarantine/` is not empty: the sensitive-content guard held
   something; run `/chum-quarantine list`.
 
+Pausing capture for a session (say you are pasting customer data): start
+Claude Code with `CHUM_MEMORY_API_URL=http://127.0.0.1:1 claude`. Every event
+then goes to the local outbox, which is pinned to that dead URL and never
+replays. Delete those outbox files when you are done. Turning the hooks off for
+good in your checkout means `"disableAllHooks": true` in
+`.claude/settings.local.json` (the monorepo does not gitignore it, so do not commit it). Tell the team if you do
+this, because your sessions will stop showing up for everyone else.
+
 If the tunnel is slow (several sessions share it), the hooks' health gate can be
 widened per repo with `"healthTimeoutSecs": 8` in `.chum-mem` (default 5 s); a
 tripped gate spools the whole turn instead of sending it live.
