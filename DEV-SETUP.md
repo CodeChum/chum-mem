@@ -65,9 +65,14 @@ monorepo** (`.claude/settings.json`, `.claude/chum-mem/`, `.claude/skills/chum-m
 `.mcp.json`, `.chum-mem`), so there is no plugin to install. The only thing a
 laptop needs is the tunnel to the VM:
 
+On the laptop you need the Google Cloud SDK (`brew install --cask google-cloud-sdk`),
+the GitHub CLI logged in (`brew install gh && gh auth login`; `CodeChum/chum-mem`
+is private, so the clone below fails with HTTP 401 without it), and `jq` (ships
+with macOS 15+, otherwise `brew install jq`; every hook uses it). Then:
+
 ```bash
 gcloud auth login                                   # once; your @codechum.com account
-gh repo clone CodeChum/chum-mem ~/chum-mem
+gh repo clone CodeChum/chum-mem ~/chum-mem           # needs gh auth login first
 ~/chum-mem/deploy/gcp/install-tunnel-agent.sh install   # launchd agent, auto-restarts, survives reboots
 ~/chum-mem/deploy/gcp/install-tunnel-agent.sh token     # paste the team API token (not echoed)
 ```
@@ -76,20 +81,54 @@ Prerequisites from an admin: **IAP-secured Tunnel User** + **Compute Viewer** on
 project `gradechum`, and the **API token** (the server rejects requests without
 it since 2026-10-09). The token step stores it in `~/.config/chum-mem/token`
 (0600) for the hooks and exports it from `~/.zshenv` for the MCP server; open a
-new terminal afterwards.
+new terminal afterwards. If your login shell is bash, add the same `export`
+line to `~/.bash_profile` (the hooks read the file, so capture works either
+way, but the MCP server only sees the env var and shows `failed` in `/mcp`
+without it).
+
+The installer is macOS-only (launchd). On Linux keep
+`~/chum-mem/deploy/gcp/deploy-vm.sh tunnel` running under systemd or tmux and
+do the `token` step by hand: write the token to `~/.config/chum-mem/token`
+(mode 0600) and export `CHUM_MEMORY_API_TOKEN` from your shell profile.
 
 Then start Claude Code from the **monorepo root** as usual. On the first run
-Claude Code asks once to approve the project's MCP server (`chum-memory`) and
-hooks; accept. From then on every session is captured and auto-searched.
-If the tunnel is down, events spool to `.chum-cache/outbox/` and replay later.
+Claude Code asks you to trust the folder and once to approve the project's MCP
+server (`chum-memory`); accept both. (Headless `claude -p` skips the trust
+dialog: in a checkout you never opened interactively it prints "Ignoring N
+permissions.allow entries … has not been trusted", but the chum-mem hooks
+still run.) From then on every session is captured and auto-searched,
+including headless `claude -p` runs started in the repo (scripts, CI, skills
+that spawn `claude -p`). If the tunnel is down, events spool to
+`.chum-cache/outbox/` and replay later.
 
 Do **not** also install the chum-memory plugin in this checkout: the committed
 hooks and the plugin would both fire and every event would be stored twice.
 
-Check: `~/chum-mem/deploy/gcp/install-tunnel-agent.sh status` shows `/ready`;
-in Claude Code `/mcp` shows `chum-memory` connected; ask "is anyone working on
-the bonus toggle?" and the answer cites team memory with an author email.
+Check (works on an empty store): `~/chum-mem/deploy/gcp/install-tunnel-agent.sh status`
+shows `/ready`; in Claude Code `/mcp` shows `chum-memory` connected. Then, in
+one session, type `Decision: for the chum-mem setup check I am using <your
+name> as the test value.` and end the session; start a new session in the same
+checkout and ask `did anyone decide what test value to use for the chum-mem
+setup check?` The answer should quote the decision and name your git
+`user.email`. If it does not, the session was not stored: see the
+troubleshooting list below.
 Identity is your git `user.email` in that checkout.
+
+Troubleshooting (the hooks are silent on purpose, so none of these show an
+error in Claude Code):
+
+- `status` shows `/ready` but nothing is stored and `/mcp` shows `failed`:
+  the token is missing or wrong. `/health` and `/ready` are open endpoints, so
+  the tunnel check passes without a token. Re-run the `token` step, open a new
+  terminal, and confirm with
+  `curl -s -o /dev/null -w '%{http_code}\n' -H "X-Chum-Token: $(cat ~/.config/chum-mem/token)" http://localhost:63001/api/dashboard/summary`
+  (expect `200`; `401` means the token is wrong).
+- `status` shows nothing after `state = running`: the tunnel process is up but
+  IAP refused it; check `~/Library/Logs/chum-mem-tunnel.log` and your IAM roles.
+- Files pile up in `.chum-cache/outbox/`: the API was unreachable when those
+  turns ran; they replay on the next hook once the tunnel is back.
+- `.chum-cache/quarantine/` is not empty: the sensitive-content guard held
+  something; run `/chum-quarantine list`.
 
 If the tunnel is slow (several sessions share it), the hooks' health gate can be
 widened per repo with `"healthTimeoutSecs": 8` in `.chum-mem` (default 5 s); a
@@ -104,7 +143,22 @@ dropped (every prompt is also stored as an "open question" memory).
 
 If you have a global hook that spawns `claude -p` (for example a session
 labeller), guard it with an env flag: the nested session fires the project hooks
-again and is captured as a junk session under your email.
+again and is captured as a junk session under your email (go-live review: 34 of
+82 sessions stored in 100 minutes were labeller prompts). A minimal guard at
+the top of such a hook:
+
+```bash
+[ -n "${IN_LABELLER:-}" ] && exit 0        # nested run: do nothing
+export IN_LABELLER=1                        # set before calling claude -p
+cd "$HOME"                                  # run the nested claude outside the repo
+```
+
+What you will notice day to day: each prompt waits about 1–2 s for the hooks
+on an idle server (4–8 s when the server or tunnel is busy), each tool call
+about 0.25 s, and the reply stays on screen while the Stop hook finishes. The
+"Team memory" block is often filled with shell commands and paths from recent
+sessions rather than decisions; it is only useful when someone recorded a
+decision or fix in words ("Decision: …", "Fixed: …").
 
 Token auth is **on** (`CHUM_MEM_API_TOKENS` in the VM's `.env`; one shared team
 token for the pilot, comma-separated list for more). Rotate by editing `.env`
@@ -127,6 +181,14 @@ the secrets masked, `send` releases them as they are (the store has no
 redaction), `drop` discards them. A session whose reply was held still closes
 normally with a placeholder summary. Clean events are not delayed; the scan is
 a few `grep -E` calls per event.
+
+Expect false positives when reading ordinary code: the generic
+`secret-assignment` rule matches lines such as `auth_token = request…` or
+`SECRET_KEY = os.getenv(…)`, so a session that reads
+`gradechum-api/gradechum/tasks/views/tasks.py` or `settings.py` gets the warning
+and those tool results stay local (go-live review, runs 800 and 805; a narrower
+rule is proposed). Run `/chum-quarantine list` and `send` if nothing in it is a
+real secret.
 
 The list is a starting point, not a policy. Extend it per repo with a
 `.chum-sensitive-patterns` file at the repo root (same `name|flags|regex`
@@ -151,13 +213,20 @@ responsibility.
   the monorepo is **not** indexed until F8 is fixed server-side.
 - Transcripts are stored raw with no redaction (team decision); the server's
   access control is the only gate.
-- Headless `claude -p` runs capture no prompt on some Claude Code versions (F9).
+- Headless `claude -p` runs captured no prompt on older Claude Code versions
+  (F9); on 2.1.x the prompt, every tool result and the reply are captured
+  (go-live review, runs 800–809).
 
 ## Changing the hook scripts (maintainers)
 
 `.claude/chum-mem/scripts/` in the monorepo is a byte copy of
 `plugins/chum-memory-claude/scripts/` in this repo; change the fork first and
-copy. Before any paid session, run the three-event dry run against the server
+copy. To point a checkout at another server (a local stack, a review VM) export
+`CHUM_MEMORY_API_URL` before starting Claude Code: the hooks and the root
+`.mcp.json` both read it, and `.chum-mem` carries no `apiUrl` on purpose. (The
+hook's own `.mcp.json` rewrite targets `.claude/chum-mem/.mcp.json`, which does
+not exist in the monorepo layout, so it is a no-op there.) Before any paid
+session, run the three-event dry run against the server
 and confirm the session row on it (this caught a silent `set -e` exit that lost
 3.5 hours of capture during the overnight test, FINDINGS F39):
 
