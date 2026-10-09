@@ -17,16 +17,22 @@ CMD="${1:-list}"; WHO="${2:-}"
 shopt -s nullglob
 files=("$QDIR"/*.jsonl)
 if [[ -n "$WHO" ]]; then
-  sel=(); for f in "${files[@]}"; do [[ "$(basename "$f")" == *"$WHO"* ]] && sel+=("$f"); done; files=("${sel[@]}")
+  # "${sel[@]+"${sel[@]}"}": expanding an EMPTY array under `set -u` is an
+  # "unbound variable" error on bash 3.2 (macOS /bin/bash); this idiom is not.
+  sel=(); for f in "${files[@]}"; do [[ "$(basename "$f")" == *"$WHO"* ]] && sel+=("$f"); done; files=("${sel[@]+"${sel[@]}"}")
 fi
 if [[ ${#files[@]} -eq 0 ]]; then echo "chum-quarantine: nothing held${WHO:+ for $WHO}"; exit 0; fi
 
 mask() { # replace every matched secret with *** so a listing never prints one
-  local text="$1" line name flags re
+  local text="$1" line name flags re d=$'\001'
+  # The substitution is delimited by \001, not "/": several rules contain "/"
+  # (postgres://user:pw@, hooks.slack.com/services/) and with "/" sed rejected
+  # the command, the fallback printed the text UNMASKED, and `list` showed the
+  # password it was supposed to hide.
   while IFS='|' read -r name flags re; do
-    [[ -z "$name" || "$name" == \#* ]] && continue
-    if [[ "$flags" == *i* ]]; then text=$(printf '%s' "$text" | sed -E "s/$re/***/Ig" 2>/dev/null || printf '%s' "$text")
-    else text=$(printf '%s' "$text" | sed -E "s/$re/***/g" 2>/dev/null || printf '%s' "$text"); fi
+    [[ -z "$name" || "$name" == \#* || -z "$re" ]] && continue
+    if [[ "$flags" == *i* ]]; then text=$(printf '%s' "$text" | sed -E "s${d}${re}${d}***${d}Ig" 2>/dev/null || printf '%s' "$text")
+    else text=$(printf '%s' "$text" | sed -E "s${d}${re}${d}***${d}g" 2>/dev/null || printf '%s' "$text"); fi
   done < <(cat "$SCRIPTS_DIR/sensitive-patterns.txt" "$PROJECT_DIR/.chum-sensitive-patterns" 2>/dev/null)
   printf '%s' "$text"
 }
@@ -41,8 +47,15 @@ case "$CMD" in
         kind=$(printf '%s' "$line" | jq -r '.body.eventType // .kind // "?"')
         matched=$(printf '%s' "$line" | jq -r '.matched // "?"')
         at=$(printf '%s' "$line" | jq -r '.at // ""')
-        preview=$(printf '%s' "$line" | jq -r '(.body.payload.message // .body.payload.output // .body.payload.input // .body.summary // "") | tostring | .[0:160]' | tr '\n' ' ')
-        echo "  - $at $kind [$matched]: $(mask "$preview")"
+        # Tool events keep their output under payload.metadata (payload.message is
+        # just the tool name). Mask the WHOLE field first, then cut to 160 chars:
+        # cutting first could leave half a key that no rule matches any more.
+        preview=$(printf '%s' "$line" | jq -r '
+          (if ((.body.eventType // "") | startswith("tool_"))
+             then (.body.payload.metadata.output // .body.payload.metadata.input // .body.payload.message)
+             else (.body.payload.message // .body.summary) end // "") | tostring' | tr '\n' ' ')
+        preview=$(mask "$preview")
+        echo "  - $at $kind [$matched]: ${preview:0:160}"
       done < "$f"
     done
     echo "Release with: chum-quarantine.sh send [SESSION]   Discard with: chum-quarantine.sh drop [SESSION]"

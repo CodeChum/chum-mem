@@ -13,7 +13,12 @@
 # Errors are surfaced to stderr with exit 1 (non-blocking) when the API is
 # unreachable — the user sees the error but their prompt still proceeds.
 
-set -euo pipefail
+set -Eeuo pipefail
+# An unhandled failure under `set -e` must say where it died: an empty error line
+# hid a 3.5 h capture outage (FINDINGS F39). -E lets functions inherit the trap.
+trap 'rc=$?; echo "session-sync: aborted at line ${LINENO} (exit ${rc}) during ${HOOK_EVENT:-?}" >&2' ERR
+# A hook killed at its timeout must not leave response/payload files in /tmp.
+trap 'rm -f /tmp/chum-session-*-resp.$$.json' EXIT
 
 API_URL="${CHUM_MEMORY_API_URL:-http://localhost:63001}"
 FLUSH_ONLY=0
@@ -96,10 +101,13 @@ session_start_payload() {
     )'
 }
 
+# Large bodies (a tool output can be hundreds of KB) go to jq and curl through
+# stdin, never as an argument: argv is capped at 1 MB on macOS and a single
+# argument at 128 KB on Linux ("Argument list too long" lost the event).
 spool_line() {  # $1 kind (event|end), $2 body json
-  jq -c -n --arg kind "$1" --arg ext "$AGENT_SESSION_ID" \
-    --argjson start "$(session_start_payload)" --argjson body "$2" --arg api "$API_URL" \
-    '{kind:$kind, ext:$ext, api:$api, start:$start, body:$body}' >> "$OUTBOX"
+  printf '%s' "$2" | jq -c --arg kind "$1" --arg ext "$AGENT_SESSION_ID" \
+    --argjson start "$(session_start_payload)" --arg api "$API_URL" \
+    '{kind:$kind, ext:$ext, api:$api, start:$start, body:.}' >> "$OUTBOX"
 }
 
 flush_one() {
@@ -107,20 +115,28 @@ flush_one() {
   [[ -s "$f" ]] || { rm -f "$f"; return 0; }
   mv "$f" "$tmp" || return 0
   total=$(grep -c . "$tmp" || true)
-  while IFS= read -r line; do
+  while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
+    if ! printf '%s' "$line" | jq -e . >/dev/null 2>&1; then
+      # A line cut short by a killed writer, or two parallel hooks interleaving
+      # their appends, used to kill the replayer here (jq parse error under set -e)
+      # and strand every line behind it forever. Park it and carry on.
+      printf '%s\n' "$line" >> "$OUTBOX_DIR/corrupt.parked"
+      echo "session-sync: WARN outbox $(basename "$f"): skipped a corrupt line (kept in outbox/corrupt.parked)" >&2
+      sent=$((sent + 1)); continue
+    fi
     kind=$(printf '%s' "$line" | jq -r '.kind // "event"')
     # Lines record the API they were spooled for; older lines fall back to ours.
     api=$(printf '%s' "$line" | jq -r '.api // empty'); api="${api:-$API_URL}"
     start=$(printf '%s' "$line" | jq -c '.start')
     body=$(printf '%s' "$line" | jq -c '.body')
-    sid=$(curl -sS $AUTH_HEADER --max-time 10 -X POST -H 'Content-Type: application/json' -d "$start" \
+    sid=$(printf '%s' "$start" | curl -sS $AUTH_HEADER --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- \
       "${api}/v1/ingest/session/start" 2>/dev/null | jq -r '.sessionId // empty' 2>/dev/null) || sid=""
     [[ -n "$sid" ]] || break
     body=$(printf '%s' "$body" | jq -c --arg sid "$sid" '.sessionId = $sid')
     case "$kind" in end) ep="session/end" ;; *) ep="session/event" ;; esac
-    code=$(curl -sS $AUTH_HEADER --max-time 15 -o /dev/null -w "%{http_code}" -X POST \
-      -H 'Content-Type: application/json' -d "$body" "${api}/v1/ingest/${ep}" 2>/dev/null) || code="000"
+    code=$(printf '%s' "$body" | curl -sS $AUTH_HEADER --max-time 15 -o /dev/null -w "%{http_code}" -X POST \
+      -H 'Content-Type: application/json' --data-binary @- "${api}/v1/ingest/${ep}" 2>/dev/null) || code="000"
     [[ "$code" == 2* ]] || break
     sent=$((sent + 1))
   done < "$tmp"
@@ -158,12 +174,14 @@ scan_sensitive() {  # $1 text -> prints matched rule names; exit 0 when any matc
 }
 quarantine_line() {  # $1 kind (event|end), $2 body json, $3 matched names, $4 where (prompt|tool output|reply)
   mkdir -p "$QUARANTINE_DIR"
-  jq -c -n --arg kind "$1" --arg ext "$AGENT_SESSION_ID" --arg api "$API_URL" --arg matched "$3" \
-    --arg at "$(date -u +%FT%TZ)" --argjson start "$(session_start_payload)" --argjson body "$2" \
-    '{kind:$kind, ext:$ext, api:$api, matched:$matched, at:$at, start:$start, body:$body}' \
+  printf '%s' "$2" | jq -c --arg kind "$1" --arg ext "$AGENT_SESSION_ID" --arg api "$API_URL" --arg matched "$3" \
+    --arg at "$(date -u +%FT%TZ)" --argjson start "$(session_start_payload)" \
+    '{kind:$kind, ext:$ext, api:$api, matched:$matched, at:$at, start:$start, body:.}' \
     >> "$QUARANTINE_DIR/${PROVIDER}-${AGENT_SESSION_ID}.jsonl"
+  # The notice is per agent session: with parallel sessions in one checkout a
+  # shared file would surface session A's warning in session B's terminal.
   printf 'chum-mem: NOT sent to team memory — secret-shaped content (%s) found in your %s. It is held locally in .chum-cache/quarantine/. Run /chum-quarantine list to review, send to store it anyway, drop to discard. Held items are never sent on their own.' \
-    "$3" "$4" > "$QUARANTINE_DIR/.notice"
+    "$3" "$4" > "$QUARANTINE_DIR/.notice.${AGENT_SESSION_ID}"
   echo "session-sync: held $1 from $4 (matched: $3)" >&2
 }
 
@@ -224,9 +242,14 @@ ensure_session_started() {
     -H "Content-Type: application/json" \
     -d "$payload" \
     "${API_URL}/v1/ingest/session/start" 2>&1) || {
-    echo "session-sync: ERROR session_start curl failed — API unreachable at ${API_URL}: $response" >&2
+    # Health passed but the call timed out or the connection dropped (busy API,
+    # tunnel flap). Spool this event instead of losing it: the replay creates
+    # the session later, exactly as when the health gate trips.
+    echo "session-sync: WARN session_start failed — API unreachable at ${API_URL}; spooling: $response" >&2
     rm -f /tmp/chum-session-start-resp.$$.json
-    exit 1
+    CHUM_SPOOL_ONLY=1
+    printf '{"sessionId":"DEFERRED","deferredStart":true}\n' > "$SESSION_STATE_FILE"
+    return 0
   }
 
   http_code="$response"
@@ -275,16 +298,21 @@ post_event() {
   [[ -n "$event_time" ]] || event_time=$(date -u +%FT%T.000Z)
   idempotency_key=$(printf '%s|%s|%s' "$chum_session_id" "$event_type" "$event_id" | shasum -a 256 | cut -d' ' -f1)
 
-  local full_payload
-  full_payload=$(jq -n \
+  # The two JSON documents are handed to jq as files, not --argjson arguments:
+  # a 1 MB tool output made jq fail with "Argument list too long" (argv cap
+  # 1 MB on macOS, 128 KB per argument on Linux) and the event was lost.
+  local full_payload tmp_p="/tmp/chum-session-payload-resp.$$.json" tmp_r="/tmp/chum-session-raw-resp.$$.json"
+  printf '%s' "$payload_json" > "$tmp_p"
+  printf '%s' "$HOOK_PAYLOAD" > "$tmp_r"
+  full_payload=$(jq -c -n \
     --arg sessionId "$chum_session_id" \
     --arg eventId "$event_id" \
     --arg idempotencyKey "$idempotency_key" \
     --arg eventType "$event_type" \
     --arg eventTime "$event_time" \
     --arg provider "$PROVIDER" \
-    --argjson payload "$payload_json" \
-    --argjson rawPayload "$HOOK_PAYLOAD" \
+    --slurpfile payload "$tmp_p" \
+    --slurpfile rawPayload "$tmp_r" \
     '{
       sessionId: $sessionId,
       eventId: $eventId,
@@ -292,9 +320,10 @@ post_event() {
       provider: $provider,
       eventType: $eventType,
       eventTime: $eventTime,
-      payload: $payload,
-      rawPayload: $rawPayload
+      payload: $payload[0],
+      rawPayload: $rawPayload[0]
     }')
+  rm -f "$tmp_p" "$tmp_r"
 
   local http_code matched where
   if matched=$(scan_sensitive "$full_payload"); then
@@ -306,12 +335,12 @@ post_event() {
     spool_line event "$full_payload"
     return 0
   fi
-  http_code=$(curl -sS $AUTH_HEADER --max-time 10 \
+  http_code=$(printf '%s' "$full_payload" | curl -sS $AUTH_HEADER --max-time 10 \
     -o /tmp/chum-session-event-resp.$$.json \
     -w "%{http_code}" \
     -X POST \
     -H "Content-Type: application/json" \
-    -d "$full_payload" \
+    --data-binary @- \
     "${API_URL}/v1/ingest/session/event" 2>&1) || {
     echo "session-sync: WARN session_event_append failed — API unreachable at ${API_URL}; spooling" >&2
     rm -f /tmp/chum-session-event-resp.$$.json
@@ -356,6 +385,10 @@ end_session() {
   if [[ -z "$chum_session_id" || "$chum_session_id" == "null" || "$chum_session_id" == "DEFERRED" ]]; then
     rm -f "$SESSION_STATE_FILE"
     ensure_session_started
+    if [[ "${CHUM_SPOOL_ONLY:-0}" == "1" ]]; then  # session_start just failed: spool the end too
+      spool_line end "$(jq -c -n --arg summary "$summary_text" '{sessionId: "DEFERRED", summary: $summary}')"
+      rm -f "$SESSION_STATE_FILE"; return 0
+    fi
     chum_session_id=$(jq -r '.sessionId // ""' "$SESSION_STATE_FILE")
     [[ -n "$chum_session_id" && "$chum_session_id" != "null" ]] || { rm -f "$SESSION_STATE_FILE"; return 0; }
   fi

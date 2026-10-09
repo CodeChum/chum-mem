@@ -95,12 +95,29 @@ If the tunnel is slow (several sessions share it), the hooks' health gate can be
 widened per repo with `"healthTimeoutSecs": 8` in `.chum-mem` (default 5 s); a
 tripped gate spools the whole turn instead of sending it live.
 
-Auto-recall (the "Team memory" block on every prompt) shows up to 5 hits chosen
-from a pool of 20 candidates; a hit must have semantic similarity >= 0.7 plus a
-word in common with the prompt, or a lexical match, or share 30% of the prompt's
-content words. Knobs: `CHUM_AUTO_RECALL_LIMIT`, `CHUM_AUTO_RECALL_POOL`,
-`CHUM_AUTO_RECALL_MIN_SEMANTIC`. A hit whose title repeats your own question is
-dropped (every prompt is also stored as an "open question" memory).
+Auto-recall (the block added to every prompt) has two parts, fetched in
+parallel under one timeout (`CHUM_AUTO_RECALL_TIMEOUT_SECS`, default 6 s, output
+capped at 3,000 chars):
+- **Team memory**: up to 5 session-memory hits from a pool of 20. A hit needs 2
+  content words in common with the prompt (1 if the prompt has only one) AND
+  semantic similarity >= 0.8, a lexical match, or 30% of the prompt's content
+  words. `implementation_detail` hits and hits whose title is a shell command,
+  a `X=/path` assignment or a bare path are dropped. A hit whose title repeats
+  your own question is dropped too (every prompt is also stored as an "open
+  question" memory). Knobs: `CHUM_AUTO_RECALL_LIMIT`, `CHUM_AUTO_RECALL_POOL`,
+  `CHUM_AUTO_RECALL_MIN_SEMANTIC`.
+- **Team docs**: the top 3 repository-layer documents for the prompt as
+  `[doc] <path>` lines (the same search as `knowledge_query(layer:repository)`).
+  In the 2026-10-09 recall review this layer answered 6/15 real questions at
+  rank 1 where session memory answered 1/15. `CHUM_AUTO_RECALL_DOCS=0` turns it off.
+
+When the hooks cannot capture (API unreachable or too slow, token rejected), a
+one-line warning appears in your terminal at most once every 10 minutes per
+checkout; events are spooled and replayed. `CHUM_NOTICES=0` silences it.
+
+The docs sync uploads only files git tracks (plus the rules in
+`.chum-sync-rules.json`); loose notes and untracked files stay on your laptop.
+`CHUM_SYNC_INCLUDE_UNTRACKED=1` restores the old full walk.
 
 If you have a global hook that spawns `claude -p` (for example a session
 labeller), guard it with an env flag: the nested session fires the project hooks

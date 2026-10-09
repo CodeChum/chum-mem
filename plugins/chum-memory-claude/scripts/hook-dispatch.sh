@@ -37,9 +37,17 @@ fi
 # Read the full hook payload from stdin once
 HOOK_PAYLOAD=$(cat)
 
+# jq is the one dependency macOS does not ship. Without it nothing below can parse
+# the payload; say so plainly instead of failing silently on every event.
+if ! command -v jq >/dev/null 2>&1; then
+  printf '{"systemMessage":"chum-mem: jq is not installed (brew install jq) - team memory is OFF; nothing from this session is captured or recalled."}\n'
+  exit 0
+fi
+
 # Extract hook event name and (Codex) cwd fallback
 HOOK_EVENT=$(echo "$HOOK_PAYLOAD" | jq -r '.hook_event_name // ""' 2>/dev/null || echo "")
 PAYLOAD_CWD=$(echo "$HOOK_PAYLOAD" | jq -r '.cwd // ""' 2>/dev/null || echo "")
+SESSION_ID=$(echo "$HOOK_PAYLOAD" | jq -r '.session_id // ""' 2>/dev/null || echo "")
 
 # Resolve project dir: prefer Claude env var, else payload cwd, else $PWD
 if [[ -n "${CLAUDE_PROJECT_DIR:-}" ]]; then
@@ -51,6 +59,27 @@ else
 fi
 export CLAUDE_PROJECT_DIR="$PROJECT_DIR"
 export CHUM_PROVIDER="$PROVIDER"
+
+# ── User-visible notices, rate-limited ──
+# Hook stderr is invisible to the user when the hook exits 0, so a dead tunnel or
+# a rejected token used to look exactly like success (nothing captured, no sign).
+# A short systemMessage is shown instead, at most once per 10 minutes per
+# checkout and per kind (marker file mtime), and only on the two turn-start
+# events so Stop/PostToolUse output stays empty. CHUM_NOTICES=0 silences them.
+SYSTEM_MSG=""
+__notice_due() {  # $1 kind -> 0 when a notice of this kind may be shown now
+  [[ "${CHUM_NOTICES:-1}" == "1" ]] || return 1
+  case "$HOOK_EVENT" in SessionStart|UserPromptSubmit) ;; *) return 1 ;; esac
+  local m="${PROJECT_DIR}/.chum-cache/.notice-${1}"
+  mkdir -p "${PROJECT_DIR}/.chum-cache" 2>/dev/null || return 1
+  if [[ -e "$m" && -z "$(find "$m" -mmin +10 2>/dev/null)" ]]; then return 1; fi
+  : > "$m"
+}
+__add_notice() {  # $1 text -> appended to SYSTEM_MSG, JSON-escaped (no surrounding quotes)
+  local esc; esc=$(printf '%s' "$1" | jq -Rs '.' 2>/dev/null | sed 's/^"//;s/"$//')
+  [[ -n "$esc" ]] || return 0
+  SYSTEM_MSG="${SYSTEM_MSG:+${SYSTEM_MSG} | }${esc}"
+}
 
 # ── Health gate — if the API is slow or down, DO NOT drop the event: run the
 # session layer in spool mode (events go to .chum-cache/outbox.jsonl and are
@@ -97,11 +126,19 @@ if [[ "$API_HEALTHY" -eq 0 ]]; then
   # Only the two turn-start events may add context. Emitting additionalContext on
   # Stop/SessionEnd makes Claude Code continue the conversation until --max-turns
   # (observed overnight: 8 looped sessions, ~$1.1 each) — so stay silent there.
+  if __notice_due unreachable; then
+    __add_notice "chum-mem: API unreachable at ${API_URL} (no /health answer within ${HEALTH_TIMEOUT}s). Events are spooled to .chum-cache/outbox/ and replayed once it answers. If this persists, check the tunnel: ~/chum-mem/deploy/gcp/install-tunnel-agent.sh status"
+  fi
+  UNAVAIL_ESC=$(printf '%s' "$UNAVAIL_MSG" | jq -Rs '.' | sed 's/^"//;s/"$//')
   case "$HOOK_EVENT" in
     SessionStart|UserPromptSubmit)
       case "$PROVIDER" in
-        codex) printf '{"systemMessage":"%s"}\n' "$UNAVAIL_MSG" ;;
-        *)     printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"%s"}}\n' "$HOOK_EVENT" "$UNAVAIL_MSG" ;;
+        codex) printf '{"systemMessage":"%s"}\n' "${SYSTEM_MSG:-$UNAVAIL_ESC}" ;;
+        *)     if [[ -n "$SYSTEM_MSG" ]]; then
+                 printf '{"systemMessage":"%s","hookSpecificOutput":{"hookEventName":"%s","additionalContext":"%s"}}\n' "$SYSTEM_MSG" "$HOOK_EVENT" "$UNAVAIL_ESC"
+               else
+                 printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"%s"}}\n' "$HOOK_EVENT" "$UNAVAIL_ESC"
+               fi ;;
       esac ;;
   esac
   exit 0
@@ -141,33 +178,47 @@ PY
   fi
 fi
 PROJECT_NAME=$(basename "$PROJECT_DIR")
-RESOLVE_PAYLOAD=$(jq -n --arg projectId "$CANDIDATE_PROJECT_ID" --arg name "$PROJECT_NAME" \
-  '{projectId: $projectId, name: $name}')
-RESOLVE_RESP=$(curl -sf $AUTH_HEADER --max-time 5 -X POST -H "Content-Type: application/json" \
-  -d "$RESOLVE_PAYLOAD" "${API_URL}/v1/projects/resolve" 2>/dev/null) || RESOLVE_RESP=""
-if [[ -n "$RESOLVE_RESP" ]]; then
-  RESOLVED_PROJECT_ID=$(echo "$RESOLVE_RESP" | jq -r '.projectId // ""' 2>/dev/null || echo "")
-  if [[ -n "$RESOLVED_PROJECT_ID" && "$RESOLVED_PROJECT_ID" != "null" && "$CHUM_MEM_EXISTED" -eq 0 ]]; then
-    # First registration only; atomic so a concurrent reader never sees a partial file.
-    echo "$RESOLVE_RESP" | jq '{projectId: .projectId, name: .name}' > "${CHUM_MEM_FILE}.tmp.$$" 2>/dev/null \
-      && mv -f "${CHUM_MEM_FILE}.tmp.$$" "$CHUM_MEM_FILE" || rm -f "${CHUM_MEM_FILE}.tmp.$$"
+# A committed .chum-mem id is registered on the server once per checkout per day
+# (marker file), not on every hook event: through the IAP tunnel that POST was
+# one of the 3-6 sequential round-trips (~0.5 s each) every hook paid, and the
+# ingest path accepts a known id without it (session/start auto-creates).
+RESOLVE_MARKER="${PROJECT_DIR}/.chum-cache/.resolved-${CANDIDATE_PROJECT_ID}"
+if [[ "$CHUM_MEM_EXISTED" -eq 1 && -e "$RESOLVE_MARKER" && -z "$(find "$RESOLVE_MARKER" -mmin +1440 2>/dev/null)" ]]; then
+  RESOLVED_PROJECT_ID="$CANDIDATE_PROJECT_ID"
+else
+  RESOLVE_PAYLOAD=$(jq -n --arg projectId "$CANDIDATE_PROJECT_ID" --arg name "$PROJECT_NAME" \
+    '{projectId: $projectId, name: $name}')
+  RESOLVE_RESP=$(curl -sf $AUTH_HEADER --max-time 5 -X POST -H "Content-Type: application/json" \
+    -d "$RESOLVE_PAYLOAD" "${API_URL}/v1/projects/resolve" 2>/dev/null) || RESOLVE_RESP=""
+  if [[ -n "$RESOLVE_RESP" ]]; then
+    RESOLVED_PROJECT_ID=$(echo "$RESOLVE_RESP" | jq -r '.projectId // ""' 2>/dev/null || echo "")
+    if [[ -n "$RESOLVED_PROJECT_ID" && "$RESOLVED_PROJECT_ID" != "null" ]]; then
+      mkdir -p "${PROJECT_DIR}/.chum-cache" 2>/dev/null && : > "${PROJECT_DIR}/.chum-cache/.resolved-${RESOLVED_PROJECT_ID}"
+    fi
+    if [[ -n "$RESOLVED_PROJECT_ID" && "$RESOLVED_PROJECT_ID" != "null" && "$CHUM_MEM_EXISTED" -eq 0 ]]; then
+      # First registration only; atomic so a concurrent reader never sees a partial file.
+      echo "$RESOLVE_RESP" | jq '{projectId: .projectId, name: .name}' > "${CHUM_MEM_FILE}.tmp.$$" 2>/dev/null \
+        && mv -f "${CHUM_MEM_FILE}.tmp.$$" "$CHUM_MEM_FILE" || rm -f "${CHUM_MEM_FILE}.tmp.$$"
+    fi
   fi
 fi
 export CHUM_MEM_PROJECT_ID="${RESOLVED_PROJECT_ID:-${CHUM_MEM_PROJECT_ID:-}}"
 
-# ── Ensure .mcp.json carries the project ID in the URL for Claude Code ──
-# Claude Code's HTTP MCP transport uses the URL from .mcp.json. The env var
-# expansion in headers may not have access to CHUM_MEM_PROJECT_ID (set in hook
-# subprocess, not parent). Embedding it in the URL guarantees delivery.
-if [[ -n "${CHUM_MEM_PROJECT_ID:-}" ]]; then
-  MCP_JSON_PATH="${SCRIPTS_DIR}/../.mcp.json"
+# ── Plugin layout only: keep the plugin's own .mcp.json pointed at this project ──
+# Claude Code's HTTP MCP transport uses the URL from .mcp.json, and a plugin's
+# file cannot expand the project id itself. In the vendored layout (scripts
+# committed under .claude/chum-mem/) the repo-root .mcp.json is committed and
+# must never be rewritten, and "${SCRIPTS_DIR}/../.mcp.json" does not exist; a
+# dirname-$0 run from a plugin checkout used to rewrite the checkout's copy.
+if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" && -n "${CHUM_MEM_PROJECT_ID:-}" ]]; then
+  MCP_JSON_PATH="${CLAUDE_PLUGIN_ROOT}/.mcp.json"
   MCP_URL_WITH_PROJECT="${API_URL}/mcp?projectId=${CHUM_MEM_PROJECT_ID}"
   if [[ -f "$MCP_JSON_PATH" ]]; then
     CURRENT_URL=$(jq -r '.mcpServers["chum-memory"].url // ""' "$MCP_JSON_PATH" 2>/dev/null || echo "")
-    if [[ "$CURRENT_URL" != "$MCP_URL_WITH_PROJECT" ]]; then
+    if [[ -n "$CURRENT_URL" && "$CURRENT_URL" != "$MCP_URL_WITH_PROJECT" ]]; then
       jq --arg url "$MCP_URL_WITH_PROJECT" \
-        '.mcpServers["chum-memory"].url = $url' "$MCP_JSON_PATH" > "${MCP_JSON_PATH}.tmp" \
-        && mv "${MCP_JSON_PATH}.tmp" "$MCP_JSON_PATH"
+        '.mcpServers["chum-memory"].url = $url' "$MCP_JSON_PATH" > "${MCP_JSON_PATH}.tmp.$$" \
+        && mv "${MCP_JSON_PATH}.tmp.$$" "$MCP_JSON_PATH" || rm -f "${MCP_JSON_PATH}.tmp.$$"
     fi
   fi
 fi
@@ -177,21 +228,36 @@ SESSION_STDERR=""
 if [[ -x "${SCRIPTS_DIR}/session-sync.sh" ]]; then
   SESSION_STDERR=$(printf '%s' "$HOOK_PAYLOAD" | bash "${SCRIPTS_DIR}/session-sync.sh" 2>&1 >/dev/null) || {
     echo "chum-memory session-sync error: ${SESSION_STDERR}" >&2
+    # The event was not stored. Tell the user (rate-limited): a 401 means the
+    # token step was skipped or the token rotated; anything else is the server.
+    if __notice_due syncerr; then
+      SYNC_ERR_LINE=$(printf '%s' "$SESSION_STDERR" | grep -m1 -E 'ERROR|aborted' || printf '%s' "$SESSION_STDERR" | head -n 1)
+      __add_notice "chum-mem: this session is NOT being captured - ${SYNC_ERR_LINE:0:200}. HTTP 401 = run ~/chum-mem/deploy/gcp/install-tunnel-agent.sh token; otherwise check the server/tunnel (install-tunnel-agent.sh status)."
+    fi
   }
 fi
 
 __tlog session_layer
-# A held (quarantined) event leaves a notice; show it to the user once.
-SYSTEM_MSG=""
-QNOTICE="${PROJECT_DIR}/.chum-cache/quarantine/.notice"
-if [[ -f "$QNOTICE" ]]; then
-  SYSTEM_MSG=$(jq -Rs '.' < "$QNOTICE" 2>/dev/null | sed 's/^"//;s/"$//'); rm -f "$QNOTICE"
+# A held (quarantined) event leaves a per-session notice; show it to the user once.
+QNOTICE="${PROJECT_DIR}/.chum-cache/quarantine/.notice.${SESSION_ID}"
+if [[ -n "$SESSION_ID" && -f "$QNOTICE" ]]; then
+  __add_notice "$(cat "$QNOTICE" 2>/dev/null)"; rm -f "$QNOTICE"
+fi
+# The session layer falls back to spooling when the API passes /health but then
+# times out. Skip everything else that would call it again this turn: otherwise
+# the repo sync (120 s request budget) and auto-recall ran into the 30 s hook kill.
+API_DEGRADED=0
+if [[ "$SESSION_STDERR" == *"spooling"* ]]; then
+  API_DEGRADED=1
+  __notice_due unreachable && __add_notice "chum-mem: API at ${API_URL} is answering too slowly; this turn's events are spooled to .chum-cache/outbox/ and will be replayed. Memory recall is skipped until it recovers."
 fi
 # ── Repository layer (only on turn-boundary events) ──
 case "$HOOK_EVENT" in
   UserPromptSubmit|SessionStart)
-    if [[ -x "${SCRIPTS_DIR}/sync.sh" ]]; then
-      bash "${SCRIPTS_DIR}/sync.sh" "$PROJECT_DIR" >/dev/null 2>&1 || true
+    if [[ "$API_DEGRADED" -eq 0 && -x "${SCRIPTS_DIR}/sync.sh" ]]; then
+      # Bounded per request inside a hook; the manifest is reconciled per chunk,
+      # so a cut-short cold sync resumes on the next prompt.
+      CHUM_SYNC_TIMEOUT_SECS="${CHUM_SYNC_TIMEOUT_SECS:-10}" bash "${SCRIPTS_DIR}/sync.sh" "$PROJECT_DIR" >/dev/null 2>&1 || true
     fi
     ;;
 esac
@@ -219,22 +285,43 @@ USER_PROMPT_MSG="ChumMemory is active. Relevant team memory for this prompt (if 
 SESSION_START_BASE="ChumMemory plugin active (PCKC v2.2.3, MCP server: chum-memory). Multi-project mode: each project folder has its own project ID (auto-resolved via .chum-mem). Repository layer (knowledge_query, knowledge_communities, layer-specific knowledge_report) is STRICTLY per-project — projectId is required, no global fallback. Unified knowledge_report keeps repository strict and uses session-layer global fallback for continuity signals. Session layer knowledge queries fall back to global project if no project-specific snapshot exists. mem_search falls back to global project for historical memories. The hook auto-runs repository_sync before every turn — do NOT call project_import or repository_sync manually. On every code-related prompt use this strict order: MCP knowledge_report(layer:unified) first; repository-layer knowledge_query second; mem_search third; Read/Grep/Glob/Edit last. Two layers: repository (code structure, AST) and session (interaction history); unified is report-only. Always pass layer. Three-way hybrid search (lexical + pgvector + Chroma). Typed partitions for per-type precision. Hierarchical communities (level-0 + level-1). Governance: use claim_govern to pin/archive/reject claims. Load the ChumMemory skill for the full cookbook and decision tree."
 
 
-# ── Automatic recall: search memory for the prompt itself and inject the top
-# hits, so retrieval does not depend on the model deciding to call a tool or on
-# how the user phrases the question. One REST call, bounded output.
+# ── Automatic recall: search memory AND the repository docs for the prompt
+# itself and inject the top hits, so retrieval does not depend on the model
+# deciding to call a tool or on how the user phrases the question. Two calls run
+# in parallel under one timeout (CHUM_AUTO_RECALL_TIMEOUT_SECS); output is capped
+# at 3,000 chars. The docs layer is worth it: in the 2026-10-09 recall review it
+# answered 6/15 real questions at rank 1 where session memory answered 1/15.
 fetch_prompt_memory_escaped() {
   local api_url="${CHUM_MEMORY_API_URL:-http://localhost:63001}"
-  local prompt limit body resp md
+  local prompt limit body resp md docs tmo tmpd
   prompt=$(echo "$HOOK_PAYLOAD" | jq -r '.prompt // ""' 2>/dev/null)
   # skip trivial prompts (slash commands, one-word replies)
   [[ ${#prompt} -ge 12 && "$prompt" != /* ]] || return 1
   limit="${CHUM_AUTO_RECALL_LIMIT:-5}"
+  tmo="${CHUM_AUTO_RECALL_TIMEOUT_SECS:-6}"
   # Ask for a wider candidate pool than we show: the server's lexical path orders
   # partial matches by recency inside its LIMIT, so a 5-row request can miss a
   # relevant memory that is a few minutes older than unrelated chatter.
   local pool; pool="${CHUM_AUTO_RECALL_POOL:-20}"
-  body=$(jq -n --arg q "${prompt:0:800}" --arg pid "${CHUM_MEM_PROJECT_ID:-}" --argjson n "$pool"     '{query:$q, mode:"hybrid", limit:$n, disclosureLevel:"overview"} + (if $pid != "" then {projectId:$pid} else {} end)')
-  resp=$(curl -sf $AUTH_HEADER --max-time "${CHUM_AUTO_RECALL_TIMEOUT_SECS:-6}" -X POST -H 'Content-Type: application/json'     -d "$body" "${api_url}/api/search" 2>/dev/null) || return 1
+  body=$(jq -n --arg q "${prompt:0:800}" --arg pid "${CHUM_MEM_PROJECT_ID:-}" --argjson n "$pool" \
+    '{query:$q, mode:"hybrid", limit:$n, disclosureLevel:"overview"} + (if $pid != "" then {projectId:$pid} else {} end)')
+  tmpd=$(mktemp -d "${TMPDIR:-/tmp}/chum-recall.XXXXXX") || return 1
+  curl -sf $AUTH_HEADER --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
+    -d "$body" "${api_url}/api/search" > "$tmpd/mem" 2>/dev/null &
+  local docs_n="${CHUM_AUTO_RECALL_DOCS:-3}"
+  if [[ "$docs_n" -gt 0 && -n "${CHUM_MEM_PROJECT_ID:-}" ]]; then
+    # Repository layer = the docs the team committed (CLAUDE files, rules, notes).
+    # Same call as MCP knowledge_query(search, layer:repository).
+    jq -n --arg t "${prompt:0:300}" --arg pid "$CHUM_MEM_PROJECT_ID" \
+      '{jsonrpc:"2.0", id:1, method:"tools/call", params:{name:"knowledge_query",
+        arguments:{query:"search", text:$t, layer:"repository", projectId:$pid, limit:8}}}' \
+    | curl -sf $AUTH_HEADER --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
+        -H 'Accept: application/json, text/event-stream' --data-binary @- \
+        "${api_url}/mcp?projectId=${CHUM_MEM_PROJECT_ID}" > "$tmpd/docs" 2>/dev/null &
+  fi
+  wait
+  resp=$(cat "$tmpd/mem" 2>/dev/null); docs=$(cat "$tmpd/docs" 2>/dev/null)
+  rm -rf "$tmpd"
   local pfx
   pfx=$(printf '%s' "$prompt" | tr '[:upper:]' '[:lower:]' | cut -c1-60)
   # Content words of the prompt (>= 4 chars, lowercase) for the overlap check below.
@@ -242,31 +329,56 @@ fetch_prompt_memory_escaped() {
   # Generic words carry no topic and are dropped before the overlap test.
   local stop='^(about|after|again|also|always|anyone|anything|around|because|been|before|being|both|could|does|doing|done|each|either|else|even|ever|every|files?|find|first|from|give|have|here|into|just|know|last|like|lines?|look|make|more|most|much|must|need|never|next|only|other|over|please|read|really|same|should|since|some|still|such|sure|take|tell|than|that|their|them|then|there|these|they|thing|think|this|those|through|under|until|very|want|were|what|when|where|whether|which|while|will|with|without|would|your)$'
   words=$(printf '%s' "$prompt" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-' '\n' | awk -v stop="$stop" 'length($0) >= 4 && $0 !~ stop' | sort -u | tr '\n' ' ')
-  md=$(printf '%s' "$resp" | jq -r --arg gate "${CHUM_AUTO_RECALL_MIN_SEMANTIC:-0.7}" --arg pfx "$pfx" --arg words "$words" --arg limit "$limit" '
+  md=""
+  [[ -n "$resp" ]] && md=$(printf '%s' "$resp" | jq -r --arg gate "${CHUM_AUTO_RECALL_MIN_SEMANTIC:-0.8}" --arg pfx "$pfx" --arg words "$words" --arg limit "$limit" '
     ($words | split(" ") | map(select(length > 0))) as $w |
+    # Word overlap needed on every path: 2 content words (1 if the prompt has only one).
+    ([2, ($w | length)] | min) as $need |
     [.hits[]? | select(.verificationStatus != "contradicted")
+       # implementation_detail memories are grep lines, scratch paths and commands
+       # (the recall review: 12 of 17 hits on one question were shell lines). Drop
+       # them, and any hit whose title is shell- or path-shaped whatever its type.
+       | select((.memoryType // .type // "") != "implementation_detail")
+       | ((.title // "") | gsub("^\\s+"; "")) as $t
+       | select(($t | test("^(\\$\\s*)?(sudo\\s+)?(grep|rg|cd|curl|gcloud|git|gh|bash|sh|zsh|ls|cat|find|sed|awk|jq|docker|kubectl|npm|npx|pnpm|python3?|uv|psql|export|echo|cp|mv|mkdir|chmod|ssh|scp|tail|head|source)(\\s|$)"; "i")) | not)
+       | select(($t | contains("=/")) | not)
+       | select(($t | test("^[~./]?[^\\s]*/[^\\s]*$")) | not)
+       | select((($t | [scan("/")] | length) >= 3 and ($t | [scan(" ")] | length) <= 2) | not)
        # Relevance gate: the ranker has no floor, so without this the block is just the
        # newest memories in the store (observed overnight: 0/32 relevant under load).
-       # Three ways in: semantic score, a full lexical match, or plain word overlap with
-       # the prompt (a memory minutes old has no embedding yet on a worker-indexed
-       # store, and a partial lexical match reports 0.0 — both would otherwise be hidden).
        | (((.title // "") + " " + (.summary // "") + " " + (.content // "")) | ascii_downcase) as $text
        | ([$w[] | select(. as $x | $text | contains($x))] | length) as $overlap
-       | select((((.semanticScore // 0) >= ($gate | tonumber)) and ($overlap >= 1 or ($w | length) == 0))
-                or (((.lexicalScore // 0) > 0) and ($overlap >= 1 or ($w | length) == 0))
-                or ($overlap >= 2 and ($overlap * 10) >= (($w | length) * 3)))
+       | select($overlap >= $need)
+       | select(((.semanticScore // 0) >= ($gate | tonumber))
+                or ((.lexicalScore // 0) > 0)
+                or (($overlap * 10) >= (($w | length) * 3)))
        # Drop echoes: a stored copy of the same question is not knowledge.
        | select(((.title // "") | ascii_downcase | contains($pfx)) | not)] | .[0:($limit | tonumber)] |
     if length == 0 then "" else
       "--- Team memory (auto-recall for this prompt; hits from chum-memory, newest first within rank) ---\n" +
       (map("- [" + (.memoryType // .type // "memory" | tostring) + "] "
            + ((.title // "") | gsub("\n"; " ") | .[0:220])
-           + " (by " + (.authorEmail // "unknown") + ", " + ((.createdAt // "")[0:16]) + ", session " + ((.sessionIds[0] // "") | tostring | .[0:8]) + ", " + (if ((.semanticScore // 0) > 0 or (.lexicalScore // 0) > 0) then ("match " + ((([(.semanticScore // 0), (.lexicalScore // 0), 1] | min) as $m | ([(.semanticScore // 0), (.lexicalScore // 0)] | max | if . > 1 then 1 else . end) * 100 | floor) | tostring) + "%") else "word overlap" end) + ")"
+           + " (by " + (.authorEmail // "unknown") + ", " + ((.createdAt // "")[0:16]) + ", session " + ((.sessionIds[0] // "") | tostring | .[0:8]) + ", " + (if ((.semanticScore // 0) > 0 or (.lexicalScore // 0) > 0) then ("match " + ((([(.semanticScore // 0), (.lexicalScore // 0)] | max | if . > 1 then 1 else . end) * 100 | floor) | tostring) + "%") else "word overlap" end) + ")"
           ) | join("\n"))
       + "\nIf any of these bears on the request, use it and say who recorded it; call mem_search for details."
     end' 2>/dev/null)
-  [[ -n "$md" ]] || return 1
-  printf '%s' "${md:0:3000}" | jq -Rs '.' 2>/dev/null | sed 's/^"//;s/"$//'
+  local dl=""
+  [[ -n "$docs" ]] && dl=$(printf '%s' "$docs" | jq -r --argjson n "$docs_n" '
+    [(.result.structuredContent.nodes // [])[]
+      | (.metadata.fullPath // .sourceId // ((.id // "") | sub("^(file|section):"; "") | sub(":[^:]*$"; ""))) as $path
+      | select(($path | length) > 0)
+      | {path: $path, label: (if (.type // .kind) == "section" and (.label // "") != ($path | split("/") | last) then (.label // "") else "" end)}]
+    | reduce .[] as $d ([]; if any(.[]; .path == $d.path) then . else . + [$d] end)
+    | .[0:$n]
+    | if length == 0 then "" else
+        "--- Team docs (repository layer, top matches for this prompt) ---\n"
+        + (map("- [doc] " + .path + (if .label != "" then " > " + (.label | gsub("\n"; " ") | .[0:120]) else "" end)) | join("\n"))
+        + "\nRead the doc before relying on it; call knowledge_query(layer:repository) for more."
+      end' 2>/dev/null)
+  local out="$md" nl=$'\n'
+  [[ -n "$dl" ]] && out="${out:+${out}${nl}}${dl}"
+  [[ -n "$out" ]] || return 1
+  printf '%s' "${out:0:3000}" | jq -Rs '.' 2>/dev/null | sed 's/^"//;s/"$//'
 }
 
 # ── Fetch knowledge report on session start for codebase context ──
@@ -287,7 +399,8 @@ fetch_knowledge_report_escaped() {
 
 case "$HOOK_EVENT" in
   UserPromptSubmit)
-    RECALL=$(fetch_prompt_memory_escaped 2>/dev/null || echo "")
+    RECALL=""
+    [[ "$API_DEGRADED" -eq 0 ]] && RECALL=$(fetch_prompt_memory_escaped 2>/dev/null || echo "")
     __tlog auto_recall 2>/dev/null || true
     if [[ -n "$RECALL" ]]; then
       PROMPT_MSG="${USER_PROMPT_MSG}\\n\\n${RECALL}"
@@ -302,7 +415,8 @@ case "$HOOK_EVENT" in
     ;;
   SessionStart)
     # Fetch repository knowledge report to prime the session
-    KB_REPORT=$(fetch_knowledge_report_escaped 2>/dev/null || echo "")
+    KB_REPORT=""
+    [[ "$API_DEGRADED" -eq 0 ]] && KB_REPORT=$(fetch_knowledge_report_escaped 2>/dev/null || echo "")
     if [[ -n "$KB_REPORT" ]]; then
       SESSION_START_MSG="${SESSION_START_BASE}\\n\\n--- Unified Knowledge Report ---\\n${KB_REPORT}"
     else
