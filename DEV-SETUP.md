@@ -43,13 +43,18 @@ bulk-import indexes dropped (FINDINGS F31). Copy the transcript folders up, then
 gcloud compute scp --recurse --tunnel-through-iap --zone=asia-east1-b --project=gradechum \
   ~/.claude/projects/-Users-<you>-gradechum-gradechum* gradechum-chum-mem:/tmp/sessions/
 # on the VM (deploy/gcp/deploy-vm.sh ssh), from /opt/chum-mem/src:
-pnpm sessions:import --roots /tmp/sessions --server http://10.140.0.9:63001 \
-  --project $(jq -r .projectId <monorepo>/.chum-mem) --yes
+CHUM_IMPORT_EMAIL=<you>@codechum.com pnpm sessions:import --roots /tmp/sessions \
+  --server http://10.140.0.9:63001 --project $(jq -r .projectId <monorepo>/.chum-mem) --yes
 curl -s -X POST -H 'Content-Type: application/json' -d '{"projectId":"<id>"}' http://10.140.0.9:63001/v1/ingest/bulk/create-indexes
 ```
 
 Embeddings are computed on ingest with the local model, so no re-embed step is
 needed on the VM (`POST /api/admin/reembed` exists for model changes).
+`CHUM_IMPORT_EMAIL` stamps the imported sessions with your identity (otherwise
+the importer's git `user.email`); without it recall shows "by unknown".
+
+Commit `.chum-sync-rules.json` with the branch: a checkout without it syncs
+all code and rewrites the shared repository snapshot for everyone.
 
 ## 3. Each engineer (one-time, about 3 minutes)
 
@@ -72,10 +77,28 @@ Claude Code asks once to approve the project's MCP server (`chum-memory`) and
 hooks; accept. From then on every session is captured and auto-searched.
 If the tunnel is down, events spool to `.chum-cache/outbox/` and replay later.
 
+Do **not** also install the chum-memory plugin in this checkout: the committed
+hooks and the plugin would both fire and every event would be stored twice.
+
 Check: `~/chum-mem/deploy/gcp/install-tunnel-agent.sh status` shows `/ready`;
 in Claude Code `/mcp` shows `chum-memory` connected; ask "is anyone working on
 the bonus toggle?" and the answer cites team memory with an author email.
 Identity is your git `user.email` in that checkout.
+
+If the tunnel is slow (several sessions share it), the hooks' health gate can be
+widened per repo with `"healthTimeoutSecs": 8` in `.chum-mem` (default 5 s); a
+tripped gate spools the whole turn instead of sending it live.
+
+Auto-recall (the "Team memory" block on every prompt) shows up to 5 hits chosen
+from a pool of 20 candidates; a hit must have semantic similarity >= 0.7 plus a
+word in common with the prompt, or a lexical match, or share 30% of the prompt's
+content words. Knobs: `CHUM_AUTO_RECALL_LIMIT`, `CHUM_AUTO_RECALL_POOL`,
+`CHUM_AUTO_RECALL_MIN_SEMANTIC`. A hit whose title repeats your own question is
+dropped (every prompt is also stored as an "open question" memory).
+
+If you have a global hook that spawns `claude -p` (for example a session
+labeller), guard it with an env flag: the nested session fires the project hooks
+again and is captured as a junk session under your email.
 
 Optional hardening: the API supports shared tokens (`CHUM_MEM_API_TOKENS` on
 the server, `CHUM_MEMORY_API_TOKEN` in each shell). Off by default while the
@@ -99,3 +122,18 @@ only door is IAP.
 - Transcripts are stored raw with no redaction (team decision); the server's
   access control is the only gate.
 - Headless `claude -p` runs capture no prompt on some Claude Code versions (F9).
+
+## Changing the hook scripts (maintainers)
+
+`.claude/chum-mem/scripts/` in the monorepo is a byte copy of
+`plugins/chum-memory-claude/scripts/` in this repo; change the fork first and
+copy. Before any paid session, run the three-event dry run against the server
+and confirm the session row on it (this caught a silent `set -e` exit that lost
+3.5 hours of capture during the overnight test, FINDINGS F39):
+
+```bash
+R=<checkout>; for ev in SessionStart UserPromptSubmit Stop; do
+  jq -n --arg r "$R" --arg ev $ev '{session_id:"dry-1",hook_event_name:$ev,cwd:$r,prompt:"dry run",last_assistant_message:"ok",source:"startup"}' \
+  | CHUM_MEMORY_API_URL=http://localhost:63001 CLAUDE_PROJECT_DIR=$R bash $R/.claude/chum-mem/scripts/hook-dispatch.sh; done
+# expect on the server: sessions.external_session_id='dry-1', status completed, metadata.userEmail set, events prompt+response
+```

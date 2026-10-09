@@ -16,6 +16,8 @@
 set -euo pipefail
 
 API_URL="${CHUM_MEMORY_API_URL:-http://localhost:63001}"
+FLUSH_ONLY=0
+if [[ "${1:-}" == "--flush" ]]; then FLUSH_ONLY=1; fi
 # ── API token (optional): sent as X-Chum-Token on every call. Single-word
 # header so it can be expanded unquoted under bash 3.2 with `set -u`.
 AUTH_HEADER=""
@@ -31,20 +33,20 @@ PROVIDER="$(printf '%s' "${CHUM_PROVIDER:-claude}" | tr '[:upper:]' '[:lower:]')
 
 mkdir -p "$CACHE_DIR"
 
-# Read hook payload from stdin
-HOOK_PAYLOAD=$(cat)
-
-if [[ -z "$HOOK_PAYLOAD" ]]; then
-  echo "session-sync: empty stdin payload, nothing to do" >&2
-  exit 0
-fi
-
-HOOK_EVENT=$(echo "$HOOK_PAYLOAD" | jq -r '.hook_event_name // ""')
-AGENT_SESSION_ID=$(echo "$HOOK_PAYLOAD" | jq -r '.session_id // ""')
-
-if [[ -z "$AGENT_SESSION_ID" || "$AGENT_SESSION_ID" == "null" ]]; then
-  echo "session-sync: ERROR missing session_id in hook payload" >&2
-  exit 1
+# Read hook payload from stdin (not in --flush mode)
+HOOK_PAYLOAD=""; HOOK_EVENT=""; AGENT_SESSION_ID="flush"
+if [[ "$FLUSH_ONLY" -eq 0 ]]; then
+  HOOK_PAYLOAD=$(cat)
+  if [[ -z "$HOOK_PAYLOAD" ]]; then
+    echo "session-sync: empty stdin payload, nothing to do" >&2
+    exit 0
+  fi
+  HOOK_EVENT=$(echo "$HOOK_PAYLOAD" | jq -r '.hook_event_name // ""')
+  AGENT_SESSION_ID=$(echo "$HOOK_PAYLOAD" | jq -r '.session_id // ""')
+  if [[ -z "$AGENT_SESSION_ID" || "$AGENT_SESSION_ID" == "null" ]]; then
+    echo "session-sync: ERROR missing session_id in hook payload" >&2
+    exit 1
+  fi
 fi
 
 SESSION_STATE_FILE="${CACHE_DIR}/session-${PROVIDER}-${AGENT_SESSION_ID}.json"
@@ -92,27 +94,29 @@ session_start_payload() {
 
 spool_line() {  # $1 kind (event|end), $2 body json
   jq -c -n --arg kind "$1" --arg ext "$AGENT_SESSION_ID" \
-    --argjson start "$(session_start_payload)" --argjson body "$2" \
-    '{kind:$kind, ext:$ext, start:$start, body:$body}' >> "$OUTBOX"
+    --argjson start "$(session_start_payload)" --argjson body "$2" --arg api "$API_URL" \
+    '{kind:$kind, ext:$ext, api:$api, start:$start, body:$body}' >> "$OUTBOX"
 }
 
 flush_one() {
-  local f="$1" tmp="$1.flushing.$$" line kind body start sid code ep sent=0 total
+  local f="$1" tmp="$1.flushing.$$" line kind body start sid code ep api sent=0 total
   [[ -s "$f" ]] || { rm -f "$f"; return 0; }
   mv "$f" "$tmp" || return 0
   total=$(grep -c . "$tmp" || true)
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     kind=$(printf '%s' "$line" | jq -r '.kind // "event"')
+    # Lines record the API they were spooled for; older lines fall back to ours.
+    api=$(printf '%s' "$line" | jq -r '.api // empty'); api="${api:-$API_URL}"
     start=$(printf '%s' "$line" | jq -c '.start')
     body=$(printf '%s' "$line" | jq -c '.body')
     sid=$(curl -sS $AUTH_HEADER --max-time 10 -X POST -H 'Content-Type: application/json' -d "$start" \
-      "${API_URL}/v1/ingest/session/start" 2>/dev/null | jq -r '.sessionId // empty' 2>/dev/null) || sid=""
+      "${api}/v1/ingest/session/start" 2>/dev/null | jq -r '.sessionId // empty' 2>/dev/null) || sid=""
     [[ -n "$sid" ]] || break
     body=$(printf '%s' "$body" | jq -c --arg sid "$sid" '.sessionId = $sid')
     case "$kind" in end) ep="session/end" ;; *) ep="session/event" ;; esac
     code=$(curl -sS $AUTH_HEADER --max-time 15 -o /dev/null -w "%{http_code}" -X POST \
-      -H 'Content-Type: application/json' -d "$body" "${API_URL}/v1/ingest/${ep}" 2>/dev/null) || code="000"
+      -H 'Content-Type: application/json' -d "$body" "${api}/v1/ingest/${ep}" 2>/dev/null) || code="000"
     [[ "$code" == 2* ]] || break
     sent=$((sent + 1))
   done < "$tmp"
@@ -127,12 +131,39 @@ flush_one() {
 }
 
 # Replay every spooled file for this project (all sessions), oldest first.
+# Runs in a DETACHED process (see spawn_flush): replays take ~1.5 s per line
+# over a tunnel and must not be killed by the hook's 10-60 s timeout.
 flush_outbox() {
   local f
+  # Recover files a killed replay left behind (they still hold every unsent line).
+  for f in "$OUTBOX_DIR"/*.flushing.*; do
+    [[ -e "$f" ]] || continue
+    if [[ -n "$(find "$f" -mmin +2 2>/dev/null)" ]]; then
+      cat "$f" >> "${f%%.flushing.*}" && rm -f "$f"
+    fi
+  done
   for f in "$OUTBOX_DIR"/*.jsonl; do
     [[ -e "$f" ]] || continue
     flush_one "$f"
   done
+}
+
+# Start one detached replayer if there is anything to replay and none is running.
+spawn_flush() {
+  local lock="$OUTBOX_DIR/.flush.lock" n f
+  # Counted in the shell: `ls glob glob | wc -l` returns non-zero when a glob has
+  # no match, and under `set -e` that silently ended the whole script before the
+  # event was posted (found 2026-10-09: every hook lost once the outbox was clean).
+  n=0
+  for f in "$OUTBOX_DIR"/*.jsonl "$OUTBOX_DIR"/*.flushing.*; do [[ -e "$f" ]] && n=$((n + 1)); done
+  [[ "$n" -gt 0 ]] || return 0
+  if [[ -d "$lock" ]]; then
+    # stale lock (replayer died) after 15 minutes
+    [[ -n "$(find "$lock" -mmin +15 2>/dev/null)" ]] && rmdir "$lock" 2>/dev/null || return 0
+  fi
+  mkdir "$lock" 2>/dev/null || return 0
+  ( nohup bash "$0" --flush >> "$OUTBOX_DIR/flush.log" 2>&1; rmdir "$lock" 2>/dev/null ) >/dev/null 2>&1 &
+  disown 2>/dev/null || true
 }
 
 ensure_session_started() {
@@ -199,8 +230,12 @@ post_event() {
   fi
 
   local event_id event_time idempotency_key
-  event_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
-  event_time=$(python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]+"Z")')
+  # No python3 here: two interpreter spawns per event were a visible share of hook
+  # latency under load (overnight D7). uuidgen + perl ship with macOS and Debian.
+  event_id=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]') || event_id=""
+  [[ -n "$event_id" ]] || event_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+  event_time=$(perl -MTime::HiRes=time -MPOSIX=strftime -e '$t=time; printf "%s.%03dZ", strftime("%Y-%m-%dT%H:%M:%S", gmtime($t)), ($t-int($t))*1000' 2>/dev/null) || event_time=""
+  [[ -n "$event_time" ]] || event_time=$(date -u +%FT%T.000Z)
   idempotency_key=$(printf '%s|%s|%s' "$chum_session_id" "$event_type" "$event_id" | shasum -a 256 | cut -d' ' -f1)
 
   local full_payload
@@ -318,8 +353,12 @@ end_session() {
 # Unknown fields are silently dropped by the server's JSON deserializer —
 # anything extra must go inside `metadata` to survive round-trip.
 
-if [[ "${CHUM_SPOOL_ONLY:-0}" != "1" ]]; then
+if [[ "$FLUSH_ONLY" -eq 1 ]]; then
   flush_outbox
+  exit 0
+fi
+if [[ "${CHUM_SPOOL_ONLY:-0}" != "1" ]]; then
+  spawn_flush
 fi
 
 case "$HOOK_EVENT" in

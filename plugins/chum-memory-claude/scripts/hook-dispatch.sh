@@ -15,9 +15,13 @@
 #   3. dirname $0 (fallback — works when called with an absolute path)
 
 set -uo pipefail
-__T0=$(python3 -c "import time;print(int(time.time()*1000))")
+# Hook timing is opt-in (CHUM_HOOK_TIMING_LOG). Milliseconds come from bash 5's
+# $EPOCHREALTIME when present, else perl (ships with macOS); never python3 — two
+# interpreter spawns per hook were a measurable share of hook latency under load.
 __TLOG="${CHUM_HOOK_TIMING_LOG:-}"
-__tlog(){ [[ -n "$__TLOG" ]] && printf "%s\t%s\t%s\t%s\n" "$(date -u +%FT%TZ)" "${HOOK_EVENT:-?}" "$1" "$(( $(python3 -c "import time;print(int(time.time()*1000))") - __T0 ))" >> "$__TLOG"; }
+__now_ms(){ if [[ -n "${EPOCHREALTIME:-}" ]]; then printf '%s' "${EPOCHREALTIME/./}" | cut -c1-13; else perl -MTime::HiRes=time -e 'printf "%d", time()*1000'; fi; }
+__T0=0; [[ -n "$__TLOG" ]] && __T0=$(__now_ms)
+__tlog(){ [[ -n "$__TLOG" ]] && printf "%s\t%s\t%s\t%s\n" "$(date -u +%FT%TZ)" "${HOOK_EVENT:-?}" "$1" "$(( $(__now_ms) - __T0 ))" >> "$__TLOG"; }
 
 PROVIDER="$(printf '%s' "${CHUM_PROVIDER:-claude}" | tr '[:upper:]' '[:lower:]')"
 
@@ -63,7 +67,16 @@ export CHUM_MEMORY_API_URL="$API_URL"
 AUTH_HEADER=""
 if [[ -n "${CHUM_MEMORY_API_TOKEN:-}" ]]; then AUTH_HEADER="-HX-Chum-Token:${CHUM_MEMORY_API_TOKEN}"; fi
 API_HEALTHY=1
-if ! curl -sf $AUTH_HEADER --max-time "${CHUM_HEALTH_TIMEOUT_SECS:-2}" "${API_URL}/health" >/dev/null 2>&1; then
+# Health gate. The default budget is 5 s (was 2 s): through the IAP tunnel a
+# healthy API answers in ~0.5 s idle but 1-2 s when several sessions share the
+# tunnel, and a tripped gate spools the whole turn (nothing is sent live). Order:
+# env CHUM_HEALTH_TIMEOUT_SECS, then .chum-mem "healthTimeoutSecs", then 5.
+HEALTH_TIMEOUT="${CHUM_HEALTH_TIMEOUT_SECS:-}"
+if [[ -z "$HEALTH_TIMEOUT" && -f "${PROJECT_DIR}/.chum-mem" ]]; then
+  HEALTH_TIMEOUT="$(jq -r '.healthTimeoutSecs // empty' "${PROJECT_DIR}/.chum-mem" 2>/dev/null || true)"
+fi
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-5}"
+if ! curl -sf $AUTH_HEADER --max-time "$HEALTH_TIMEOUT" "${API_URL}/health" >/dev/null 2>&1; then
   API_HEALTHY=0
 fi
 export CHUM_API_HEALTHY="$API_HEALTHY"
@@ -77,17 +90,35 @@ if [[ "$API_HEALTHY" -eq 0 ]]; then
     printf '%s' "$HOOK_PAYLOAD" | CHUM_SPOOL_ONLY=1 bash "${SCRIPTS_DIR}/session-sync.sh" >/dev/null 2>&1 || true
   fi
   __tlog spooled 2>/dev/null || true
-  case "$PROVIDER" in
-    codex) printf '{"systemMessage":"%s"}\n' "$UNAVAIL_MSG" ;;
-    *)     printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"%s"}}\n' "$HOOK_EVENT" "$UNAVAIL_MSG" ;;
+  # Only the two turn-start events may add context. Emitting additionalContext on
+  # Stop/SessionEnd makes Claude Code continue the conversation until --max-turns
+  # (observed overnight: 8 looped sessions, ~$1.1 each) — so stay silent there.
+  case "$HOOK_EVENT" in
+    SessionStart|UserPromptSubmit)
+      case "$PROVIDER" in
+        codex) printf '{"systemMessage":"%s"}\n' "$UNAVAIL_MSG" ;;
+        *)     printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"%s"}}\n' "$HOOK_EVENT" "$UNAVAIL_MSG" ;;
+      esac ;;
   esac
   exit 0
 fi
 
 # ── Resolve project identity (.chum-mem) ──
 CHUM_MEM_FILE="${PROJECT_DIR}/.chum-mem"
+CHUM_MEM_EXISTED=0
 if [[ -f "$CHUM_MEM_FILE" ]]; then
-  RESOLVED_PROJECT_ID=$(jq -r '.projectId // ""' "$CHUM_MEM_FILE" 2>/dev/null || echo "")
+  CHUM_MEM_EXISTED=1
+  # Retry: a concurrent hook may be mid-write (observed fork race: 11/75 reads empty).
+  for _try in 1 2 3 4 5 6 7 8; do
+    RESOLVED_PROJECT_ID=$(jq -r '.projectId // ""' "$CHUM_MEM_FILE" 2>/dev/null || echo "")
+    [[ -n "$RESOLVED_PROJECT_ID" && "$RESOLVED_PROJECT_ID" != "null" ]] && break
+    sleep 0.2
+  done
+  if [[ -z "${RESOLVED_PROJECT_ID:-}" || "$RESOLVED_PROJECT_ID" == "null" ]]; then
+    # Existing file but unreadable: never mint a new id over a committed one.
+    echo "chum-memory: .chum-mem present but unreadable; skipping this event" >&2
+    exit 0
+  fi
 fi
 if [[ -n "${RESOLVED_PROJECT_ID:-}" && "$RESOLVED_PROJECT_ID" != "null" ]]; then
   CANDIDATE_PROJECT_ID="$RESOLVED_PROJECT_ID"
@@ -112,8 +143,10 @@ RESOLVE_RESP=$(curl -sf $AUTH_HEADER --max-time 5 -X POST -H "Content-Type: appl
   -d "$RESOLVE_PAYLOAD" "${API_URL}/v1/projects/resolve" 2>/dev/null) || RESOLVE_RESP=""
 if [[ -n "$RESOLVE_RESP" ]]; then
   RESOLVED_PROJECT_ID=$(echo "$RESOLVE_RESP" | jq -r '.projectId // ""' 2>/dev/null || echo "")
-  if [[ -n "$RESOLVED_PROJECT_ID" && "$RESOLVED_PROJECT_ID" != "null" ]]; then
-    echo "$RESOLVE_RESP" | jq '{projectId: .projectId, name: .name}' > "$CHUM_MEM_FILE" 2>/dev/null || true
+  if [[ -n "$RESOLVED_PROJECT_ID" && "$RESOLVED_PROJECT_ID" != "null" && "$CHUM_MEM_EXISTED" -eq 0 ]]; then
+    # First registration only; atomic so a concurrent reader never sees a partial file.
+    echo "$RESOLVE_RESP" | jq '{projectId: .projectId, name: .name}' > "${CHUM_MEM_FILE}.tmp.$$" 2>/dev/null \
+      && mv -f "${CHUM_MEM_FILE}.tmp.$$" "$CHUM_MEM_FILE" || rm -f "${CHUM_MEM_FILE}.tmp.$$"
   fi
 fi
 export CHUM_MEM_PROJECT_ID="${RESOLVED_PROJECT_ID:-${CHUM_MEM_PROJECT_ID:-}}"
@@ -181,15 +214,39 @@ fetch_prompt_memory_escaped() {
   # skip trivial prompts (slash commands, one-word replies)
   [[ ${#prompt} -ge 12 && "$prompt" != /* ]] || return 1
   limit="${CHUM_AUTO_RECALL_LIMIT:-5}"
-  body=$(jq -n --arg q "${prompt:0:800}" --arg pid "${CHUM_MEM_PROJECT_ID:-}" --argjson n "$limit"     '{query:$q, mode:"hybrid", limit:$n, disclosureLevel:"overview"} + (if $pid != "" then {projectId:$pid} else {} end)')
+  # Ask for a wider candidate pool than we show: the server's lexical path orders
+  # partial matches by recency inside its LIMIT, so a 5-row request can miss a
+  # relevant memory that is a few minutes older than unrelated chatter.
+  local pool; pool="${CHUM_AUTO_RECALL_POOL:-20}"
+  body=$(jq -n --arg q "${prompt:0:800}" --arg pid "${CHUM_MEM_PROJECT_ID:-}" --argjson n "$pool"     '{query:$q, mode:"hybrid", limit:$n, disclosureLevel:"overview"} + (if $pid != "" then {projectId:$pid} else {} end)')
   resp=$(curl -sf $AUTH_HEADER --max-time "${CHUM_AUTO_RECALL_TIMEOUT_SECS:-6}" -X POST -H 'Content-Type: application/json'     -d "$body" "${api_url}/api/search" 2>/dev/null) || return 1
-  md=$(printf '%s' "$resp" | jq -r '
-    [.hits[]? | select(.verificationStatus != "contradicted")] | .[0:5] |
+  local pfx
+  pfx=$(printf '%s' "$prompt" | tr '[:upper:]' '[:lower:]' | cut -c1-60)
+  # Content words of the prompt (>= 4 chars, lowercase) for the overlap check below.
+  local words
+  # Generic words carry no topic and are dropped before the overlap test.
+  local stop='^(about|after|again|also|always|anyone|anything|around|because|been|before|being|both|could|does|doing|done|each|either|else|even|ever|every|files?|find|first|from|give|have|here|into|just|know|last|like|lines?|look|make|more|most|much|must|need|never|next|only|other|over|please|read|really|same|should|since|some|still|such|sure|take|tell|than|that|their|them|then|there|these|they|thing|think|this|those|through|under|until|very|want|were|what|when|where|whether|which|while|will|with|without|would|your)$'
+  words=$(printf '%s' "$prompt" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-' '\n' | awk -v stop="$stop" 'length($0) >= 4 && $0 !~ stop' | sort -u | tr '\n' ' ')
+  md=$(printf '%s' "$resp" | jq -r --arg gate "${CHUM_AUTO_RECALL_MIN_SEMANTIC:-0.7}" --arg pfx "$pfx" --arg words "$words" --arg limit "$limit" '
+    ($words | split(" ") | map(select(length > 0))) as $w |
+    [.hits[]? | select(.verificationStatus != "contradicted")
+       # Relevance gate: the ranker has no floor, so without this the block is just the
+       # newest memories in the store (observed overnight: 0/32 relevant under load).
+       # Three ways in: semantic score, a full lexical match, or plain word overlap with
+       # the prompt (a memory minutes old has no embedding yet on a worker-indexed
+       # store, and a partial lexical match reports 0.0 — both would otherwise be hidden).
+       | (((.title // "") + " " + (.summary // "") + " " + (.content // "")) | ascii_downcase) as $text
+       | ([$w[] | select(. as $x | $text | contains($x))] | length) as $overlap
+       | select((((.semanticScore // 0) >= ($gate | tonumber)) and ($overlap >= 1 or ($w | length) == 0))
+                or ((.lexicalScore // 0) > 0)
+                or ($overlap >= 2 and ($overlap * 10) >= (($w | length) * 3)))
+       # Drop echoes: a stored copy of the same question is not knowledge.
+       | select(((.title // "") | ascii_downcase | contains($pfx)) | not)] | .[0:($limit | tonumber)] |
     if length == 0 then "" else
       "--- Team memory (auto-recall for this prompt; hits from chum-memory, newest first within rank) ---\n" +
       (map("- [" + (.memoryType // .type // "memory" | tostring) + "] "
            + ((.title // "") | gsub("\n"; " ") | .[0:220])
-           + " (by " + (.authorEmail // "unknown") + ", " + ((.createdAt // "")[0:16]) + ", session " + ((.sessionIds[0] // "") | tostring | .[0:8]) + ")"
+           + " (by " + (.authorEmail // "unknown") + ", " + ((.createdAt // "")[0:16]) + ", session " + ((.sessionIds[0] // "") | tostring | .[0:8]) + ", " + (if ((.semanticScore // 0) > 0 or (.lexicalScore // 0) > 0) then ("match " + ((([(.semanticScore // 0), (.lexicalScore // 0)] | max) * 100 | floor) | tostring) + "%") else "word overlap" end) + ")"
           ) | join("\n"))
       + "\nIf any of these bears on the request, use it and say who recorded it; call mem_search for details."
     end' 2>/dev/null)

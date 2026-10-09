@@ -1979,7 +1979,16 @@ pub async fn load_memory_search_rows(
           m.created_at,
           s.branch,
           s.metadata->>'userEmail' as author_email,
-          ts_rank_cd(m.search_vector, websearch_to_tsquery('english', $4))::float8 as lexical_score,
+          -- Full-query rank first (phrase/AND matches), plus half credit for the
+          -- OR'd lexemes so a partial match scores by how much of the question it
+          -- covers instead of 0.0 — otherwise every partial match ties at zero and
+          -- the LIMIT below is decided by recency alone (a decision recorded a few
+          -- minutes before unrelated chatter fell out of the top 5; F40).
+          (ts_rank_cd(m.search_vector, websearch_to_tsquery('english', $4))
+           + 0.5 * ts_rank_cd(m.search_vector, coalesce(
+               (select to_tsquery('english', string_agg(lexeme, ' | '))
+                  from unnest(tsvector_to_array(to_tsvector('english', $4))) as lexeme),
+               websearch_to_tsquery('english', $4))))::float8 as lexical_score,
           null::float8 as semantic_score,
           c.id as claim_id,
           c.claim_type::text as claim_type,

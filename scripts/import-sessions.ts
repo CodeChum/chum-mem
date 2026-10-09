@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -603,7 +604,7 @@ async function parseSessionFile(filePath: string, options: ImportOptions): Promi
         provider: 'gemini',
         externalSessionId,
         repo: { filePaths: [] },
-        metadata: { source: 'bulk-import', filePath, projectHash: data.projectHash },
+        metadata: { source: 'bulk-import', filePath, projectHash: data.projectHash, ...(importUserEmail() ? { userEmail: importUserEmail() } : {}) },
         startedAt: data.startTime,
         events: []
       };
@@ -685,7 +686,8 @@ async function parseSessionFile(filePath: string, options: ImportOptions): Promi
             filePath,
             cwd: stringOrUndefined(sessionMeta.cwd),
             originator: stringOrUndefined(sessionMeta.originator),
-            modelProvider: stringOrUndefined(sessionMeta.model_provider)
+            modelProvider: stringOrUndefined(sessionMeta.model_provider),
+            ...(importUserEmail() ? { userEmail: importUserEmail() } : {})
           },
           startedAt,
           events: []
@@ -696,7 +698,7 @@ async function parseSessionFile(filePath: string, options: ImportOptions): Promi
           provider: 'claude',
           externalSessionId,
           repo: { filePaths: [] },
-          metadata: { source: 'bulk-import', filePath, cwd: stringOrUndefined(parsedLine.cwd) },
+          metadata: { source: 'bulk-import', filePath, cwd: stringOrUndefined(parsedLine.cwd), ...(importUserEmail() ? { userEmail: importUserEmail() } : {}) },
           startedAt: stringOrUndefined(parsedLine.timestamp),
           events: []
         };
@@ -785,6 +787,21 @@ async function parseSessionFile(filePath: string, options: ImportOptions): Promi
   parsed.endedAt = parsed.events.at(-1)?.eventTime;
 
   return parsed;
+}
+
+// Author identity stamped on every imported session (hooks send the checkout's
+// git user.email; a backfill has no checkout, so take CHUM_IMPORT_EMAIL or the
+// global git identity of whoever runs the import).
+let cachedImportEmail: string | undefined | null = null;
+function importUserEmail(): string | undefined {
+  if (cachedImportEmail !== null) return cachedImportEmail;
+  const fromEnv = (process.env.CHUM_IMPORT_EMAIL || '').trim();
+  if (fromEnv) { cachedImportEmail = fromEnv; return fromEnv; }
+  try {
+    const out = execFileSync('git', ['config', '--get', 'user.email'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    cachedImportEmail = out || undefined;
+  } catch { cachedImportEmail = undefined; }
+  return cachedImportEmail;
 }
 
 function stringOrUndefined(value: unknown): string | undefined {
