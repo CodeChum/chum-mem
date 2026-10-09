@@ -18,6 +18,10 @@ case "${1:-install}" in
   install)
     [[ -n "$GCLOUD" ]] || { echo "gcloud not found; install the Google Cloud SDK and run 'gcloud auth login' first" >&2; exit 1; }
     "$GCLOUD" auth print-access-token >/dev/null 2>&1 || { echo "run 'gcloud auth login' (your @codechum.com account) first" >&2; exit 1; }
+    # launchd does not inherit the shell's PATH or CLOUDSDK_PYTHON; pin the Python
+    # that gcloud uses interactively, or launchd may pick a stray interpreter
+    # without ssl (seen: /usr/local/lib/python3.8 "No module named _ssl").
+    GPY="$("$GCLOUD" info --format='value(basic.python_location)' 2>/dev/null || true)"
     mkdir -p "$(dirname "$PLIST")"
     cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -39,6 +43,7 @@ case "${1:-install}" in
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
     <key>CLOUDSDK_CORE_DISABLE_PROMPTS</key><string>1</string>
+    <key>CLOUDSDK_PYTHON</key><string>${GPY:-/usr/bin/python3}</string>
   </dict>
 </dict></plist>
 EOF
