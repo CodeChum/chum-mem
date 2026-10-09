@@ -6,6 +6,7 @@ use chum_mem_db::{
     Database, RepositoryContext, WorkerJobRecord, apply_repository_context, check_readiness,
     claim_next_worker_job, complete_worker_job, fail_worker_job, load_candidate_completed_sessions,
     load_pckc_memory_edges, load_session_events_limited, mark_session_replay_ready,
+    requeue_running_worker_jobs,
 };
 use chum_mem_pipeline::{
     KnowledgeEdge, MemoryNodeInput, SessionEventRecord, TurboVecStore, UpsertMemory,
@@ -19,6 +20,9 @@ use sqlx::{Postgres, Row, Transaction};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+/// Knowledge snapshots kept per project and type (older ones are pruned).
+const KNOWLEDGE_SNAPSHOT_KEEP: i64 = 3;
 
 const WORKER_JOB_TYPES: &[&str] = &[
     "derive-session-memories",
@@ -58,6 +62,33 @@ async fn main() -> anyhow::Result<()> {
         .context("building shared worker HTTP client")?;
     let scope = RepositoryContext::from_config(&config);
     let worker_id = format!("worker:{}", std::process::id());
+
+    // F35: jobs left `running` by a previous worker process would never be
+    // picked up again (no lease expiry). This deployment runs one worker, so
+    // anything still `running` at start-up is an orphan.
+    {
+        let mut tx = db.pool().begin().await.context("beginning requeue transaction")?;
+        apply_repository_context(&mut *tx, &scope)
+            .await
+            .context("applying repository context for requeue")?;
+        let outcome = requeue_running_worker_jobs(
+            &mut tx,
+            &scope,
+            &format!("requeued by {worker_id} at start-up: previous worker exited mid-job"),
+        )
+        .await
+        .context("requeueing orphaned running jobs")?;
+        tx.commit().await.context("committing requeue")?;
+        if !outcome.requeued.is_empty() || !outcome.poisoned.is_empty() {
+            warn!(
+                requeued = outcome.requeued.len(),
+                poisoned = outcome.poisoned.len(),
+                requeued_ids = ?outcome.requeued,
+                poisoned_ids = ?outcome.poisoned,
+                "requeued jobs orphaned in status=running by a previous worker"
+            );
+        }
+    }
     let concurrency = config.worker_concurrency.max(1);
     let mut interval = tokio::time::interval(config.worker_poll_interval());
     let mut ticks: u64 = 0;
@@ -384,7 +415,14 @@ async fn derive_session_memories_job(
         .session_id
         .ok_or("derive-session-memories job missing session_id")?;
     let summary = job.payload.get("summary").and_then(Value::as_str);
-    let metadata = job.payload.get("metadata").cloned().unwrap_or(json!({}));
+    let mut metadata = job.payload.get("metadata").cloned().unwrap_or(json!({}));
+    // Tell session/end this is a derivation callback: keep the session's
+    // ended_at (an import passes its own `endedAt`, which still wins).
+    if let Value::Object(map) = &mut metadata {
+        map.insert("derivationCallback".to_string(), Value::Bool(true));
+    } else {
+        metadata = json!({ "derivationCallback": true });
+    }
     let body = json!({
         "sessionId": session_id,
         "summary": summary,
@@ -646,12 +684,67 @@ async fn build_knowledge_graph_job_with_dedup(
     }
 
     // Build graphs for all sessions (current job + siblings) and batch-merge.
-    build_knowledge_graph_job_batched(db, config, scope, job, &sibling_jobs).await
+    let result = build_knowledge_graph_job_batched(db, config, scope, job, &sibling_jobs).await;
+
+    // Siblings were held in `running` for the duration of the build; settle
+    // them with the same outcome as the primary job. On failure they go back
+    // to `pending` so the next build picks their sessions up again. If the
+    // process dies in between, the start-up requeue (F35) releases them.
+    if !sibling_jobs.is_empty() {
+        let sibling_ids: Vec<Uuid> = sibling_jobs.iter().map(|(job_id, _)| *job_id).collect();
+        settle_sibling_graph_jobs(db, scope, job.project_id, &sibling_ids, result.is_ok()).await;
+    }
+    result
+}
+
+/// Mark batch-merged sibling jobs completed (success) or pending (failure).
+async fn settle_sibling_graph_jobs(
+    db: &Database,
+    scope: &RepositoryContext,
+    project_id: Uuid,
+    sibling_ids: &[Uuid],
+    success: bool,
+) {
+    let result = async {
+        let mut tx = db.pool().begin().await.map_err(|e| e.to_string())?;
+        let scoped = RepositoryContext {
+            project_id: Some(project_id),
+            ..scope.clone()
+        };
+        apply_repository_context(&mut *tx, &scoped)
+            .await
+            .map_err(|e| e.to_string())?;
+        let sql = if success {
+            "update public.worker_jobs \
+             set status = 'completed'::public.worker_job_status, completed_at = now(), \
+                 updated_at = now(), last_error = null \
+             where id = any($1) and status = 'running'::public.worker_job_status"
+        } else {
+            "update public.worker_jobs \
+             set status = 'pending'::public.worker_job_status, worker_id = null, \
+                 claimed_at = null, available_at = now(), updated_at = now(), \
+                 last_error = 'batch-merged graph build failed; requeued' \
+             where id = any($1) and status = 'running'::public.worker_job_status"
+        };
+        sqlx::query(sql)
+            .bind(sibling_ids)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())
+    }
+    .await;
+    if let Err(error) = result {
+        warn!(error = %error, success, "failed to settle batch-merged sibling graph jobs");
+    }
 }
 
 /// Claim and lock all pending `build-knowledge-graph` jobs for a project,
-/// returning their session IDs and job IDs. The jobs are marked completed
-/// with worker_id 'batch-merged'.
+/// returning their session IDs and job IDs. The jobs are held in `running`
+/// with worker_id 'batch-merged:<primary job id>' until the batched build
+/// settles them (see `settle_sibling_graph_jobs`). They used to be marked
+/// completed up front, so a worker crash mid-build lost their sessions from
+/// the graph for good.
 async fn claim_sibling_graph_jobs(
     db: &Database,
     scope: &RepositoryContext,
@@ -679,10 +772,11 @@ async fn claim_sibling_graph_jobs(
               for update skip locked
             )
             update public.worker_jobs as j
-            set status = 'completed'::public.worker_job_status,
-                completed_at = now(),
+            set status = 'running'::public.worker_job_status,
+                claimed_at = now(),
+                attempts = j.attempts + 1,
                 updated_at = now(),
-                worker_id = 'batch-merged'
+                worker_id = 'batch-merged:' || $2::text
             from batch
             where j.id = batch.id
             returning j.id, j.session_id, j.payload
@@ -1130,6 +1224,11 @@ async fn persist_knowledge_graph(
     .bind(snapshot_type)
     .execute(&mut **tx)
     .await?;
+
+    // Snapshot retention (review 2026-10-09): keep the newest few per type.
+    chum_mem_db::prune_knowledge_snapshots(tx, scope, project_id, snapshot_type, KNOWLEDGE_SNAPSHOT_KEEP)
+        .await
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
 
     sqlx::query(
         r#"

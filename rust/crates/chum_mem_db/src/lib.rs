@@ -14,6 +14,7 @@ pub use migrate::{
     get_migration_status, require_latest_migration_head, run_migrations,
 };
 pub use repos::{
+    RequeueOutcome, metadata_timestamp, prune_knowledge_snapshots, requeue_running_worker_jobs,
     AppendSessionEventParams, AppendedSessionEvent, CandidateSessionRow, ClaimProofInsertParams,
     ClaimProofRow, ClaimRelationRow, ClaimRow, ClaimUpsertParams, DashboardGraphEdgeRow,
     DashboardGraphNodeRow, EpisodeBatchRow, EpisodeRow, MemoryDetailRow, MemoryInsertParams,

@@ -41,14 +41,22 @@ the IAP tunnel: a tunnel reset mid-import leaves sessions partial and the
 bulk-import indexes dropped (FINDINGS F31). Copy the transcript folders up, then:
 
 ```bash
-# on your laptop: copy your monorepo session folders to the VM
+# on your laptop: copy ONLY the monorepo session folder(s) to the VM. Do not use a
+# `-gradechum-gradechum*` glob: it also matches sibling projects (the customer-bot
+# folder made up 97.6% of the first backfill, customer chat included).
 gcloud compute scp --recurse --tunnel-through-iap --zone=asia-east1-b --project=gradechum \
-  ~/.claude/projects/-Users-<you>-gradechum-gradechum* gradechum-chum-mem:/tmp/sessions/
-# on the VM (deploy/gcp/deploy-vm.sh ssh), from /opt/chum-mem/src:
-CHUM_IMPORT_EMAIL=<you>@codechum.com pnpm sessions:import --roots /tmp/sessions \
+  ~/.claude/projects/-Users-<you>-gradechum-gradechum gradechum-chum-mem:/tmp/sessions/
+# on the VM (deploy/gcp/deploy-vm.sh ssh), from /opt/chum-mem/src. The importer
+# refuses to run without an explicit folder allowlist (use the `=` form: the
+# names start with "-"), and needs a token once auth is on; the bulk index
+# endpoints need an ADMIN token when CHUM_MEM_ADMIN_TOKENS is set.
+CHUM_MEMORY_API_TOKEN=<admin token> CHUM_IMPORT_EMAIL=<you>@codechum.com pnpm sessions:import \
+  --roots /tmp/sessions --allow-folders=-Users-<you>-gradechum-gradechum \
   --server http://10.140.0.9:63001 --project $(jq -r .projectId <monorepo>/.chum-mem) --yes
-curl -s -X POST -H 'Content-Type: application/json' -d '{"projectId":"<id>"}' http://10.140.0.9:63001/v1/ingest/bulk/create-indexes
 ```
+The importer recreates the indexes it dropped even if it crashes; if it is killed
+hard, run `curl -s -X POST -H "X-Chum-Token: <admin token>" -H 'Content-Type: application/json' -d '{}' http://10.140.0.9:63001/v1/ingest/bulk/create-indexes`.
+Imported sessions and their memories carry the transcript's own start/end times.
 
 Embeddings are computed on ingest with the local model, so no re-embed step is
 needed on the VM (`POST /api/admin/reembed` exists for model changes).
@@ -109,6 +117,21 @@ again and is captured as a junk session under your email.
 Token auth is **on** (`CHUM_MEM_API_TOKENS` in the VM's `.env`; one shared team
 token for the pilot, comma-separated list for more). Rotate by editing `.env`
 and `docker compose up -d`, then re-run the `token` step on every laptop.
+
+Admin token (`CHUM_MEM_ADMIN_TOKENS`, comma-separated, keep it off laptops):
+when set, `/api/admin/*`, `/v1/ingest/bulk/*` and a repository sync with
+`mergeWithExisting=false` need it; a team token gets 403. Unset = any team token
+may call them (the old behaviour). The MCP `repository_sync` tool never accepts
+`mergeWithExisting=false`.
+
+CORS is closed by default (no `Access-Control-Allow-Origin`), so a web page
+cannot use an engineer's tunnel. Nothing shipped needs it; if a browser client
+ever does, list its origin in `CHUM_MEM_CORS_ORIGINS`.
+
+The repository snapshot is pinned to the first git remote that syncs into the
+project (`projects.repository_remote`); a checkout of another remote gets 409.
+A clone of the same remote can still add files (sync uploads untracked files;
+see the review report).
 
 ## Sensitive-content guard (hold and ask)
 

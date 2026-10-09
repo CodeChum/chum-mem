@@ -8,6 +8,7 @@ use axum::http::header::{ACCEPT, CONTENT_TYPE, HeaderName};
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::http::HeaderValue;
 use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -153,6 +154,24 @@ impl ApiError {
     fn not_found(error: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            body: ErrorBody {
+                error: error.into(),
+            },
+        }
+    }
+
+    fn conflict(error: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            body: ErrorBody {
+                error: error.into(),
+            },
+        }
+    }
+
+    fn forbidden(error: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
             body: ErrorBody {
                 error: error.into(),
             },
@@ -376,17 +395,48 @@ async fn admin_reembed(
 /// except `/health`, `/ready` and CORS preflight must carry one of the tokens in
 /// `X-Chum-Token` or `Authorization: Bearer …`. With no tokens configured the
 /// API is open (logged at startup) — acceptable only behind a private network.
+/// Whether the request presented an admin token (or no admin tokens are
+/// configured, in which case every authenticated caller is "admin" and the
+/// destructive endpoints behave as before). Inserted into request extensions
+/// by `require_api_token`.
+#[derive(Debug, Clone, Copy)]
+struct AdminAuth(bool);
+
+/// Endpoints that rewrite or drop shared state for everyone. With
+/// `CHUM_MEM_ADMIN_TOKENS` set they require an admin token; a plain team token
+/// gets 403.
+fn is_admin_route(path: &str) -> bool {
+    path.starts_with("/api/admin/") || path.starts_with("/v1/ingest/bulk/")
+}
+
+/// Constant-time string comparison so a token cannot be guessed byte by byte
+/// from response timing.
+fn token_matches(known: &str, presented: &str) -> bool {
+    let a = known.as_bytes();
+    let b = presented.as_bytes();
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
+    }
+    diff == 0
+}
+
 async fn require_api_token(
     State(state): State<ApiState>,
-    request: Request,
+    mut request: Request,
     next: axum::middleware::Next,
 ) -> Response {
     let tokens = &state.config.api_tokens;
-    if tokens.is_empty() {
+    let admin_tokens = &state.config.admin_tokens;
+    if tokens.is_empty() && admin_tokens.is_empty() {
+        request.extensions_mut().insert(AdminAuth(true));
         return next.run(request).await;
     }
-    let path = request.uri().path();
+    let path = request.uri().path().to_string();
     if request.method() == Method::OPTIONS || path == "/health" || path == "/ready" {
+        request.extensions_mut().insert(AdminAuth(false));
         return next.run(request).await;
     }
     let presented = request
@@ -403,14 +453,51 @@ async fn require_api_token(
                 .map(str::trim)
                 .map(str::to_string)
         });
-    match presented {
-        Some(token) if tokens.iter().any(|known| known == &token) => next.run(request).await,
-        _ => (
+    // Team auth off but admin tokens on: ordinary routes stay open (as with
+    // no tokens at all); only the admin routes and full repository replaces
+    // need the admin token.
+    let open_team_routes = tokens.is_empty();
+    let Some(token) = presented else {
+        if open_team_routes && !is_admin_route(&path) {
+            request.extensions_mut().insert(AdminAuth(false));
+            return next.run(request).await;
+        }
+        if open_team_routes {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "this endpoint requires an admin token (CHUM_MEM_ADMIN_TOKENS)"})),
+            )
+                .into_response();
+        }
+        return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "missing or invalid API token (X-Chum-Token)"})),
         )
-            .into_response(),
+            .into_response();
+    };
+    let is_admin = admin_tokens
+        .iter()
+        .any(|known| token_matches(known, &token));
+    let is_team = tokens.iter().any(|known| token_matches(known, &token));
+    if !is_admin && !is_team && !open_team_routes {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "missing or invalid API token (X-Chum-Token)"})),
+        )
+            .into_response();
     }
+    // No admin tokens configured: every authenticated caller may use the
+    // destructive endpoints (previous behaviour, logged at startup).
+    let admin = is_admin || admin_tokens.is_empty();
+    if is_admin_route(&path) && !admin {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "this endpoint requires an admin token (CHUM_MEM_ADMIN_TOKENS)"})),
+        )
+            .into_response();
+    }
+    request.extensions_mut().insert(AdminAuth(admin));
+    next.run(request).await
 }
 
 async fn session_start(
@@ -539,11 +626,105 @@ async fn sync_rules() -> Result<Response, ApiError> {
     Ok((StatusCode::OK, Json(response)).into_response())
 }
 
+/// `github.com/org/repo` from any git remote form (https with or without
+/// credentials, ssh `git@host:org/repo.git`, trailing `.git`), lowercased.
+fn normalize_git_remote(raw: &str) -> Option<String> {
+    let mut value = raw.trim().to_string();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(index) = value.find("://") {
+        value = value[index + 3..].to_string();
+    } else if let Some((user_host, path)) = value.split_once(':')
+        && !user_host.contains('/')
+    {
+        value = format!("{user_host}/{path}");
+    }
+    if let Some(index) = value.find('@')
+        && index < value.find('/').unwrap_or(usize::MAX)
+    {
+        value = value[index + 1..].to_string();
+    }
+    let value = value
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_lowercase();
+    (!value.is_empty()).then_some(value)
+}
+
 async fn repository_sync(
     State(state): State<ApiState>,
+    admin: Option<axum::Extension<AdminAuth>>,
+    headers: axum::http::HeaderMap,
     Json(input): Json<RepositorySyncRequest>,
 ) -> Result<Response, ApiError> {
-    let response = perform_repository_sync(&state, input)
+    // Review 2026-10-09: any checkout carrying `.chum-mem` (a worktree, a
+    // throwaway test clone) wrote its files into the team's shared repository
+    // snapshot. Clients now send the checkout's git remote; the first remote
+    // seen for a project is pinned and a sync from a different remote is
+    // rejected. Clients that send no remote (older sync.sh) are still accepted.
+    let remote = headers
+        .get("x-chum-repo-remote")
+        .and_then(|value| value.to_str().ok())
+        .and_then(normalize_git_remote);
+    let root = headers
+        .get("x-chum-repo-root")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.chars().take(512).collect::<String>());
+    if let Some(remote) = remote.as_deref() {
+        let project_id = input.project_id.or(state.scope.project_id).ok_or_else(|| {
+            ApiError::bad_request("projectId is required when CHUM_MEM_PROJECT_ID is not configured")
+        })?;
+        let context = scoped_context(&state.scope, Some(project_id)).map_err(map_domain_error)?;
+        let mut tx = begin_tx(&state, &context).await.map_err(map_domain_error)?;
+        ensure_scope_entities(&mut tx, &state.scope).await.map_err(|e| map_domain_error(e.into()))?;
+        upsert_ingested_project(&mut tx, &state.scope, project_id, None)
+            .await
+            .map_err(|e| map_domain_error(e.into()))?;
+        let pinned: Option<String> = sqlx::query_scalar(
+            r#"
+            update public.projects
+            set repository_remote = coalesce(repository_remote, $2)
+            where id = $1
+            returning repository_remote
+            "#,
+        )
+        .bind(project_id)
+        .bind(remote)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .flatten();
+        commit_tx(tx).await.map_err(map_domain_error)?;
+        if let Some(pinned) = pinned
+            && pinned != remote
+        {
+            return Err(ApiError::conflict(format!(
+                "this project's repository snapshot belongs to {pinned}; a checkout of {remote} cannot sync into it"
+            )));
+        }
+    }
+    // Record where every synced file came from, so a stray checkout's files
+    // can be found and removed.
+    let synced_from = json!({
+        "remote": remote,
+        "root": root,
+        "at": OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+    });
+
+    // `mergeWithExisting=false` replaces the whole shared repository snapshot
+    // with this one payload. The stock client always sends `true`; a checkout
+    // with a bad sync script would wipe every other engineer's docs graph, so
+    // it needs the admin token once admin tokens are configured.
+    let is_admin = admin.map(|axum::Extension(AdminAuth(flag))| flag).unwrap_or(true);
+    if !input.merge_with_existing && !is_admin {
+        return Err(ApiError::forbidden(
+            "repository sync with mergeWithExisting=false replaces the shared snapshot and requires an admin token",
+        ));
+    }
+    let response = perform_repository_sync(&state, input, Some(synced_from))
         .await
         .map_err(map_domain_error)?;
     Ok((StatusCode::OK, Json(response)).into_response())
@@ -880,7 +1061,16 @@ async fn handle_mcp_call(
         "repository_sync" => {
             let input: RepositorySyncRequest =
                 serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
-            let result = perform_repository_sync(state, input)
+            // Review 2026-10-09: the MCP tool is reachable by every engineer's
+            // model; it must never replace the shared snapshot. Full rebuilds
+            // go through REST with an admin token.
+            if !input.merge_with_existing {
+                return Err(
+                    "repository_sync over MCP requires mergeWithExisting=true; a full replace needs the REST endpoint and an admin token".to_string(),
+                );
+            }
+            let synced_from = json!({ "via": "mcp" });
+            let result = perform_repository_sync(state, input, Some(synced_from))
                 .await
                 .map_err(|e| format!("{e:?}"))?;
             Ok(json!({"content":[{"type":"text","text":"SUCCESSFUL"}],"structuredContent":result}))
@@ -1114,15 +1304,33 @@ async fn mcp_delete(State(state): State<ApiState>, request: Request) -> Result<R
 }
 
 fn router(state: ApiState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::DELETE])
-        .allow_headers(Any)
-        .expose_headers([
-            ACCEPT,
-            HeaderName::from_static("mcp-session-id"),
-            HeaderName::from_static("content-type"),
-        ]);
+    // CORS used to be `allow_origin(Any)` + `allow_headers(Any)`. The API is
+    // reached through a localhost tunnel, so with that setting any web page an
+    // engineer visits could read and write the store through their tunnel
+    // whenever auth is off (and could probe it when auth is on). Nothing that
+    // ships needs cross-origin access: the dashboard proxies server-side and
+    // the hooks/MCP client are not browsers. Allow only the origins listed in
+    // CHUM_MEM_CORS_ORIGINS; with none configured no CORS headers are sent and
+    // browsers refuse cross-origin reads.
+    let cors = if state.config.cors_origins.is_empty() {
+        CorsLayer::new()
+    } else {
+        let origins: Vec<HeaderValue> = state
+            .config
+            .cors_origins
+            .iter()
+            .filter_map(|origin| HeaderValue::from_str(origin).ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([Method::GET, Method::POST, Method::DELETE])
+            .allow_headers(Any)
+            .expose_headers([
+                ACCEPT,
+                HeaderName::from_static("mcp-session-id"),
+                HeaderName::from_static("content-type"),
+            ])
+    };
 
     Router::new()
         .route("/health", get(health))
@@ -1204,6 +1412,18 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("CHUM_MEM_API_TOKENS is not set: the API accepts unauthenticated requests");
     } else {
         info!(tokens = config.api_tokens.len(), "API token authentication enabled");
+    }
+    if config.admin_tokens.is_empty() {
+        tracing::warn!(
+            "CHUM_MEM_ADMIN_TOKENS is not set: any authenticated caller may use /api/admin/*, /v1/ingest/bulk/* and full repository replaces"
+        );
+    } else {
+        info!(admin_tokens = config.admin_tokens.len(), "admin token required for destructive endpoints");
+    }
+    if config.cors_origins.is_empty() {
+        info!("CORS closed: no cross-origin browser access (set CHUM_MEM_CORS_ORIGINS to allow origins)");
+    } else {
+        info!(origins = ?config.cors_origins, "CORS allowed origins");
     }
     info!(address = %address, "starting Rust API");
 
@@ -1381,12 +1601,7 @@ async fn perform_session_event(
 
     let mut tx = begin_tx(state, &state.scope).await?;
     let session = resolve_session(&mut tx, &state.scope, input.session_id).await?;
-    if session.status != "active" {
-        return Err(DomainError::BadRequest(format!(
-            "Cannot append events to non-active session {}",
-            session.id
-        )));
-    }
+    let late = ensure_appendable(&session)?;
 
     let inserted = insert_session_event(
         &mut tx,
@@ -1421,6 +1636,9 @@ async fn perform_session_event(
         }),
     )
     .await?;
+    if late && !inserted.duplicate {
+        schedule_late_derivation(&mut tx, state, &session).await?;
+    }
     commit_tx(tx).await?;
 
     Ok(AppendSessionEventResponse {
@@ -1429,18 +1647,86 @@ async fn perform_session_event(
     })
 }
 
+/// Sessions accept events while active and, since review 2026-10-09, after
+/// they completed (quarantined items released later, spool replays, the next
+/// turn of a multi-turn session). Returns whether the event is "late".
+fn ensure_appendable(session: &chum_mem_db::SessionRow) -> Result<bool, DomainError> {
+    match session.status.as_str() {
+        "active" => Ok(false),
+        "completed" => Ok(true),
+        _ => Err(DomainError::BadRequest(format!(
+            "Cannot append events to {} session {}",
+            session.status, session.id
+        ))),
+    }
+}
+
+/// Seconds to wait after the last late event before deriving, so a burst of
+/// late events (or the rest of a turn) is derived once.
+const LATE_DERIVATION_DELAY_SECS: i64 = 60;
+
+/// Late events: mark the session not-derived and queue a debounced
+/// `derive-session-memories`. The worker calls session/end, which derives the
+/// whole session again (memories are keyed per session, so nothing doubles)
+/// and keeps `ended_at`. If a hook's session/end arrives first it derives
+/// inline and the queued job finds the session derived and does nothing.
+async fn schedule_late_derivation(
+    tx: &mut Transaction<'_, Postgres>,
+    state: &ApiState,
+    session: &chum_mem_db::SessionRow,
+) -> Result<(), DomainError> {
+    let row = sqlx::query(
+        r#"
+        update public.sessions
+        set metadata = coalesce(metadata, '{}'::jsonb) - 'derivedAt'
+        where id = $1
+        returning metadata->>'sessionSummary' as summary, metadata->'metadata' as end_metadata
+        "#,
+    )
+    .bind(session.id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(DbError::from)?;
+    let summary: Option<String> = row.try_get("summary").unwrap_or(None);
+    let end_metadata: Option<Value> = row.try_get("end_metadata").unwrap_or(None);
+    let mut metadata = match end_metadata {
+        Some(Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    metadata.remove("endedAt");
+    metadata.insert("derivationCallback".to_string(), Value::Bool(true));
+    let available_at = (OffsetDateTime::now_utc()
+        + time::Duration::seconds(LATE_DERIVATION_DELAY_SECS))
+    .format(&time::format_description::well_known::Rfc3339)
+    .map_err(|error| DomainError::Internal(error.to_string()))?;
+    enqueue_worker_job(
+        tx,
+        &state.scope,
+        session.project_id,
+        Some(session.id),
+        None,
+        "derive-session-memories",
+        &format!("derive:{}", session.id),
+        50,
+        3,
+        Some(&available_at),
+        &json!({
+            "sessionId": session.id,
+            "summary": summary,
+            "metadata": Value::Object(metadata),
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn perform_session_events_batch(
     state: &ApiState,
     input: BatchAppendSessionEventsRequest,
 ) -> Result<BatchAppendSessionEventsResponse, DomainError> {
     let mut tx = begin_tx(state, &state.scope).await?;
     let session = resolve_session(&mut tx, &state.scope, input.session_id).await?;
-    if session.status != "active" {
-        return Err(DomainError::BadRequest(format!(
-            "Cannot append events to non-active session {}",
-            session.id
-        )));
-    }
+    let late = ensure_appendable(&session)?;
 
     // One multi-row INSERT per batch instead of one round trip per event.
     // Collapses the primary ingestion hot path from O(N) round trips to O(1).
@@ -1475,6 +1761,9 @@ async fn perform_session_events_batch(
         } else {
             inserted_count += 1;
         }
+    }
+    if late && inserted_count > 0 {
+        schedule_late_derivation(&mut tx, state, &session).await?;
     }
     commit_tx(tx).await?;
 
@@ -1539,17 +1828,48 @@ async fn perform_session_end(
 ) -> Result<EndSessionResponse, DomainError> {
     let mut tx = begin_tx(state, &state.scope).await?;
     let session = resolve_session(&mut tx, &state.scope, input.session_id).await?;
+    if session.status != "active" && session.derived {
+        // Idempotent end: the hooks retry/replay `session/end`, and a second
+        // end on an already-derived session used to re-derive the memories
+        // and enqueue a second `build-knowledge-graph` for the same session.
+        // Nothing new can have been appended (events on a non-active session
+        // are rejected); `session/start` reactivates the row (and clears
+        // `derivedAt`) when more events are coming. A completed session that
+        // was ended with `defer: true` is NOT derived yet: the worker's
+        // derive-session-memories callback lands here and must go through.
+        commit_tx(tx).await?;
+        return Ok(EndSessionResponse {
+            session_id: session.id,
+            status: session.status.clone(),
+            queued_jobs: Vec::new(),
+        });
+    }
+    let defer = input.defer.unwrap_or(false);
+    let mut patch = json!({
+        "sessionSummary": input.summary,
+        "metadata": input.metadata,
+    });
+    if !defer {
+        patch["derivedAt"] = json!(OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default());
+    }
+    // The worker's derivation callbacks (deferred import, late events) must
+    // not restamp ended_at; a hook's end of a new turn does.
+    let keep_existing_end = input
+        .metadata
+        .get("derivationCallback")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let session_update = mark_session_completed(
         &mut tx,
         session.id,
-        &json!({
-            "sessionSummary": input.summary,
-            "metadata": input.metadata,
-        }),
+        &patch,
+        chum_mem_db::metadata_timestamp(&input.metadata, "endedAt"),
+        keep_existing_end,
     )
     .await?;
 
-    let defer = input.defer.unwrap_or(false);
 
     let (derived_info, queued_jobs) = if defer {
         // Deferred mode: skip inline derivation, enqueue a worker job.
@@ -1826,6 +2146,15 @@ async fn perform_search(
             ranked = typed;
         }
     }
+
+    // Review 2026-10-09 (recall review): relevance floor, then `limit` as a
+    // total across the lexical, pgvector and vector-store paths (limit 10 used
+    // to return up to 19 hits). Continuation queries ("pick up where I left
+    // off") have no topical words to match and keep the old behaviour.
+    if !ranking_context.is_continuation {
+        ranked.retain(|hit| chum_mem_pipeline::passes_relevance_floor(&input.query, hit));
+    }
+    ranked.truncate(input.limit as usize);
 
     let final_ids = ranked
         .iter()
@@ -3079,6 +3408,7 @@ async fn perform_knowledge_query(
 async fn perform_repository_sync(
     state: &ApiState,
     input: RepositorySyncRequest,
+    synced_from: Option<Value>,
 ) -> Result<RepositorySyncResponse, DomainError> {
     let project_id = input.project_id.or(state.scope.project_id).ok_or_else(|| {
         DomainError::BadRequest(
@@ -3120,7 +3450,7 @@ async fn perform_repository_sync(
         .collect::<Result<_, DomainError>>()?;
     let removed_paths = input.removed_paths.clone();
 
-    let (new_nodes, new_edges) = if !file_payloads.is_empty() {
+    let (mut new_nodes, new_edges) = if !file_payloads.is_empty() {
         tokio::task::spawn_blocking(move || {
             chum_mem_pipeline::parse_file_payload_batch(&file_payloads)
         })
@@ -3129,6 +3459,13 @@ async fn perform_repository_sync(
     } else {
         (Vec::new(), Vec::new())
     };
+    if let Some(synced_from) = synced_from {
+        for node in new_nodes.iter_mut() {
+            if let Value::Object(map) = &mut node.metadata {
+                map.insert("syncedFrom".to_string(), synced_from.clone());
+            }
+        }
+    }
 
     let mut tx = begin_tx(state, &context).await?;
     sqlx::query("select pg_advisory_xact_lock($1)")
@@ -3136,6 +3473,11 @@ async fn perform_repository_sync(
         .execute(&mut *tx)
         .await
         .map_err(DbError::from)?;
+    // A docs sync can arrive before the project's first session/start (fresh
+    // store, or SessionStart spooled while the tunnel was down); the snapshot
+    // insert then failed with a 500 on the projects foreign key.
+    ensure_scope_entities(&mut tx, &state.scope).await?;
+    upsert_ingested_project(&mut tx, &state.scope, project_id, None).await?;
 
     let existing = if merge_with_existing {
         load_latest_knowledge_graph_by_type(&mut tx, &context, Some("repository")).await?
@@ -3354,8 +3696,25 @@ async fn derive_and_persist_session_memories(
             .get("episodeOrdinal")
             .and_then(Value::as_i64)
             .map(|value| value as i32);
+        // The key used to be session:derivation:episode:type, so a second
+        // distinct decision stated in the same episode was silently dropped.
+        // User-stated and assistant-answer claims and every decision or
+        // constraint now key on their claim too; tool-derived claims keep the
+        // one-per-type-per-episode cap that holds back tool-output noise.
+        let claim_key = draft
+            .metadata
+            .get("claimKey")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let keyed_by_claim = matches!(
+            draft.memory_type,
+            MemoryType::Decision | MemoryType::Constraint
+        ) || draft.metadata.get("proofType").and_then(Value::as_str) == Some("user_confirmation")
+            || draft.metadata.get("claimSource").and_then(Value::as_str)
+                == Some("assistant_final_answer");
         let derivation_key = format!(
-            "{}:{}:{}:{}",
+            "{}:{}:{}:{}{}",
             session_id,
             draft
                 .metadata
@@ -3365,7 +3724,12 @@ async fn derive_and_persist_session_memories(
             episode_ordinal
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "session".to_string()),
-            memory_type_str(draft.memory_type)
+            memory_type_str(draft.memory_type),
+            if keyed_by_claim && !claim_key.is_empty() {
+                format!(":{claim_key}")
+            } else {
+                String::new()
+            }
         );
         let existing = sqlx::query_scalar::<_, Uuid>(
             r#"
@@ -3383,6 +3747,59 @@ async fn derive_and_persist_session_memories(
         .map_err(DbError::from)?;
         if existing.is_some() {
             continue;
+        }
+
+        // Cross-session dedupe (recall review: one prompt sentence existed as
+        // 1,121 active fix memories). If the project already holds an active
+        // memory with the same type, claim key and normalised content, record
+        // the repeat on it instead of creating another row.
+        if !claim_key.is_empty() {
+            let normalised = draft
+                .content
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            let duplicate_of = sqlx::query_scalar::<_, Uuid>(
+                r#"
+                update public.memories
+                set metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object(
+                  'seenCount', coalesce((metadata->>'seenCount')::int, 1) + 1,
+                  'lastSeenAt', now(),
+                  'lastSeenSessionId', $5::text
+                )
+                where id = (
+                  select id from public.memories
+                  where project_id = $1
+                    and superseded_at is null
+                    and type::text = $2
+                    and metadata->>'claimKey' = $3
+                    and lower(btrim(regexp_replace(content, '\s+', ' ', 'g'))) = $4
+                  order by created_at asc
+                  limit 1
+                )
+                returning id
+                "#,
+            )
+            .bind(project_id)
+            .bind(memory_type_str(draft.memory_type))
+            .bind(&claim_key)
+            .bind(&normalised)
+            .bind(session_id.to_string())
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(DbError::from)?;
+            if let Some(memory_id) = duplicate_of {
+                for provenance_event_id in &draft.provenance_event_ids {
+                    let excerpt = records
+                        .iter()
+                        .find(|event| event.id == *provenance_event_id)
+                        .map(event_text)
+                        .map(|value| truncate(&value, 500));
+                    batched_provenance.push((memory_id, *provenance_event_id, excerpt));
+                }
+                continue;
+            }
         }
 
         let mut metadata = match draft.metadata {
@@ -5006,6 +5423,12 @@ async fn persist_knowledge_snapshot_typed(
     .await
     .map_err(DbError::from)?;
 
+    // Snapshot retention (review 2026-10-09): every repository sync chunk
+    // inserted a full graph copy and nothing pruned them.
+    chum_mem_db::prune_knowledge_snapshots(tx, context, project_id, snapshot_type, 3)
+        .await
+        .map_err(DbError::from)?;
+
     sqlx::query(
         r#"
         delete from public.knowledge_communities
@@ -6100,4 +6523,47 @@ mod tests {
     // covered by `integration_history_flag_controls_superseded_claim_visibility`
     // and `integration_contradictions_surface_in_memory_get_and_context_build`
     // which now drain the queue via `run_pending_reconciliation`.
+}
+
+#[cfg(test)]
+mod review_2026_10_09_tests {
+    use super::*;
+
+    #[test]
+    fn git_remotes_normalise_to_host_and_path() {
+        for raw in [
+            "https://github.com/CodeChum/gradechum.git",
+            "https://someone:example@github.com/CodeChum/gradechum",
+            "git@github.com:CodeChum/gradechum.git",
+            "ssh://git@github.com/CodeChum/gradechum.git/",
+        ] {
+            assert_eq!(
+                normalize_git_remote(raw).as_deref(),
+                Some("github.com/codechum/gradechum"),
+                "{raw}"
+            );
+        }
+        assert_eq!(normalize_git_remote("  "), None);
+        assert_ne!(
+            normalize_git_remote("git@github.com:CodeChum/chum-mem.git"),
+            normalize_git_remote("git@github.com:CodeChum/gradechum.git")
+        );
+    }
+
+    #[test]
+    fn token_compare_is_exact() {
+        assert!(token_matches("abc123", "abc123"));
+        assert!(!token_matches("abc123", "abc12"));
+        assert!(!token_matches("abc123", "abc1234"));
+        assert!(!token_matches("abc123", ""));
+    }
+
+    #[test]
+    fn destructive_routes_are_admin_routes() {
+        assert!(is_admin_route("/api/admin/reembed"));
+        assert!(is_admin_route("/v1/ingest/bulk/drop-indexes"));
+        assert!(is_admin_route("/v1/ingest/bulk/create-indexes"));
+        assert!(!is_admin_route("/v1/ingest/session/events/bulk"));
+        assert!(!is_admin_route("/api/search"));
+    }
 }
