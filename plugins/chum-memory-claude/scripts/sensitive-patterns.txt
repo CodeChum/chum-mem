@@ -42,3 +42,5 @@ env-secret-assignment|-|(^|[^A-Za-z0-9])([A-Z0-9]+_)*(PWD|PASS|PASSWD|PASSWORD|S
 google-oauth-token|-|ya29\.[A-Za-z0-9_-]{20,}
 short-password-assignment|-|(^|[^A-Za-z0-9])(pw|pwd)(\\?["'])?[[:space:]]*[=:][[:space:]]*(\\?["'])?[A-Za-z0-9][^[:space:]"',;\\]{7,}
 json-escaped-secret-assignment|i|(api[_-]?key|secret[_-]?key|client[_-]?secret|password|passwd|auth[_-]?token|access[_-]?token|refresh[_-]?token|private[_-]?key|encryption[_-]?key|database_url)\\"[[:space:]]*:[[:space:]]*\\"[^[:space:]"',;\\]{8,}
+
+chum-mem-token|i|(x-chum-token|chum_memory_api_token|chum_mem_api_tokens)(\\?["'])?[[:space:]]*[:=][[:space:]]*(\\?["'])?[A-Za-z0-9_-]{20,}
