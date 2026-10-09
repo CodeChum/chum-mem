@@ -210,6 +210,12 @@ Actor 1 = real headless Claude Code session on the monorepo checkout (git email 
 - After the rebuild and restart (fork commit 0192626): real two-actor check through the tunnel, runs 210–211. Actor 2's answer: "The DepEd results-release emails go out through the existing automated_emails app … recorded as a decision under CODECHUM-99903 by cymmer@codechum.com on 2026-10-08, per team memory." Author now present on the semantic path too. **The shared server works end to end for two identities over IAP.**
 - Per-engineer setup is one-time: `deploy/gcp/install-tunnel-agent.sh` installs a launchd agent that keeps the IAP tunnel open (KeepAlive, RunAtLoad); after that nothing is started per session.
 
+## F32 — Capture made unavoidable in the repo; API token auth built; cloud sessions deferred (2026-10-09)
+- The monorepo branch `chum-mem-pilot/shared-project-id` now carries the hooks (`.claude/settings.json`), the three hook scripts (`.claude/chum-mem/scripts/`), the retrieval skill and the `chum-memory` MCP server (`.mcp.json`), plus `.chum-mem` with the server URL. Any Claude Code session started in the repo runs them; the plugin install is no longer needed. Observed immediately: this very session picked the hooks up live when the settings file changed.
+- Server: `CHUM_MEM_API_TOKENS` enables an axum middleware requiring `X-Chum-Token` or `Authorization: Bearer` on everything except `/health`, `/ready` and preflight; hook scripts, the worker callback and the dashboard proxy send it. Verified locally: 401 without/with a wrong token, 200 with it, health open. Off by default.
+- Decision: no public hostname yet, IAP stays the only door, cloud sessions excluded for now. The Access application settings are ready for when that changes: self-hosted app `chum-mem.gradechum.com`, policy allow emails ending `@codechum.com`, plus a service token for sandboxes.
+- VM incremental import after the tunnel-reset recovery: 8,099 sessions / 97,818 events imported, 0 failed; store at 7,930 sessions, 16,103 memories; indexes recreated.
+
 ## Measurements table (updated as runs complete)
 | Run | What | Result |
 |---|---|---|

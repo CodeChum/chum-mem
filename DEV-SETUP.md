@@ -51,33 +51,42 @@ curl -s -X POST -H 'Content-Type: application/json' -d '{"projectId":"<id>"}' ht
 Embeddings are computed on ingest with the local model, so no re-embed step is
 needed on the VM (`POST /api/admin/reembed` exists for model changes).
 
-## 3. Each engineer (one-time, about 5 minutes)
+## 3. Each engineer (one-time, about 3 minutes)
 
-Prerequisites: Claude Code, `gh`, the Google Cloud SDK, and an admin has given
-your @codechum.com account **IAP-secured Tunnel User** + **Compute Viewer** on
-project `gradechum`.
+The hooks, the retrieval skill and the MCP server are **committed in the
+monorepo** (`.claude/settings.json`, `.claude/chum-mem/`, `.claude/skills/chum-memory/`,
+`.mcp.json`, `.chum-mem`), so there is no plugin to install. The only thing a
+laptop needs is the tunnel to the VM:
 
 ```bash
-gcloud auth login                                   # once; tokens refresh on their own
-gh repo clone CodeChum/chum-mem ~/chum-mem && cd ~/chum-mem
-deploy/gcp/install-tunnel-agent.sh install          # launchd agent: tunnel to the VM, auto-restarts, survives reboots
-echo 'export CHUM_MEMORY_API_URL=http://localhost:63001' >> ~/.zshrc && export CHUM_MEMORY_API_URL=http://localhost:63001
-./plugin-install.sh claude production               # registers the plugin + MCP server in Claude Code
+gcloud auth login                                   # once; your @codechum.com account
+gh repo clone CodeChum/chum-mem ~/chum-mem
+~/chum-mem/deploy/gcp/install-tunnel-agent.sh install   # launchd agent, auto-restarts, survives reboots
 ```
 
-That is the whole setup. From then on, every Claude Code session you start from
-the **monorepo root** is captured and auto-searched. Nothing to run per session.
+Prerequisite from an admin: **IAP-secured Tunnel User** + **Compute Viewer** on
+project `gradechum`.
 
-Check it works:
+Then start Claude Code from the **monorepo root** as usual. On the first run
+Claude Code asks once to approve the project's MCP server (`chum-memory`) and
+hooks; accept. From then on every session is captured and auto-searched.
+If the tunnel is down, events spool to `.chum-cache/outbox/` and replay later.
 
-- `deploy/gcp/install-tunnel-agent.sh status` shows the tunnel up and `/ready`
-- in Claude Code, `/mcp` shows `chum-memory` connected
-- ask "is anyone working on the bonus toggle?" and the answer cites team memory with an author email
-- `.chum-cache/` appears in the repo root (ignored); if the tunnel is down,
-  events spool to `.chum-cache/outbox/` and replay on the next prompt
+Check: `~/chum-mem/deploy/gcp/install-tunnel-agent.sh status` shows `/ready`;
+in Claude Code `/mcp` shows `chum-memory` connected; ask "is anyone working on
+the bonus toggle?" and the answer cites team memory with an author email.
+Identity is your git `user.email` in that checkout.
 
-Identity is your git `user.email` in that checkout — make sure it is your work
-address. Updates: `git -C ~/chum-mem pull` then `/reload-plugins` in Claude Code.
+Optional hardening: the API supports shared tokens (`CHUM_MEM_API_TOKENS` on
+the server, `CHUM_MEMORY_API_TOKEN` in each shell). Off by default while the
+only door is IAP.
+
+## Scope decision (2026-10-09)
+
+- Laptop sessions in the monorepo: captured. Cloud / web Claude Code sessions,
+  Claude Desktop and Cowork: **not captured** (no tunnel, no hooks there). The
+  public-hostname path (Cloudflare Tunnel + Access + API token) is built but
+  not deployed; it is the next step if cloud sessions are wanted.
 
 ## What you get, and what you do not (yet)
 
