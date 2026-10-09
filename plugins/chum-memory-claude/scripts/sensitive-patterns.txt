@@ -18,3 +18,23 @@ private-key|-|-----BEGIN [A-Z ]*PRIVATE KEY-----
 jwt|-|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}
 webhook-url|-|https://(hooks\.slack\.com/services/|discord(app)?\.com/api/webhooks/)[A-Za-z0-9/_-]+
 secret-assignment|i|(api[_-]?key|secret[_-]?key|client[_-]?secret|password|passwd|auth[_-]?token|access[_-]?token|refresh[_-]?token|private[_-]?key|encryption[_-]?key|database_url)["']?[[:space:]]*[=:][[:space:]]*["']?[^[:space:]"',;\\]{8,}
+# --- added by the go-live security review (2026-10-09). Every rule below was run
+# with /usr/bin/grep -E against a true-positive corpus and a false-positive corpus
+# (git SHAs, UUIDs, base64 image data, "password" in prose, placeholders).
+# Note: the scan runs on the JSON-encoded event, so a quote inside a tool
+# output arrives as \" — rules that expect quotes allow an optional backslash.
+bearer-token|i|authorization(\\?["'])?[[:space:]]*[:=][[:space:]]*(\\?["'])?[[:space:]]*bearer[[:space:]]+[A-Za-z0-9._~+/=-]{20,}
+aws-secret-key|i|aws[_-]?secret[_-]?access[_-]?key(\\?["'])?[[:space:]]*[=:][[:space:]]*(\\?["'])?[A-Za-z0-9/+=]{40}
+stripe-key|-|(sk|rk)_(live|test)_[A-Za-z0-9]{20,}
+twilio-api-key|-|(^|[^A-Za-z0-9])SK[0-9a-fA-F]{32}([^A-Za-z0-9]|$)
+sendgrid-key|-|SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}
+huggingface-token|-|hf_[A-Za-z0-9]{30,}
+npm-token|-|npm_[A-Za-z0-9]{30,}
+langfuse-secret-key|-|sk-lf-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
+sentry-dsn|-|https://[0-9a-f]{32}@[A-Za-z0-9.-]*sentry\.io/
+gcp-service-account-key|-|private_key_id(\\?["'])[[:space:]]*:[[:space:]]*(\\?["'])[0-9a-f]{40}
+basic-auth-url|-|https?://[^:/@[:space:]"']+:[^@/[:space:]"']{6,}@
+cli-password-flag|-|(--password[= ]|--token[= ]|-u [^[:space:]:"']+:)[A-Za-z0-9][^[:space:]"']{7,}
+env-secret-assignment|-|(^|[^A-Za-z0-9])([A-Z0-9]+_)*(PWD|PASS|PASSWD|PASSWORD|SECRET|TOKEN|APIKEY|API_KEY|PRIVATE_KEY|ACCESS_KEY|SECRET_KEY|CREDENTIALS?)(_[A-Z0-9_]*)?=[A-Za-z0-9][^[:space:]"'$]{7,}
+short-password-assignment|-|(^|[^A-Za-z0-9])(pw|pwd)(\\?["'])?[[:space:]]*[=:][[:space:]]*(\\?["'])?[A-Za-z0-9][^[:space:]"',;\\]{7,}
+json-escaped-secret-assignment|i|(api[_-]?key|secret[_-]?key|client[_-]?secret|password|passwd|auth[_-]?token|access[_-]?token|refresh[_-]?token|private[_-]?key|encryption[_-]?key|database_url)\\"[[:space:]]*:[[:space:]]*\\"[^[:space:]"',;\\]{8,}
