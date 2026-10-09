@@ -238,7 +238,7 @@ fetch_prompt_memory_escaped() {
        | (((.title // "") + " " + (.summary // "") + " " + (.content // "")) | ascii_downcase) as $text
        | ([$w[] | select(. as $x | $text | contains($x))] | length) as $overlap
        | select((((.semanticScore // 0) >= ($gate | tonumber)) and ($overlap >= 1 or ($w | length) == 0))
-                or ((.lexicalScore // 0) > 0)
+                or (((.lexicalScore // 0) > 0) and ($overlap >= 1 or ($w | length) == 0))
                 or ($overlap >= 2 and ($overlap * 10) >= (($w | length) * 3)))
        # Drop echoes: a stored copy of the same question is not knowledge.
        | select(((.title // "") | ascii_downcase | contains($pfx)) | not)] | .[0:($limit | tonumber)] |
@@ -246,7 +246,7 @@ fetch_prompt_memory_escaped() {
       "--- Team memory (auto-recall for this prompt; hits from chum-memory, newest first within rank) ---\n" +
       (map("- [" + (.memoryType // .type // "memory" | tostring) + "] "
            + ((.title // "") | gsub("\n"; " ") | .[0:220])
-           + " (by " + (.authorEmail // "unknown") + ", " + ((.createdAt // "")[0:16]) + ", session " + ((.sessionIds[0] // "") | tostring | .[0:8]) + ", " + (if ((.semanticScore // 0) > 0 or (.lexicalScore // 0) > 0) then ("match " + ((([(.semanticScore // 0), (.lexicalScore // 0)] | max) * 100 | floor) | tostring) + "%") else "word overlap" end) + ")"
+           + " (by " + (.authorEmail // "unknown") + ", " + ((.createdAt // "")[0:16]) + ", session " + ((.sessionIds[0] // "") | tostring | .[0:8]) + ", " + (if ((.semanticScore // 0) > 0 or (.lexicalScore // 0) > 0) then ("match " + ((([(.semanticScore // 0), (.lexicalScore // 0), 1] | min) as $m | ([(.semanticScore // 0), (.lexicalScore // 0)] | max | if . > 1 then 1 else . end) * 100 | floor) | tostring) + "%") else "word overlap" end) + ")"
           ) | join("\n"))
       + "\nIf any of these bears on the request, use it and say who recorded it; call mem_search for details."
     end' 2>/dev/null)
