@@ -8,6 +8,7 @@
 # SESSION is the Claude session id prefix shown by `list`; omit it to act on all.
 # The project is taken from CLAUDE_PROJECT_DIR, then the git root of $PWD.
 set -uo pipefail
+umask 077  # outbox, quarantine and state files hold raw session content: owner-only
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 QDIR="$PROJECT_DIR/.chum-cache/quarantine"

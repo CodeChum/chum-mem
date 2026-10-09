@@ -119,6 +119,15 @@ The docs sync uploads only files git tracks (plus the rules in
 `.chum-sync-rules.json`); loose notes and untracked files stay on your laptop.
 `CHUM_SYNC_INCLUDE_UNTRACKED=1` restores the old full walk.
 
+Pause capture for one session with `CHUM_CAPTURE=0 claude`: every hook becomes
+a no-op (nothing captured, spooled or recalled). A spool file that still cannot
+be delivered after 50 replays (`CHUM_SPOOL_MAX_REPLAYS`) or 7 days moves to
+`.chum-cache/quarantine/` marked `stale-spool`, with one warning; use
+`/chum-quarantine` to send or drop it. Sessions that died without a Stop hook
+are closed on the server at your next session start once their local state is
+12 h old. Auto-recall and the session-start report are framed as untrusted
+data, and nothing is added to a prompt when no memory or doc matches it.
+
 If you have a global hook that spawns `claude -p` (for example a session
 labeller), guard it with an env flag: the nested session fires the project hooks
 again and is captured as a junk session under your email.

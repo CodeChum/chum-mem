@@ -16,7 +16,8 @@
 set -Eeuo pipefail
 # An unhandled failure under `set -e` must say where it died: an empty error line
 # hid a 3.5 h capture outage (FINDINGS F39). -E lets functions inherit the trap.
-trap 'rc=$?; echo "session-sync: aborted at line ${LINENO} (exit ${rc}) during ${HOOK_EVENT:-?}" >&2' ERR
+# Only the top-level shell reports: failures inside $(...) are handled by their `|| ...`.
+trap 'rc=$?; [[ ${BASH_SUBSHELL:-0} -eq 0 ]] && echo "session-sync: aborted at line ${LINENO} (exit ${rc}) during ${HOOK_EVENT:-?}" >&2' ERR
 # A hook killed at its timeout must not leave response/payload files in /tmp.
 trap 'rm -f /tmp/chum-session-*-resp.$$.json' EXIT
 
@@ -144,10 +145,54 @@ flush_one() {
     { grep . "$tmp" | tail -n +$((sent + 1)); [[ -s "$f" ]] && cat "$f"; } > "${f}.new"
     mv "${f}.new" "$f"
     echo "session-sync: WARN outbox $(basename "$f"): replayed ${sent}/${total}, rest kept" >&2
+    note_replay_failure "$f"
   else
     echo "session-sync: replayed ${sent} spooled lines from $(basename "$f")" >&2
+    rm -f "${f%.jsonl}.fails"
   fi
   rm -f "$tmp"
+}
+
+# A spool file that keeps failing (its API URL no longer answers, or the server
+# rejects the lines) used to be retried on every hook forever, silently. After
+# CHUM_SPOOL_MAX_REPLAYS failed replays (default 50) or 7 days since the first
+# failure, its lines move to .chum-cache/quarantine/ (marked "stale-spool"),
+# where /chum-quarantine list|send|drop handles them, and the user is told once.
+note_replay_failure() {  # $1 outbox file
+  local f="$1" fails="${1%.jsonl}.fails" n=0 first now
+  now=$(date +%s)
+  if [[ -f "$fails" ]]; then read -r n first < "$fails" || true; fi
+  n=$(( ${n:-0} + 1 )); first="${first:-$now}"
+  if [[ "$n" -ge "${CHUM_SPOOL_MAX_REPLAYS:-50}" || $(( now - first )) -ge 604800 ]]; then
+    mkdir -p "$QUARANTINE_DIR"
+    jq -c --arg at "$(date -u +%FT%TZ)" '. + {matched:"stale-spool", at:$at}' "$f" \
+      >> "$QUARANTINE_DIR/$(basename "$f")" 2>/dev/null && rm -f "$f" "$fails"
+    printf 'chum-mem: spooled events in %s could not be delivered after %s attempts (target %s). They are held in .chum-cache/quarantine/: run /chum-quarantine list, then send or drop.' \
+      "$(basename "$f")" "$n" "$(head -n 1 "$QUARANTINE_DIR/$(basename "$f")" | jq -r '.api // "?"' 2>/dev/null)" > "$QUARANTINE_DIR/.notice.global"
+    echo "session-sync: WARN outbox $(basename "$f") moved to quarantine after ${n} failed replays" >&2
+  else
+    printf '%s %s\n' "$n" "$first" > "$fails"
+  fi
+}
+
+# Sessions whose Claude process died (crash, closed terminal, kill) never send
+# Stop/SessionEnd and stay "active" on the server forever. On SessionStart,
+# close up to 5 of this checkout's own session-state files older than 12 h.
+close_stale_sessions() {
+  local st sid n=0 code
+  while IFS= read -r st; do
+    [[ -n "$st" && "$st" != "$SESSION_STATE_FILE" ]] || continue
+    n=$((n + 1)); [[ "$n" -le 5 ]] || break
+    sid=$(jq -r '.sessionId // ""' "$st" 2>/dev/null || echo "")
+    if [[ -z "$sid" || "$sid" == "null" || "$sid" == "DEFERRED" ]]; then
+      rm -f "$st"; continue   # never reached the server; its spooled lines replay on their own
+    fi
+    code=$(jq -c -n --arg sid "$sid" '{sessionId:$sid, summary:"[session ended without a Stop hook; closed by chum-mem at the next session start]"}' \
+      | curl -sS $AUTH_HEADER --max-time 5 -o /dev/null -w "%{http_code}" -X POST -H 'Content-Type: application/json' \
+          --data-binary @- "${API_URL}/v1/ingest/session/end" 2>/dev/null) || code="000"
+    case "$code" in 2*|404) rm -f "$st"; echo "session-sync: closed stale session $sid" >&2 ;; esac
+  done < <(find "$CACHE_DIR" -maxdepth 1 -name "session-${PROVIDER}-*.json" -mmin +720 2>/dev/null)
+  return 0
 }
 
 # ── Sensitive-content guard ──────────────────────────────────────────────────
@@ -443,6 +488,7 @@ fi
 
 case "$HOOK_EVENT" in
   SessionStart)
+    [[ "${CHUM_SPOOL_ONLY:-0}" == "1" ]] || close_stale_sessions
     ensure_session_started
     ;;
   UserPromptSubmit)
