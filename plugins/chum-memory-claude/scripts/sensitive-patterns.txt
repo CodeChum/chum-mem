@@ -1,0 +1,20 @@
+# Sensitive-content guard: one rule per line, `name|flags|extended-regex`.
+# flags: `i` = case-insensitive, `-` = none. Lines starting with # are ignored.
+# A session event that matches any rule is HELD in .chum-cache/quarantine/ and
+# never sent to team memory until someone runs `chum-quarantine.sh send`.
+# A repo can extend this list with a `.chum-sensitive-patterns` file at its root
+# (same format); both lists apply.
+anthropic-key|-|sk-ant-[A-Za-z0-9_-]{20,}
+openai-key|-|sk-(proj-|live-)?[A-Za-z0-9]{32,}
+claude-oauth-token|-|oat01-[A-Za-z0-9_-]{20,}
+google-api-key|-|AIza[0-9A-Za-z_-]{30,}
+github-token|-|(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}
+github-pat|-|github_pat_[A-Za-z0-9_]{30,}
+slack-token|-|xox[abprs]-[A-Za-z0-9-]{10,}
+aws-access-key|-|AKIA[0-9A-Z]{16}
+neon-password|-|npg_[A-Za-z0-9]{8,}
+url-with-password|-|(postgres|postgresql|mysql|redis|rediss|mongodb|mongodb\+srv|amqp|amqps)://[^:/[:space:]"']+:[^@[:space:]"']+@
+private-key|-|-----BEGIN [A-Z ]*PRIVATE KEY-----
+jwt|-|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}
+webhook-url|-|https://(hooks\.slack\.com/services/|discord(app)?\.com/api/webhooks/)[A-Za-z0-9/_-]+
+secret-assignment|i|(api[_-]?key|secret[_-]?key|client[_-]?secret|password|passwd|auth[_-]?token|access[_-]?token|refresh[_-]?token|private[_-]?key|encryption[_-]?key|database_url)["']?[[:space:]]*[=:][[:space:]]*["']?[^[:space:]"',;\\]{8,}

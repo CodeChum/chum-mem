@@ -130,6 +130,39 @@ flush_one() {
   rm -f "$tmp"
 }
 
+# ── Sensitive-content guard ──────────────────────────────────────────────────
+# Every event is scanned against scripts/sensitive-patterns.txt plus the repo's
+# optional .chum-sensitive-patterns. A match is HELD in .chum-cache/quarantine/
+# (same line format as the outbox) and a notice is left for hook-dispatch to show
+# the user. Nothing held is ever sent unless chum-quarantine.sh releases it.
+# CHUM_SENSITIVE_GUARD=0 disables the scan (not recommended).
+SCRIPTS_DIR_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+QUARANTINE_DIR="${CACHE_DIR}/quarantine"
+scan_sensitive() {  # $1 text -> prints matched rule names; exit 0 when any matched
+  [[ "${CHUM_SENSITIVE_GUARD:-1}" == "1" ]] || return 1
+  local text="$1" name flags re hits=""
+  while IFS='|' read -r name flags re; do
+    [[ -z "$name" || "$name" == \#* || -z "$re" ]] && continue
+    if [[ "$flags" == *i* ]]; then
+      printf '%s' "$text" | grep -Eiq -- "$re" 2>/dev/null && hits="${hits:+$hits,}$name"
+    else
+      printf '%s' "$text" | grep -Eq -- "$re" 2>/dev/null && hits="${hits:+$hits,}$name"
+    fi
+  done < <(cat "$SCRIPTS_DIR_SELF/sensitive-patterns.txt" "${PROJECT_ROOT:-$PWD}/.chum-sensitive-patterns" 2>/dev/null)
+  [[ -n "$hits" ]] || return 1
+  printf '%s' "$hits"
+}
+quarantine_line() {  # $1 kind (event|end), $2 body json, $3 matched names, $4 where (prompt|tool output|reply)
+  mkdir -p "$QUARANTINE_DIR"
+  jq -c -n --arg kind "$1" --arg ext "$AGENT_SESSION_ID" --arg api "$API_URL" --arg matched "$3" \
+    --arg at "$(date -u +%FT%TZ)" --argjson start "$(session_start_payload)" --argjson body "$2" \
+    '{kind:$kind, ext:$ext, api:$api, matched:$matched, at:$at, start:$start, body:$body}' \
+    >> "$QUARANTINE_DIR/${PROVIDER}-${AGENT_SESSION_ID}.jsonl"
+  printf 'chum-mem: NOT sent to team memory — secret-shaped content (%s) found in your %s. It is held locally in .chum-cache/quarantine/. Run /chum-quarantine list to review, send to store it anyway, drop to discard. Held items are never sent on their own.' \
+    "$3" "$4" > "$QUARANTINE_DIR/.notice"
+  echo "session-sync: held $1 from $4 (matched: $3)" >&2
+}
+
 # Replay every spooled file for this project (all sessions), oldest first.
 # Runs in a DETACHED process (see spawn_flush): replays take ~1.5 s per line
 # over a tunnel and must not be killed by the hook's 10-60 s timeout.
@@ -259,7 +292,12 @@ post_event() {
       rawPayload: $rawPayload
     }')
 
-  local http_code
+  local http_code matched where
+  if matched=$(scan_sensitive "$full_payload"); then
+    case "$event_type" in prompt) where="prompt" ;; response) where="reply" ;; *) where="tool input/output" ;; esac
+    quarantine_line event "$full_payload" "$matched" "$where"
+    return 0
+  fi
   if [[ "${CHUM_SPOOL_ONLY:-0}" == "1" ]]; then
     spool_line event "$full_payload"
     return 0
@@ -297,8 +335,13 @@ end_session() {
   local chum_session_id
   chum_session_id=$(jq -r '.sessionId // ""' "$SESSION_STATE_FILE")
 
-  local summary_text
+  local summary_text matched
   summary_text=$(echo "$HOOK_PAYLOAD" | jq -r '.last_assistant_message // ""')
+  if matched=$(scan_sensitive "$summary_text"); then
+    # The session must still close; only the summary text is held.
+    quarantine_line end "$(jq -c -n --arg summary "$summary_text" '{sessionId: "DEFERRED", summary: $summary}')" "$matched" "reply"
+    summary_text="[summary held back by the chum-mem sensitive-content guard]"
+  fi
 
   if [[ "${CHUM_SPOOL_ONLY:-0}" == "1" ]]; then
     spool_line end "$(jq -c -n --arg summary "$summary_text" '{sessionId: "DEFERRED", summary: $summary}')"

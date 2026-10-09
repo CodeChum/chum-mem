@@ -177,6 +177,12 @@ if [[ -x "${SCRIPTS_DIR}/session-sync.sh" ]]; then
 fi
 
 __tlog session_layer
+# A held (quarantined) event leaves a notice; show it to the user once.
+SYSTEM_MSG=""
+QNOTICE="${PROJECT_DIR}/.chum-cache/quarantine/.notice"
+if [[ -f "$QNOTICE" ]]; then
+  SYSTEM_MSG=$(jq -Rs '.' < "$QNOTICE" 2>/dev/null | sed 's/^"//;s/"$//'); rm -f "$QNOTICE"
+fi
 # ── Repository layer (only on turn-boundary events) ──
 case "$HOOK_EVENT" in
   UserPromptSubmit|SessionStart)
@@ -190,13 +196,18 @@ __tlog repo_layer
 # ── Emit provider-appropriate control JSON ──
 emit_claude() {
   local event="$1" message="$2"
-  printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"%s"}}\n' "$event" "$message"
+  if [[ -n "${SYSTEM_MSG:-}" ]]; then
+    printf '{"systemMessage":"%s","hookSpecificOutput":{"hookEventName":"%s","additionalContext":"%s"}}\n' "$SYSTEM_MSG" "$event" "$message"
+  else
+    printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"%s"}}\n' "$event" "$message"
+  fi
 }
 
 emit_codex() {
   # Codex reads `systemMessage` from stdout JSON. Keep it short so it isn't
   # injected verbatim into every turn.
   local message="$1"
+  [[ -n "${SYSTEM_MSG:-}" ]] && message="${SYSTEM_MSG}\\n${message}"
   printf '{"systemMessage":"%s"}\n' "$message"
 }
 
@@ -298,6 +309,11 @@ case "$HOOK_EVENT" in
     else
       emit_claude "SessionStart" "$SESSION_START_MSG"
     fi
+    ;;
+  PostToolUse|Stop)
+    # No context on these events (a Stop context keeps the session running);
+    # a quarantine notice is a plain warning to the user and is safe here.
+    [[ -n "${SYSTEM_MSG:-}" ]] && printf '{"systemMessage":"%s"}\n' "$SYSTEM_MSG"
     ;;
 esac
 

@@ -104,6 +104,30 @@ Optional hardening: the API supports shared tokens (`CHUM_MEM_API_TOKENS` on
 the server, `CHUM_MEMORY_API_TOKEN` in each shell). Off by default while the
 only door is IAP.
 
+## Sensitive-content guard (hold and ask)
+
+Claude Code hooks cannot open a dialog, so the guard works as hold-and-ask.
+Every prompt, tool output and reply is scanned against
+`scripts/sensitive-patterns.txt` (API keys, OAuth tokens, passwords inside
+URLs, private keys, JWTs, webhook URLs, `KEY=value` secrets). A match is
+**held** in `.chum-cache/quarantine/` instead of being sent, and the hook shows
+one warning line:
+
+> chum-mem: NOT sent to team memory — secret-shaped content (anthropic-key)
+> found in your prompt. … Run /chum-quarantine list / send / drop.
+
+Held items are never sent on their own. `/chum-quarantine list` shows them with
+the secrets masked, `send` releases them as they are (the store has no
+redaction), `drop` discards them. A session whose reply was held still closes
+normally with a placeholder summary. Clean events are not delayed; the scan is
+a few `grep -E` calls per event.
+
+The list is a starting point, not a policy. Extend it per repo with a
+`.chum-sensitive-patterns` file at the repo root (same `name|flags|regex`
+format); both lists apply. `CHUM_SENSITIVE_GUARD=0` disables the scan.
+The docs sync (`sync.sh`) is not scanned yet; committed docs are the team's
+responsibility.
+
 ## Scope decision (2026-10-09)
 
 - Laptop sessions in the monorepo: captured. Cloud / web Claude Code sessions,
