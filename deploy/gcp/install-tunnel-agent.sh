@@ -3,7 +3,7 @@
 # agent that keeps `gcloud compute start-iap-tunnel` running so the chum-memory
 # plugin always finds the team server at http://localhost:63001.
 #
-# Usage: deploy/gcp/install-tunnel-agent.sh [install|uninstall|status]
+# Usage: deploy/gcp/install-tunnel-agent.sh [install|uninstall|status|token [TOKEN]]
 set -euo pipefail
 PROJECT="${CHUM_GCP_PROJECT:-gradechum}"
 ZONE="${CHUM_GCP_ZONE:-asia-east1-b}"
@@ -55,9 +55,20 @@ EOF
     launchctl bootout "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || true
     rm -f "$PLIST"; echo "tunnel agent removed"
     ;;
+  token)
+    # Store the team API token for the hooks (file) and for the MCP server (env
+    # var exported from ~/.zshenv). Paste it when prompted; it is never echoed.
+    mkdir -p "$HOME/.config/chum-mem"; chmod 700 "$HOME/.config/chum-mem"
+    if [[ -n "${2:-}" ]]; then printf '%s' "$2" > "$HOME/.config/chum-mem/token"
+    else read -r -s -p "chum-mem API token: " T; echo; printf '%s' "$T" > "$HOME/.config/chum-mem/token"; fi
+    chmod 600 "$HOME/.config/chum-mem/token"
+    LINE='export CHUM_MEMORY_API_TOKEN="$(cat "$HOME/.config/chum-mem/token" 2>/dev/null)"'
+    grep -qF 'config/chum-mem/token' "$HOME/.zshenv" 2>/dev/null || printf '\n# chum-mem team memory token (hooks + MCP)\n%s\n' "$LINE" >> "$HOME/.zshenv"
+    echo "token saved to ~/.config/chum-mem/token (0600) and exported from ~/.zshenv; open a new terminal before starting Claude Code"
+    ;;
   status)
     launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | grep -E 'state|pid' | head -2 || echo "not installed"
     curl -s --max-time 2 "http://localhost:$PORT/ready" | head -c 120; echo
     ;;
-  *) echo "usage: $0 [install|uninstall|status]"; exit 2 ;;
+  *) echo "usage: $0 [install|uninstall|status|token [TOKEN]]"; exit 2 ;;
 esac

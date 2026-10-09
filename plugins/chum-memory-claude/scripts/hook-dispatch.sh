@@ -65,6 +65,10 @@ export CHUM_MEMORY_API_URL="$API_URL"
 # ── API token (optional): sent as X-Chum-Token on every call. Single-word
 # header so it can be expanded unquoted under bash 3.2 with `set -u`.
 AUTH_HEADER=""
+# Token: env var first, else the file the installer writes (~/.config/chum-mem/token).
+if [[ -z "${CHUM_MEMORY_API_TOKEN:-}" && -r "${HOME}/.config/chum-mem/token" ]]; then
+  CHUM_MEMORY_API_TOKEN="$(tr -d '[:space:]' < "${HOME}/.config/chum-mem/token")"; export CHUM_MEMORY_API_TOKEN
+fi
 if [[ -n "${CHUM_MEMORY_API_TOKEN:-}" ]]; then AUTH_HEADER="-HX-Chum-Token:${CHUM_MEMORY_API_TOKEN}"; fi
 API_HEALTHY=1
 # Health gate. The default budget is 5 s (was 2 s): through the IAP tunnel a

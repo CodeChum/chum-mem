@@ -26,7 +26,7 @@ If you ever want to re-create it: `deploy/gcp/deploy-vm.sh create` (same env var
 
 ## 2. Monorepo (once)
 
-Merge branch `chum-mem-pilot/shared-project-id` in `CodeChum/gradechum`. It adds:
+Branch `chum-mem-pilot/shared-project-id` was merged into `main` on 2026-10-09. It adds:
 
 - `.chum-mem` — the shared project id (every checkout joins one graph)
 - `.chum-sync-rules.json` — docs-only sync rules (the server cannot index the
@@ -34,7 +34,9 @@ Merge branch `chum-mem-pilot/shared-project-id` in `CodeChum/gradechum`. It adds
 - `docs-mirror/` — memory notes mirrored as repository docs
 - `.gitignore` — `.chum-cache/`
 
-Backfill history once per engineer. Do it **on the VM over SSH**, not through
+The store was reset to empty on 2026-10-09 (the earlier full import was for
+testing only); the team starts from scratch and nothing is backfilled by
+default. If a backfill is ever wanted, do it **on the VM over SSH**, not through
 the IAP tunnel: a tunnel reset mid-import leaves sessions partial and the
 bulk-import indexes dropped (FINDINGS F31). Copy the transcript folders up, then:
 
@@ -67,10 +69,14 @@ laptop needs is the tunnel to the VM:
 gcloud auth login                                   # once; your @codechum.com account
 gh repo clone CodeChum/chum-mem ~/chum-mem
 ~/chum-mem/deploy/gcp/install-tunnel-agent.sh install   # launchd agent, auto-restarts, survives reboots
+~/chum-mem/deploy/gcp/install-tunnel-agent.sh token     # paste the team API token (not echoed)
 ```
 
-Prerequisite from an admin: **IAP-secured Tunnel User** + **Compute Viewer** on
-project `gradechum`.
+Prerequisites from an admin: **IAP-secured Tunnel User** + **Compute Viewer** on
+project `gradechum`, and the **API token** (the server rejects requests without
+it since 2026-10-09). The token step stores it in `~/.config/chum-mem/token`
+(0600) for the hooks and exports it from `~/.zshenv` for the MCP server; open a
+new terminal afterwards.
 
 Then start Claude Code from the **monorepo root** as usual. On the first run
 Claude Code asks once to approve the project's MCP server (`chum-memory`) and
@@ -100,9 +106,9 @@ If you have a global hook that spawns `claude -p` (for example a session
 labeller), guard it with an env flag: the nested session fires the project hooks
 again and is captured as a junk session under your email.
 
-Optional hardening: the API supports shared tokens (`CHUM_MEM_API_TOKENS` on
-the server, `CHUM_MEMORY_API_TOKEN` in each shell). Off by default while the
-only door is IAP.
+Token auth is **on** (`CHUM_MEM_API_TOKENS` in the VM's `.env`; one shared team
+token for the pilot, comma-separated list for more). Rotate by editing `.env`
+and `docker compose up -d`, then re-run the `token` step on every laptop.
 
 ## Sensitive-content guard (hold and ask)
 
