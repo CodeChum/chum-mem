@@ -213,7 +213,36 @@ test_health_cache() {
   rm -f "$FAKE_STATE/mcp-500"
 }
 
-ALL="concurrent_append fence_forgery tokenizer deferred_start_replay health_cache"
+# ── B: auto-recall attaches repository docs only unless session recall is on ──
+test_docs_only_default() {
+  echo "docs_only_default"
+  local r ctx p
+  r=$(mkrepo docsonly)
+  start_fake docsonly || { bad "fake api"; return; }
+  jq -n '{hits: [{memoryType:"decision", title:"bonus toggle lives in section settings", authorEmail:"dev@example.com",
+    createdAt:"2026-10-09T10:00:00Z", sessionIds:["aaaaaaaa-1"], semanticScore:0.9}]}' > "$FAKE_STATE/search.json"
+  jq -n '{jsonrpc:"2.0", id:1, result:{structuredContent:{nodes:[
+    {type:"file", label:"bonus-toggle.md", metadata:{fullPath:"docs/bonus-toggle.md"}}]}}}' > "$FAKE_STATE/docs.json"
+  p=$(payload UserPromptSubmit docsonly "$r" '{"prompt":"where does the bonus toggle flag live?"}')
+  ctx=$(hook "$r" "$FAKE_URL" "$p" | jq -r '.hookSpecificOutput.additionalContext // ""')
+  check "default: docs block attached" '[[ "$ctx" == *"--- Team docs"*"docs/bonus-toggle.md"* ]]'
+  check "default: no session-memory block" '[[ "$ctx" != *"Team memory"* && "$ctx" != *"bonus toggle lives in section settings"* ]]'
+  check "default: session memory is not even queried" '! grep -q "^POST /api/search" "$FAKE_STATE/requests.log"'
+  check "default: prompt preamble points to mem_search" '[[ "$ctx" == *"not attached automatically; search it with the chum-memory MCP tool mem_search"* ]]'
+  ctx=$(hook "$r" "$FAKE_URL" "$p" CHUM_AUTO_RECALL_SESSIONS=1 | jq -r '.hookSpecificOutput.additionalContext // ""')
+  check "CHUM_AUTO_RECALL_SESSIONS=1: memory and docs blocks" '[[ "$ctx" == *"--- Team memory"*"bonus toggle lives in section settings"*"--- Team docs"* ]]'
+  jq '. + {autoRecallSessions: true}' "$r/.chum-mem" > "$r/.chum-mem.new" && mv "$r/.chum-mem.new" "$r/.chum-mem"
+  ctx=$(hook "$r" "$FAKE_URL" "$p" | jq -r '.hookSpecificOutput.additionalContext // ""')
+  check ".chum-mem autoRecallSessions:true: memory block back" '[[ "$ctx" == *"--- Team memory"* ]]'
+  ctx=$(hook "$r" "$FAKE_URL" "$p" CHUM_AUTO_RECALL_SESSIONS=0 | jq -r '.hookSpecificOutput.additionalContext // ""')
+  check "env 0 overrides the .chum-mem switch" '[[ "$ctx" != *"Team memory"* && "$ctx" == *"--- Team docs"* ]]'
+  jq 'del(.autoRecallSessions)' "$r/.chum-mem" > "$r/.chum-mem.new" && mv "$r/.chum-mem.new" "$r/.chum-mem"
+  ctx=$(hook "$r" "$FAKE_URL" "$(payload SessionStart docsonly "$r")" | jq -r '.hookSpecificOutput.additionalContext // ""')
+  check "SessionStart says session memory is searchable on demand with mem_search" \
+    '[[ "$ctx" == *"NOT attached automatically: it is searchable on demand"*"mem_search for session memory"* ]]'
+}
+
+ALL="concurrent_append fence_forgery tokenizer deferred_start_replay health_cache docs_only_default"
 for t in ${*:-$ALL}; do "test_$t"; done
 echo "passed $PASS, failed $FAIL, skipped $SKIP  (scratch: $TMP)"
 [[ "$FAIL" -eq 0 ]]
