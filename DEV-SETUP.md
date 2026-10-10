@@ -154,7 +154,10 @@ widened per repo with `"healthTimeoutSecs": 8` in `.chum-mem` (default 5 s); a
 tripped gate spools the whole turn instead of sending it live. A successful
 health check is reused for 60 s (`.chum-cache/.health-ok`; any failed API call
 deletes it), so most hooks skip that round-trip; `CHUM_HEALTH_CACHE_SECS=0`
-checks on every hook.
+checks on every hook. A failed check is remembered for 30 s
+(`.chum-cache/.health-down`), so with the server down only one hook in that
+window waits for the timeout and the rest spool at once;
+`CHUM_HEALTH_DOWN_SECS=0` turns that off.
 
 Auto-recall (the block added to every prompt) attaches **repository docs only**
 by default (owner decision 2026-10-11: session memory as an automatic

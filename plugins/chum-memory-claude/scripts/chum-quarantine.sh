@@ -74,7 +74,20 @@ case "$CMD" in
       sid=$(basename "$f" .jsonl)
       # Held lines use the outbox line format, so releasing is a move into the
       # outbox; the detached replayer sends them with the usual retries.
-      jq -c 'del(.matched, .at)' "$f" >> "$OUTBOX/$sid.jsonl" && rm -f "$f"
+      # Append under the same mkdir lock session-sync.sh uses for the outbox, so
+      # a hook spooling into this session's outbox cannot interleave with us.
+      out="$OUTBOX/$sid.jsonl" part="$OUTBOX/$sid.jsonl.part.$$" i=0 locked=0
+      jq -c 'del(.matched, .at)' "$f" > "$part" || { rm -f "$part"; echo "could not read $(basename "$f")" >&2; continue; }
+      while ! mkdir "$out.lock" 2>/dev/null; do
+        i=$((i + 1))
+        if [[ $((i % 20)) -eq 0 && -n "$(find "$out.lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then rmdir "$out.lock" 2>/dev/null || true; fi
+        [[ "$i" -lt 100 ]] || break
+        sleep 0.1
+      done
+      [[ "$i" -lt 100 ]] && locked=1
+      cat "$part" >> "$out" && rm -f "$f"
+      [[ "$locked" -eq 0 ]] || rmdir "$out.lock" 2>/dev/null || true
+      rm -f "$part"
       echo "released $(basename "$f") -> outbox"
     done
     if [[ -x "$SCRIPTS_DIR/session-sync.sh" ]]; then

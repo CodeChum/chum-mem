@@ -288,7 +288,51 @@ test_hung_api_spools() {
   check "Stop finishes inside its 30 s timeout with reply and end spooled ($kinds)" '[[ "$kinds" == "end event event " ]]'
 }
 
-ALL="concurrent_append fence_forgery tokenizer deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools"
+# ── A failed /health is remembered briefly, so a down VM costs one timeout ──
+test_health_down_cache() {
+  echo "health_down_cache"
+  local r p hc
+  r=$(mkrepo hdown)
+  start_fake hdown || { bad "fake api"; return; }
+  : > "$FAKE_STATE/health-down"
+  p=$(payload UserPromptSubmit hdown "$r" '{"prompt":"where is the bonus toggle?"}')
+  hc() { grep -c '^GET /health' "$FAKE_STATE/requests.log" 2>/dev/null || true; }
+  hook "$r" "$FAKE_URL" "$p" >/dev/null
+  check "first hook checks /health ($(hc))" '[[ $(hc) -eq 1 ]]'
+  check "the failure is remembered" '[[ -f "$r/.chum-cache/.health-down" ]]'
+  hook "$r" "$FAKE_URL" "$p" >/dev/null
+  check "the next hook inside the window skips /health ($(hc))" '[[ $(hc) -eq 1 ]]'
+  check "and still spools the event" '[[ -n "$(ls "$r/.chum-cache/outbox/" 2>/dev/null)" ]]'
+  hook "$r" "$FAKE_URL" "$p" CHUM_HEALTH_DOWN_SECS=0 >/dev/null
+  check "CHUM_HEALTH_DOWN_SECS=0 always checks ($(hc))" '[[ $(hc) -eq 2 ]]'
+  rm -f "$FAKE_STATE/health-down"
+  printf '%s %s\n' "$(( $(date +%s) - 60 ))" "$FAKE_URL" > "$r/.chum-cache/.health-down"
+  hook "$r" "$FAKE_URL" "$p" >/dev/null
+  check "after the window /health is checked again ($(hc))" '[[ $(hc) -eq 3 ]]'
+  check "a healthy answer clears the memory" '[[ ! -f "$r/.chum-cache/.health-down" ]]'
+}
+
+# ── `chum-quarantine.sh send` appends under the outbox lock ──
+test_quarantine_send_locked() {
+  echo "quarantine_send_locked"
+  local r q out
+  r=$(mkrepo qsend)
+  mkdir -p "$r/.chum-cache/quarantine" "$r/.chum-cache/outbox"
+  q="$r/.chum-cache/quarantine/claude-qsend.jsonl"
+  out="$r/.chum-cache/outbox/claude-qsend.jsonl"
+  jq -cn '{kind:"event", ext:"qsend", matched:"jwt", at:"x", body:{eventType:"prompt", payload:{message:"made-up"}}}' > "$q"
+  mkdir "$out.lock"   # a hook is mid-append
+  ( sleep 1; printf '{"kind":"event","ext":"qsend","body":{"eventType":"tool_result"}}\n' >> "$out"; rmdir "$out.lock" ) &
+  local bg=$!
+  env -i PATH="$PATH" HOME="$TMP/home" CLAUDE_PROJECT_DIR="$r" CHUM_MEMORY_API_URL=http://127.0.0.1:9 \
+    "$BASH_BIN" "$SCRIPTS/chum-quarantine.sh" send >/dev/null 2>&1
+  wait "$bg"
+  check "send waited for the lock: hook line first, released line second" \
+    '[[ "$(jq -r .body.eventType "$out" 2>/dev/null | tr "\n" " ")" == "tool_result prompt " || "$(cat "$out".flushing.* "$out" 2>/dev/null | jq -r .body.eventType | tr "\n" " ")" == "tool_result prompt " ]]'
+  check "the held file is gone and the lock released" '[[ ! -e "$q" && ! -d "$out.lock" ]]'
+}
+
+ALL="concurrent_append fence_forgery tokenizer deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked"
 for t in ${*:-$ALL}; do "test_$t"; done
 echo "passed $PASS, failed $FAIL, skipped $SKIP  (scratch: $TMP)"
 [[ "$FAIL" -eq 0 ]]
