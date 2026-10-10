@@ -91,6 +91,18 @@ def write_tsv(path, mapping):
     os.replace(tmp, path)
 
 t0 = time.time()
+# Only files git tracks are uploaded: the repository snapshot is shared by the
+# whole team, and a plain walk also shipped an engineer's loose notes, scratch
+# exports and local agent memory (24 of 79 files in one checkout). Outside a
+# git checkout, or with CHUM_SYNC_INCLUDE_UNTRACKED=1, the walk is unfiltered.
+tracked = None
+if os.environ.get("CHUM_SYNC_INCLUDE_UNTRACKED") != "1" and os.path.exists(".git"):
+    try:
+        import subprocess
+        out = subprocess.run(["git", "ls-files", "-z"], capture_output=True, timeout=20, check=True).stdout
+        tracked = set(p.decode("utf-8", "replace") for p in out.split(b"\0") if p)
+    except Exception:
+        tracked = None
 eligible = []
 for root, dirs, files in os.walk(".", topdown=True):
     dirs[:] = [
@@ -108,6 +120,8 @@ for root, dirs, files in os.walk(".", topdown=True):
         if any(fnmatch.fnmatch(basename, pat) or fnmatch.fnmatch(filepath, pat) for pat in ignore_patterns):
             continue
         if not os.path.isfile(filepath):
+            continue
+        if tracked is not None and filepath not in tracked:
             continue
         try:
             size = os.path.getsize(filepath)
