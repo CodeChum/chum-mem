@@ -8,8 +8,10 @@ engineer does step 3.
 
 Project `gradechum`, zone `asia-east1-b`, e2-standard-4, Debian 12, built from
 `deploy/gcp/startup.sh`. **Nothing is exposed to the internet**: the firewall
-admits only Google's IAP range on tcp/22, and the API, Postgres and dashboard
-bind to the VM's loopback. Access control is Google IAM on the project.
+admits only Google's IAP range on tcp/22 and tcp/63001. Postgres and the
+dashboard bind to the VM's loopback; the API binds to the VM's internal NIC
+address (IAP TCP forwarding connects there, not to loopback). Access control is
+Google IAM on the project plus the API tokens below.
 
 Operate it with `deploy/gcp/deploy-vm.sh` (`status`, `logs`, `ssh`, `tunnel`):
 
@@ -23,6 +25,23 @@ Engineers need the IAM role **IAP-secured Tunnel User** (`roles/iap.tunnelResour
 plus `compute.instances.get` on the project (Compute Viewer is enough).
 
 If you ever want to re-create it: `deploy/gcp/deploy-vm.sh create` (same env vars).
+`create` pins the VM to one chum-mem commit (`CHUM_MEM_REF`, default: the
+current tip of `main`, resolved to a SHA and stored in the instance metadata
+`chum-mem-ref`). On first boot the startup script clones that commit, generates
+the Postgres password, a team API token (`CHUM_MEM_API_TOKENS`) and an admin
+token (`CHUM_MEM_ADMIN_TOKENS`) into `/opt/chum-mem/src/.env` (mode 600, never
+logged), then builds and starts the stack. Read the tokens over
+`deploy-vm.sh ssh` with `sudo grep -E '^CHUM_MEM_(API|ADMIN)_TOKENS=' /opt/chum-mem/src/.env`.
+
+**A reboot never deploys code.** Later boots only start the images already built
+from the checked-out commit; nothing is fetched or rebuilt. To roll out a
+reviewed change: `deploy/gcp/deploy-vm.sh deploy <full-commit-sha|tag>`, which
+records the ref in metadata, refreshes the startup script from your checkout and
+runs it with `--deploy <ref>` over IAP SSH (fetch that ref, check it out,
+rebuild, restart). `/opt/chum-mem/deployed-refs.log` lists every deploy.
+
+The API refuses to start when `CHUM_MEM_API_TOKENS` is empty, unless
+`CHUM_MEM_ALLOW_NO_AUTH=1` is set (for a laptop-only stack; never on the VM).
 
 ## 2. Monorepo (once)
 
@@ -225,14 +244,17 @@ commands and paths from recent sessions rather than decisions; it is only
 useful when someone recorded a decision or fix in words ("Decision: …",
 "Fixed: …"). That is why it is off by default.
 
-Token auth is **on** (`CHUM_MEM_API_TOKENS` in the VM's `.env`; one shared team
-token for the pilot, comma-separated list for more). Rotate by editing `.env`
-and `docker compose up -d`, then re-run the `token` step on every laptop.
+Token auth is **on** (`CHUM_MEM_API_TOKENS` in the VM's `.env`, generated on
+first boot; one shared team token for the pilot, comma-separated list for
+more). Rotate by editing `.env` and `docker compose up -d`, then re-run the
+`token` step on every laptop.
 
 Admin token (`CHUM_MEM_ADMIN_TOKENS`, comma-separated, keep it off laptops):
-when set, `/api/admin/*`, `/v1/ingest/bulk/*` and a repository sync with
-`mergeWithExisting=false` need it; a team token gets 403. Unset = any team token
-may call them (the old behaviour). The MCP `repository_sync` tool never accepts
+when set, `/api/admin/*`, `/v1/ingest/bulk/*`, claim governance
+(`POST /api/claims/{id}/govern` and the MCP `claim_govern` tool: archive,
+reject, pin, reactivate) and a repository sync with `mergeWithExisting=false`
+need it; a team token gets 403 (MCP: a tool error). Unset = any team token may
+call them (the old behaviour). The MCP `repository_sync` tool never accepts
 `mergeWithExisting=false`.
 
 CORS is closed by default (no `Access-Control-Allow-Origin`), so a web page
@@ -305,7 +327,9 @@ responsibility.
 `plugins/chum-memory-claude/scripts/` in this repo; change the fork first and
 copy. To point a checkout at another server (a local stack, a review VM) export
 `CHUM_MEMORY_API_URL` before starting Claude Code: the hooks and the root
-`.mcp.json` both read it, and `.chum-mem` carries no `apiUrl` on purpose. (The
+`.mcp.json` both read it. The hooks fall back to an `apiUrl` field in
+`.chum-mem` when the variable is unset (the monorepo's `.chum-mem` sets it), so
+the variable always wins over the committed file. (The
 hook's own `.mcp.json` rewrite targets `.claude/chum-mem/.mcp.json`, which does
 not exist in the monorepo layout, so it is a no-op there.) Before any paid
 session, run the three-event dry run against the server

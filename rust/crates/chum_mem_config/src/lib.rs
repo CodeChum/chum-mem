@@ -64,8 +64,13 @@ pub struct AppConfig {
     pub user_id: Option<Uuid>,
     pub actor_type: ActorType,
     pub team_role: TeamRole,
-    /// Shared API tokens (CHUM_MEM_API_TOKENS, comma-separated). Empty = auth disabled.
+    /// Shared API tokens (CHUM_MEM_API_TOKENS, comma-separated). Empty = auth
+    /// disabled, which the API refuses at startup unless `allow_no_auth`.
     pub api_tokens: Vec<String>,
+    /// CHUM_MEM_ALLOW_NO_AUTH=1: explicit opt-out that lets the API start with
+    /// no CHUM_MEM_API_TOKENS (a laptop-only stack). Without it an empty token
+    /// list is a startup error, so a fresh deployment can never come up open.
+    pub allow_no_auth: bool,
     /// Admin tokens (CHUM_MEM_ADMIN_TOKENS, comma-separated). When set, the
     /// destructive endpoints (`/api/admin/*`, `/v1/ingest/bulk/*`, and a
     /// repository sync with `mergeWithExisting=false`) require one of these
@@ -145,6 +150,9 @@ impl AppConfig {
             team_role: parse_or_default(values, "CHUM_MEM_TEAM_ROLE", TeamRole::Admin)?,
             api_tokens: csv_list(values, "CHUM_MEM_API_TOKENS"),
             admin_tokens: csv_list(values, "CHUM_MEM_ADMIN_TOKENS"),
+            allow_no_auth: optional(values, "CHUM_MEM_ALLOW_NO_AUTH").is_some_and(|value| {
+                matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+            }),
             cors_origins: csv_list(values, "CHUM_MEM_CORS_ORIGINS"),
             worker_poll_interval_ms: parse_or_default(values, "WORKER_POLL_INTERVAL_MS", 5_000u64)?,
             worker_concurrency: parse_or_default(values, "WORKER_CONCURRENCY", 4usize)?,
@@ -159,6 +167,23 @@ impl AppConfig {
                 200_000u32,
             )?,
         })
+    }
+
+    /// Why the API must not start with this auth configuration, if it must
+    /// not: no team tokens and no explicit CHUM_MEM_ALLOW_NO_AUTH opt-out.
+    /// (Admin tokens alone leave every ordinary route open, so they do not
+    /// count.)
+    pub fn api_auth_problem(&self) -> Option<String> {
+        if self.api_tokens.is_empty() && !self.allow_no_auth {
+            Some(
+                "CHUM_MEM_API_TOKENS is empty: refusing to start an unauthenticated API. \
+                 Set CHUM_MEM_API_TOKENS (and CHUM_MEM_ADMIN_TOKENS), or set \
+                 CHUM_MEM_ALLOW_NO_AUTH=1 for a stack that only this machine can reach."
+                    .to_string(),
+            )
+        } else {
+            None
+        }
     }
 
     pub fn bind_address(&self, kind: ServiceKind) -> Result<SocketAddr, ConfigError> {
@@ -292,6 +317,45 @@ mod tests {
                 "00000000-0000-0000-0000-000000000002".to_string(),
             ),
         ])
+    }
+
+    #[test]
+    fn empty_api_tokens_are_a_startup_error_without_the_opt_out() {
+        let config = AppConfig::from_map(&fixture()).expect("config should parse");
+        assert!(config.api_tokens.is_empty());
+        assert!(!config.allow_no_auth);
+        assert!(config.api_auth_problem().is_some());
+
+        // Admin tokens alone leave the team routes open: still refused.
+        let mut values = fixture();
+        values.insert("CHUM_MEM_ADMIN_TOKENS".to_string(), "admin-x".to_string());
+        let config = AppConfig::from_map(&values).expect("config should parse");
+        assert!(config.api_auth_problem().is_some());
+
+        // "0" / "false" are not an opt-out.
+        for value in ["0", "false", "no", ""] {
+            let mut values = fixture();
+            values.insert("CHUM_MEM_ALLOW_NO_AUTH".to_string(), value.to_string());
+            let config = AppConfig::from_map(&values).expect("config should parse");
+            assert!(config.api_auth_problem().is_some(), "{value:?} must not opt out");
+        }
+    }
+
+    #[test]
+    fn team_tokens_or_explicit_opt_out_allow_startup() {
+        let mut values = fixture();
+        values.insert("CHUM_MEM_API_TOKENS".to_string(), "team-a, team-b".to_string());
+        let config = AppConfig::from_map(&values).expect("config should parse");
+        assert_eq!(config.api_tokens, vec!["team-a", "team-b"]);
+        assert!(config.api_auth_problem().is_none());
+
+        for value in ["1", "true", "YES"] {
+            let mut values = fixture();
+            values.insert("CHUM_MEM_ALLOW_NO_AUTH".to_string(), value.to_string());
+            let config = AppConfig::from_map(&values).expect("config should parse");
+            assert!(config.allow_no_auth);
+            assert!(config.api_auth_problem().is_none());
+        }
     }
 
     #[test]

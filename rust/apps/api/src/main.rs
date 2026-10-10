@@ -407,7 +407,18 @@ struct AdminAuth(bool);
 /// `CHUM_MEM_ADMIN_TOKENS` set they require an admin token; a plain team token
 /// gets 403.
 fn is_admin_route(path: &str) -> bool {
-    path.starts_with("/api/admin/") || path.starts_with("/v1/ingest/bulk/")
+    path.starts_with("/api/admin/")
+        || path.starts_with("/v1/ingest/bulk/")
+        || is_claim_govern_route(path)
+}
+
+/// `POST /api/claims/{id}/govern` archives, rejects, pins or reactivates a
+/// claim for the whole team, so it is gated like the other admin routes (the
+/// MCP `claim_govern` tool checks the same flag).
+fn is_claim_govern_route(path: &str) -> bool {
+    path.strip_prefix("/api/claims/")
+        .and_then(|rest| rest.strip_suffix("/govern"))
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
 /// Constant-time string comparison so a token cannot be guessed byte by byte
@@ -880,6 +891,7 @@ async fn handle_mcp_call(
     method: &str,
     params: &Value,
     default_project_id: Option<Uuid>,
+    is_admin: bool,
 ) -> Result<Value, String> {
     let raw_args = if let Some(a) = params.get("arguments") {
         a.clone()
@@ -1077,6 +1089,13 @@ async fn handle_mcp_call(
             Ok(json!({"content":[{"type":"text","text":"SUCCESSFUL"}],"structuredContent":result}))
         }
         "claim_govern" => {
+            // Governance changes what every engineer's recall returns; like
+            // the REST route it needs an admin token once those are set.
+            if !is_admin {
+                return Err(
+                    "claim_govern requires an admin token (CHUM_MEM_ADMIN_TOKENS); a team token cannot archive, reject, pin or reactivate claims".to_string(),
+                );
+            }
             let claim_id: Uuid = args
                 .get("claimId")
                 .and_then(|v| v.as_str())
@@ -1124,6 +1143,11 @@ async fn mcp_post(State(state): State<ApiState>, request: Request) -> Result<Res
                 .and_then(|s| s.parse::<Uuid>().ok())
         })
         .or(state.scope.project_id);
+    // Set by `require_api_token` on every request that reaches a handler.
+    let is_admin = request
+        .extensions()
+        .get::<AdminAuth>()
+        .is_some_and(|AdminAuth(flag)| *flag);
 
     let body_bytes = axum::body::to_bytes(request.into_body(), 8 * 1024 * 1024)
         .await
@@ -1212,7 +1236,7 @@ async fn mcp_post(State(state): State<ApiState>, request: Request) -> Result<Res
                 }
             }
 
-            let result = match handle_mcp_call(&state, method, &params, default_project_id).await {
+            let result = match handle_mcp_call(&state, method, &params, default_project_id, is_admin).await {
                 Ok(content) => jsonrpc_ok(&id, content),
                 Err(err) => jsonrpc_error(&id, -32000, &err),
             };
@@ -1374,6 +1398,12 @@ async fn main() -> anyhow::Result<()> {
     init_tracing("chum_mem_api");
 
     let config = Arc::new(AppConfig::from_env().context("loading API configuration")?);
+    // A fresh deployment used to come up open because .env.example ships an
+    // empty CHUM_MEM_API_TOKENS. Fail before touching the database.
+    if let Some(problem) = config.api_auth_problem() {
+        tracing::error!("{problem}");
+        anyhow::bail!(problem);
+    }
     let db = Database::connect(config.as_ref())
         .await
         .context("connecting API database pool")?;
@@ -1410,7 +1440,9 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("binding API listener on {address}"))?;
 
     if config.api_tokens.is_empty() {
-        tracing::warn!("CHUM_MEM_API_TOKENS is not set: the API accepts unauthenticated requests");
+        tracing::warn!(
+            "CHUM_MEM_API_TOKENS is not set and CHUM_MEM_ALLOW_NO_AUTH=1: the API accepts unauthenticated requests"
+        );
     } else {
         info!(tokens = config.api_tokens.len(), "API token authentication enabled");
     }
@@ -6632,5 +6664,18 @@ mod review_2026_10_09_tests {
         assert!(is_admin_route("/v1/ingest/bulk/create-indexes"));
         assert!(!is_admin_route("/v1/ingest/session/events/bulk"));
         assert!(!is_admin_route("/api/search"));
+    }
+
+    #[test]
+    fn claim_govern_is_an_admin_route() {
+        assert!(is_admin_route(
+            "/api/claims/0b6f6a52-6a0e-4cf0-9c55-2f0f1b8f1c11/govern"
+        ));
+        assert!(is_admin_route("/api/claims/x/govern"));
+        // Other claim paths and look-alikes are not.
+        assert!(!is_admin_route("/api/claims//govern"));
+        assert!(!is_admin_route("/api/claims/a/b/govern"));
+        assert!(!is_admin_route("/api/claims/x/governance"));
+        assert!(!is_admin_route("/api/memory/x"));
     }
 }
