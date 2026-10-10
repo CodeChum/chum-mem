@@ -4,7 +4,7 @@ import { createReadStream, readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { readdir, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, extname, join, resolve } from 'node:path';
+import { basename, dirname, extname, join, resolve } from 'node:path';
 import readline from 'node:readline';
 
 type Provider = string;
@@ -41,6 +41,8 @@ interface ImportOptions {
   /** Exact project-folder names to import (see --allow-folders). */
   allowFolders?: string[];
   allFolders: boolean;
+  /** Import events that match the sensitive-content patterns (off by default). */
+  includeSensitive: boolean;
 }
 
 interface SessionStartPayload {
@@ -95,6 +97,8 @@ interface ImportStats {
   eventsImported: number;
   sessionsFailed: number;
   sessionsDuplicate: number;
+  eventsHeldSensitive: number;
+  heldByPattern: Record<string, number>;
   elapsedMs: number;
 }
 
@@ -144,7 +148,8 @@ function parseArgs(argv: string[]): ImportOptions {
     concurrency: Number(stringArg(args, '--concurrency') ?? DEFAULT_CONCURRENCY),
     batchSize: Number(stringArg(args, '--batch-size') ?? DEFAULT_BATCH_SIZE),
     fresh: boolArg(args, '--fresh'),
-    allFolders: boolArg(args, '--all-folders')
+    allFolders: boolArg(args, '--all-folders'),
+    includeSensitive: boolArg(args, '--include-sensitive')
   };
 
   // Review 2026-10-09: the backfill glob `-Users-<you>-gradechum-gradechum*`
@@ -1050,6 +1055,108 @@ async function importSession(parsed: ParsedSession, options: ImportOptions): Pro
   return { events: importedEvents, duplicate: false };
 }
 
+// ─── Sensitive-content guard ────────────────────────────────────────
+// The hooks hold back any event that matches the client's secret patterns
+// (plugins/chum-memory-claude/scripts/sensitive-patterns.txt plus the repo's
+// optional .chum-sensitive-patterns); the importer used to store transcripts
+// as they are, keys and database URLs included. It now skips matching events
+// the same way and reports only how many matched each pattern, never the text.
+// --include-sensitive turns the guard off.
+
+interface SensitiveRule {
+  name: string;
+  re: RegExp;
+}
+
+// The pattern files are POSIX extended regexes (grep -E); JS has no [:class:].
+const POSIX_CLASSES: Record<string, string> = {
+  space: '\\s', alnum: 'A-Za-z0-9', alpha: 'A-Za-z', digit: '0-9', upper: 'A-Z', lower: 'a-z', xdigit: '0-9A-Fa-f'
+};
+
+function ereToJs(pattern: string): string {
+  return pattern.replace(/\[:([a-z]+):\]/g, (whole, name: string) => {
+    const replacement = POSIX_CLASSES[name];
+    if (!replacement) throw new Error(`unsupported POSIX class ${whole}`);
+    return replacement;
+  });
+}
+
+function sensitivePatternFiles(): { base: string; repo: string } {
+  const scriptDir = typeof __dirname === 'string' ? __dirname : dirname(resolve(process.argv[1] ?? '.'));
+  return {
+    base: process.env.CHUM_SENSITIVE_PATTERNS_FILE
+      || join(scriptDir, '..', 'plugins', 'chum-memory-claude', 'scripts', 'sensitive-patterns.txt'),
+    repo: join(process.cwd(), '.chum-sensitive-patterns')
+  };
+}
+
+/** Loads `name|flags|regex` rules. Fails closed: an unreadable base file or a bad rule stops the import. */
+function loadSensitiveRules(): { rules: SensitiveRule[]; sources: string[] } {
+  const { base, repo } = sensitivePatternFiles();
+  const sources: string[] = [];
+  let text: string;
+  try {
+    text = readFileSync(base, 'utf8');
+    sources.push(base);
+  } catch {
+    throw new Error(`sensitive-content guard: cannot read ${base}; refusing to import unguarded (set CHUM_SENSITIVE_PATTERNS_FILE, or pass --include-sensitive to import secrets as they are)`);
+  }
+  try {
+    text += `\n${readFileSync(repo, 'utf8')}`;
+    sources.push(repo);
+  } catch {
+    // the per-repo extension is optional
+  }
+  const rules: SensitiveRule[] = [];
+  for (const line of text.split('\n')) {
+    if (line.length === 0 || line.startsWith('#')) continue;
+    const first = line.indexOf('|');
+    const second = first < 0 ? -1 : line.indexOf('|', first + 1);
+    if (first <= 0 || second < 0) continue;
+    const name = line.slice(0, first);
+    const flags = line.slice(first + 1, second);
+    const pattern = line.slice(second + 1);
+    if (pattern.length === 0) continue;
+    try {
+      rules.push({ name, re: new RegExp(ereToJs(pattern), flags.includes('i') ? 'i' : '') });
+    } catch (error) {
+      throw new Error(`sensitive-content guard: rule "${name}" does not compile: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (rules.length === 0) {
+    throw new Error(`sensitive-content guard: no rules in ${sources.join(', ')}; refusing to import unguarded`);
+  }
+  return { rules, sources };
+}
+
+/**
+ * Drops events whose payload or raw payload matches a rule (the hooks scan the
+ * same JSON-encoded event) and rebuilds the summary from the events kept.
+ */
+function applySensitiveGuard(parsed: ParsedSession, rules: SensitiveRule[], stats: ImportStats): void {
+  const kept: SessionEventPayload[] = [];
+  for (const event of parsed.events) {
+    const text = `${JSON.stringify(event.payload)}\n${JSON.stringify(event.rawPayload)}`;
+    const matched = rules.filter((rule) => rule.re.test(text)).map((rule) => rule.name);
+    if (matched.length === 0) {
+      kept.push(event);
+      continue;
+    }
+    stats.eventsHeldSensitive += 1;
+    for (const name of matched) {
+      stats.heldByPattern[name] = (stats.heldByPattern[name] ?? 0) + 1;
+    }
+  }
+  if (kept.length === parsed.events.length) return;
+  parsed.events = kept;
+  parsed.summary = kept
+    .map((event) => event.payload.message)
+    .filter((value): value is string => typeof value === 'string' && value.length > 0)
+    .slice(-5)
+    .join('\n')
+    .slice(0, 1500);
+}
+
 // ─── Session grouping (main transcript + its subagent transcripts) ──
 
 /**
@@ -1165,6 +1272,8 @@ async function main(): Promise<void> {
     eventsImported: 0,
     sessionsFailed: 0,
     sessionsDuplicate: 0,
+    eventsHeldSensitive: 0,
+    heldByPattern: {},
     elapsedMs: 0
   };
 
@@ -1197,6 +1306,14 @@ async function main(): Promise<void> {
     )
   );
 
+  // Load the guard before any parsing, so a missing pattern file stops the run early.
+  const guard = options.includeSensitive ? undefined : loadSensitiveRules();
+  if (guard) {
+    console.log(`Sensitive-content guard: ${guard.rules.length} patterns from ${guard.sources.join(', ')}`);
+  } else {
+    console.log('Sensitive-content guard OFF (--include-sensitive): events are imported as they are, secrets included');
+  }
+
   // Parse all files first (CPU-bound, fast)
   const parseStart = Date.now();
   const parsedSessions: Array<{ file: string; session: ParsedSession }> = [];
@@ -1204,6 +1321,7 @@ async function main(): Promise<void> {
   await runWithConcurrency(finalFiles, options.concurrency, async (filePath) => {
     try {
       const parsed = await parseSessionFile(filePath, options);
+      if (parsed && guard) applySensitiveGuard(parsed, guard.rules, stats);
       if (parsed && parsed.events.length > 0) {
         parsedSessions.push({ file: filePath, session: parsed });
       }
@@ -1215,6 +1333,10 @@ async function main(): Promise<void> {
 
   const parseMs = Date.now() - parseStart;
   console.log(`Parsed ${parsedSessions.length} transcripts from ${stats.filesProcessed} files in ${parseMs}ms`);
+  if (guard) {
+    const perPattern = Object.entries(stats.heldByPattern).sort((a, b) => b[1] - a[1]).map(([name, n]) => `${name}: ${n}`).join(', ');
+    console.log(`Sensitive-content guard: skipped ${stats.eventsHeldSensitive} event(s) matching secret patterns${perPattern ? ` (${perPattern})` : ''}; values are not printed. Re-run with --include-sensitive to import them.`);
+  }
 
   // One import per session, not per file: subagent transcripts carry their
   // parent's session id, and importing them as separate sessions in parse
