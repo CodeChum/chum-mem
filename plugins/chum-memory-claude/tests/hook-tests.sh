@@ -258,7 +258,37 @@ test_quarantine_list_masks_key_body() {
   check "list prints no part of the key body" '[[ "$out" != *"MIIEow"* && "$out" != *"fakeBODY"* && "$out" != *"fakeTAIL"* ]]'
 }
 
-ALL="concurrent_append fence_forgery tokenizer deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body"
+# ── R3: a hung API (connection accepted, no answer) never costs an event ──
+# Claude Code kills PostToolUse at 10 s and Stop at 30 s (settings.json); the
+# kill is emulated with perl's alarm. The /health result is cached, so the
+# hook goes straight to the live calls.
+test_hung_api_spools() {
+  echo "hung_api_spools"
+  local r p kinds
+  r=$(mkrepo hung)
+  start_fake hung || { bad "fake api"; return; }
+  echo 40000 > "$FAKE_STATE/delay-ms"
+  mkdir -p "$r/.chum-cache"
+  printf '{"sessionId":"11111111-1111-4111-8111-111111111111"}\n' > "$r/.chum-cache/session-claude-hung.json"
+  : > "$r/.chum-cache/.resolved-$PID_FAKE"
+  printf '%s %s\n' "$(date +%s)" "$FAKE_URL" > "$r/.chum-cache/.health-ok"
+  p=$(payload PostToolUse hung "$r" '{"tool_name":"Bash","tool_input":{"command":"make test"},"tool_response":{"stdout":"ok"}}')
+  printf '%s' "$p" | perl -e 'alarm shift; exec @ARGV' 10 env -i PATH="$PATH" HOME="$TMP/home" TMPDIR="$TMP" \
+    CHUM_MEMORY_API_URL="$FAKE_URL" CLAUDE_PROJECT_DIR="$r" CHUM_NOTICES=0 "$BASH_BIN" "$r/.claude/chum-mem/scripts/hook-dispatch.sh" >/dev/null 2>&1
+  kinds=$(cat "$r/.chum-cache/outbox/"*.jsonl 2>/dev/null | jq -r .kind | tr '\n' ' ')
+  check "PostToolUse finishes inside its 10 s timeout with the event spooled ($kinds)" '[[ "$kinds" == "event " ]]'
+  check "the cached /health result is dropped" '[[ ! -f "$r/.chum-cache/.health-ok" ]]'
+  printf '%s %s\n' "$(date +%s)" "$FAKE_URL" > "$r/.chum-cache/.health-ok"
+  p=$(payload Stop hung "$r" '{"last_assistant_message":"all tests pass"}')
+  printf '%s' "$p" | perl -e 'alarm shift; exec @ARGV' 30 env -i PATH="$PATH" HOME="$TMP/home" TMPDIR="$TMP" \
+    CHUM_MEMORY_API_URL="$FAKE_URL" CLAUDE_PROJECT_DIR="$r" CHUM_NOTICES=0 "$BASH_BIN" "$r/.claude/chum-mem/scripts/hook-dispatch.sh" >/dev/null 2>&1
+  # The Stop hook starts the detached replayer, which may hold the first line
+  # in a .flushing file meanwhile: count every outbox file.
+  kinds=$(cat "$r/.chum-cache/outbox/"*.jsonl* 2>/dev/null | jq -r .kind | sort | tr '\n' ' ')
+  check "Stop finishes inside its 30 s timeout with reply and end spooled ($kinds)" '[[ "$kinds" == "end event event " ]]'
+}
+
+ALL="concurrent_append fence_forgery tokenizer deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools"
 for t in ${*:-$ALL}; do "test_$t"; done
 echo "passed $PASS, failed $FAIL, skipped $SKIP  (scratch: $TMP)"
 [[ "$FAIL" -eq 0 ]]

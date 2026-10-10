@@ -32,6 +32,15 @@ if [[ -z "${CHUM_MEMORY_API_TOKEN:-}" && -r "${HOME}/.config/chum-mem/token" ]];
   CHUM_MEMORY_API_TOKEN="$(tr -d '[:space:]' < "${HOME}/.config/chum-mem/token")"; export CHUM_MEMORY_API_TOKEN
 fi
 if [[ -n "${CHUM_MEMORY_API_TOKEN:-}" ]]; then AUTH_HEADER="-HX-Chum-Token:${CHUM_MEMORY_API_TOKEN}"; fi
+# Budget for the live session/start and session/event calls. It must stay well
+# under the shortest hook timeout (PostToolUse, Notification, SubagentStop:
+# 10 s): with 10 s here, an API that accepted the connection but hung got the
+# hook killed by Claude Code before curl gave up, so the event was neither
+# stored nor spooled, and the cached /health result was never dropped, so every
+# hook in the next minute was lost the same way (review 3). On timeout the
+# event is spooled and replayed by the detached replayer.
+LIVE_CALL_TIMEOUT="${CHUM_LIVE_CALL_TIMEOUT_SECS:-6}"
+[[ "$LIVE_CALL_TIMEOUT" =~ ^[0-9]+$ ]] || LIVE_CALL_TIMEOUT=6
 PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-${CODEX_PROJECT_DIR:-$PWD}}"
 CACHE_DIR="${PROJECT_ROOT}/.chum-cache"
 umask 077   # outbox and quarantine files hold raw prompts and tool output (FINDINGS F37 L)
@@ -319,7 +328,7 @@ ensure_session_started() {
   payload=$(session_start_payload)
 
   local response http_code
-  response=$(curl -sS $AUTH_HEADER --max-time 10 \
+  response=$(curl -sS $AUTH_HEADER --max-time "$LIVE_CALL_TIMEOUT" \
     -o /tmp/chum-session-start-resp.$$.json \
     -w "%{http_code}" \
     -X POST \
@@ -444,7 +453,7 @@ post_event() {
     spool_line event "$full_payload"
     return 0
   fi
-  http_code=$(printf '%s' "$full_payload" | curl -sS $AUTH_HEADER --max-time 10 \
+  http_code=$(printf '%s' "$full_payload" | curl -sS $AUTH_HEADER --max-time "$LIVE_CALL_TIMEOUT" \
     -o /tmp/chum-session-event-resp.$$.json \
     -w "%{http_code}" \
     -X POST \
@@ -454,6 +463,9 @@ post_event() {
     echo "session-sync: WARN session_event_append failed — API unreachable at ${API_URL}; spooling" >&2
     rm -f /tmp/chum-session-event-resp.$$.json
     spool_line event "$full_payload"
+    # The rest of this run (the Stop hook's session/end) spools at once instead
+    # of waiting out another timeout and getting the hook killed.
+    CHUM_SPOOL_ONLY=1
     return 0
   }
 
@@ -513,7 +525,9 @@ end_session() {
     '{sessionId: $sessionId, summary: $summary}')
 
   local http_code
-  http_code=$(curl -sS $AUTH_HEADER --max-time 30 \
+  # 20 s, under the Stop/SessionEnd hook timeout (30 s) so a hung API spools
+  # the end instead of the hook being killed with it in flight.
+  http_code=$(curl -sS $AUTH_HEADER --max-time 20 \
     -o /tmp/chum-session-end-resp.$$.json \
     -w "%{http_code}" \
     -X POST \
