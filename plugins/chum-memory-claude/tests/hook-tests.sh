@@ -180,7 +180,40 @@ test_deferred_start_replay() {
   fi
 }
 
-ALL="concurrent_append fence_forgery tokenizer deferred_start_replay"
+# ── C: a successful /health is reused for 60 s; any API failure drops it ──
+test_health_cache() {
+  echo "health_cache"
+  local r n p
+  r=$(mkrepo health)
+  start_fake health || { bad "fake api"; return; }
+  n() { grep -c '^GET /health' "$FAKE_STATE/requests.log"; }
+  p() { payload UserPromptSubmit "$1" "$r" '{"prompt":"health cache check prompt"}'; }
+  hook "$r" "$FAKE_URL" "$(p h1)" >/dev/null; hook "$r" "$FAKE_URL" "$(p h1)" >/dev/null
+  check "two hooks within 60 s -> one /health call ($(n))" '[[ $(n) -eq 1 ]]'
+  check "cache file records the API url" '[[ "$(cut -d" " -f2 "$r/.chum-cache/.health-ok")" == "$FAKE_URL" ]]'
+  printf '%s %s\n' "$(( $(date +%s) - 61 ))" "$FAKE_URL" > "$r/.chum-cache/.health-ok"
+  hook "$r" "$FAKE_URL" "$(p h1)" >/dev/null
+  check "a cached result older than 60 s is re-checked ($(n))" '[[ $(n) -eq 2 ]]'
+  printf '%s %s\n' "$(date +%s)" "http://127.0.0.1:1" > "$r/.chum-cache/.health-ok"
+  hook "$r" "$FAKE_URL" "$(p h1)" >/dev/null
+  check "a cached result for another API url is ignored ($(n))" '[[ $(n) -eq 3 ]]'
+  hook "$r" "$FAKE_URL" "$(p h1)" CHUM_HEALTH_CACHE_SECS=0 >/dev/null
+  check "CHUM_HEALTH_CACHE_SECS=0 always checks ($(n))" '[[ $(n) -eq 4 ]]'
+  hook "$r" "$FAKE_URL" "$(p h1)" >/dev/null   # re-cache
+  : > "$FAKE_STATE/start-503"
+  hook "$r" "$FAKE_URL" "$(p h2)" >/dev/null   # new session: session/start fails -> spooled
+  check "a failed API call deletes the cached result" '[[ ! -e "$r/.chum-cache/.health-ok" ]]'
+  rm -f "$FAKE_STATE/start-503"
+  : > "$FAKE_STATE/requests.log"
+  hook "$r" "$FAKE_URL" "$(p h3)" >/dev/null
+  check "the next hook checks /health again ($(n))" '[[ $(n) -eq 1 ]]'
+  : > "$FAKE_STATE/mcp-500"
+  hook "$r" "$FAKE_URL" "$(p h3)" >/dev/null
+  check "a failed recall call (docs search HTTP 500) deletes it too" '[[ ! -e "$r/.chum-cache/.health-ok" ]]'
+  rm -f "$FAKE_STATE/mcp-500"
+}
+
+ALL="concurrent_append fence_forgery tokenizer deferred_start_replay health_cache"
 for t in ${*:-$ALL}; do "test_$t"; done
 echo "passed $PASS, failed $FAIL, skipped $SKIP  (scratch: $TMP)"
 [[ "$FAIL" -eq 0 ]]

@@ -113,8 +113,32 @@ if [[ -z "$HEALTH_TIMEOUT" && -f "${PROJECT_DIR}/.chum-mem" ]]; then
   HEALTH_TIMEOUT="$(jq -r '.healthTimeoutSecs // empty' "${PROJECT_DIR}/.chum-mem" 2>/dev/null || true)"
 fi
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-5}"
-if ! curl -sf $AUTH_HEADER --max-time "$HEALTH_TIMEOUT" "${API_URL}/health" >/dev/null 2>&1; then
+# A successful /health is cached for CHUM_HEALTH_CACHE_SECS (default 60, 0 = off)
+# in .chum-cache/.health-ok ("<epoch> <api url>"): through the tunnel the check
+# was one more sequential round-trip on every hook, before any real call. Any
+# failed API call below deletes the file, so the next hook checks again.
+HEALTH_CACHE="${PROJECT_DIR}/.chum-cache/.health-ok"
+HEALTH_CACHE_SECS="${CHUM_HEALTH_CACHE_SECS:-60}"
+[[ "$HEALTH_CACHE_SECS" =~ ^[0-9]+$ ]] || HEALTH_CACHE_SECS=60
+__health_cached() {
+  [[ "$HEALTH_CACHE_SECS" -gt 0 && -f "$HEALTH_CACHE" ]] || return 1
+  local at="" url="" age
+  read -r at url < "$HEALTH_CACHE" 2>/dev/null || true
+  [[ "$url" == "$API_URL" && "$at" =~ ^[0-9]+$ ]] || return 1
+  age=$(( $(date +%s) - at ))
+  [[ "$age" -ge 0 && "$age" -lt "$HEALTH_CACHE_SECS" ]]
+}
+__health_cache_drop() { rm -f "$HEALTH_CACHE" 2>/dev/null || true; }
+if __health_cached; then
+  :
+elif curl -sf $AUTH_HEADER --max-time "$HEALTH_TIMEOUT" "${API_URL}/health" >/dev/null 2>&1; then
+  if [[ "$HEALTH_CACHE_SECS" -gt 0 ]] && mkdir -p "${PROJECT_DIR}/.chum-cache" 2>/dev/null; then
+    printf '%s %s\n' "$(date +%s)" "$API_URL" > "${HEALTH_CACHE}.$$" 2>/dev/null \
+      && mv -f "${HEALTH_CACHE}.$$" "$HEALTH_CACHE" 2>/dev/null || rm -f "${HEALTH_CACHE}.$$" 2>/dev/null
+  fi
+else
   API_HEALTHY=0
+  __health_cache_drop
 fi
 export CHUM_API_HEALTHY="$API_HEALTHY"
 if [[ "$API_HEALTHY" -eq 0 ]]; then
@@ -232,6 +256,7 @@ SESSION_STDERR=""
 if [[ -x "${SCRIPTS_DIR}/session-sync.sh" ]]; then
   SESSION_STDERR=$(printf '%s' "$HOOK_PAYLOAD" | bash "${SCRIPTS_DIR}/session-sync.sh" 2>&1 >/dev/null) || {
     echo "chum-memory session-sync error: ${SESSION_STDERR}" >&2
+    __health_cache_drop
     # The event was not stored. Tell the user (rate-limited): a 401 means the
     # token step was skipped or the token rotated; anything else is the server.
     if __notice_due syncerr; then
@@ -258,6 +283,7 @@ fi
 API_DEGRADED=0
 if [[ "$SESSION_STDERR" == *"spooling"* ]]; then
   API_DEGRADED=1
+  __health_cache_drop
   __notice_due unreachable && __add_notice "chum-mem: API at ${API_URL} is answering too slowly; this turn's events are spooled to .chum-cache/outbox/ and will be replayed. Memory recall is skipped until it recovers."
 fi
 # ── Repository layer (only on turn-boundary events) ──
@@ -315,21 +341,24 @@ fetch_prompt_memory_escaped() {
   body=$(jq -n --arg q "${prompt:0:800}" --arg pid "${CHUM_MEM_PROJECT_ID:-}" --argjson n "$pool" \
     '{query:$q, mode:"hybrid", limit:$n, disclosureLevel:"overview"} + (if $pid != "" then {projectId:$pid} else {} end)')
   tmpd=$(mktemp -d "${TMPDIR:-/tmp}/chum-recall.XXXXXX") || return 1
-  curl -sf $AUTH_HEADER --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
-    -d "$body" "${api_url}/api/search" > "$tmpd/mem" 2>/dev/null &
+  # A failed call (timeout, refused, HTTP error) leaves a .fail marker: it drops
+  # the cached health result so the next hook checks /health again.
+  { curl -sf $AUTH_HEADER --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
+    -d "$body" "${api_url}/api/search" > "$tmpd/mem" 2>/dev/null || : > "$tmpd/mem.fail"; } &
   local docs_n="${CHUM_AUTO_RECALL_DOCS:-3}"
   if [[ "$docs_n" -gt 0 && -n "${CHUM_MEM_PROJECT_ID:-}" ]]; then
     # Repository layer = the docs the team committed (CLAUDE files, rules, notes).
     # Same call as MCP knowledge_query(search, layer:repository).
-    jq -n --arg t "${prompt:0:300}" --arg pid "$CHUM_MEM_PROJECT_ID" \
+    { jq -n --arg t "${prompt:0:300}" --arg pid "$CHUM_MEM_PROJECT_ID" \
       '{jsonrpc:"2.0", id:1, method:"tools/call", params:{name:"knowledge_query",
         arguments:{query:"search", text:$t, layer:"repository", projectId:$pid, limit:8}}}' \
     | curl -sf $AUTH_HEADER --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
         -H 'Accept: application/json, text/event-stream' --data-binary @- \
-        "${api_url}/mcp?projectId=${CHUM_MEM_PROJECT_ID}" > "$tmpd/docs" 2>/dev/null &
+        "${api_url}/mcp?projectId=${CHUM_MEM_PROJECT_ID}" > "$tmpd/docs" 2>/dev/null || : > "$tmpd/docs.fail"; } &
   fi
   wait
   resp=$(cat "$tmpd/mem" 2>/dev/null); docs=$(cat "$tmpd/docs" 2>/dev/null)
+  if [[ -e "$tmpd/mem.fail" || -e "$tmpd/docs.fail" ]]; then __health_cache_drop; fi
   rm -rf "$tmpd"
   local pfx
   pfx=$(printf '%s' "$prompt" | tr '[:upper:]' '[:lower:]' | cut -c1-60)

@@ -6,6 +6,7 @@ Every request is logged as "<METHOD> <path>" to <state-dir>/requests.log.
 Behaviour is switched at run time by files in <state-dir>:
   health-down   GET /health answers 503
   start-503     POST /v1/ingest/session/start answers 503
+  mcp-500       POST /mcp (the docs search) answers 500
   search.json   body returned by POST /api/search      (default {"hits": []})
   docs.json     body returned by POST /mcp             (default: no nodes)
   delay-ms      sleep this many milliseconds before every answer (tunnel latency)
@@ -92,6 +93,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._delay()
         if self.path.startswith("/v1/ingest/session/start") and flag("start-503"):
             return self._send(503, {"error": "database restarting"})
+        if self.path.startswith("/mcp") and flag("mcp-500"):
+            return self._send(500, {"error": "boom"})
         if self.path.startswith("/api/search") and (not UPSTREAM or flag("search.json")):
             return self._send(200, read_json("search.json", {"hits": []}))
         if self.path.startswith("/mcp") and (not UPSTREAM or flag("docs.json")):
