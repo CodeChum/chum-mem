@@ -50,6 +50,7 @@ use chum_mem_pipeline::{
     RepositoryFilePayload, SearchMetrics, SessionEventRecord, TurboVecScope, TurboVecStore,
     VectorSearchResult, build_context_pack, build_session_completion_job_plan,
     community_relevance_from_query, compile_minimal_proof_set, derive_memories_from_session,
+    memory_source_time,
     derive_session_episodes, embed_text, event_text, generate_knowledge_report,
     memory_community_map, merge_graphs, merge_hybrid_results, progressive_disclosure,
     project_graph_for_dashboard, query_chroma_memories_typed, rank_hybrid_results,
@@ -3802,6 +3803,8 @@ async fn derive_and_persist_session_memories(
             }
         }
 
+        // D6: date the memory at its source event, before draft.metadata moves.
+        let source_time = memory_source_time(&draft, &records);
         let mut metadata = match draft.metadata {
             Value::Object(existing) => existing,
             _ => serde_json::Map::new(),
@@ -3827,6 +3830,7 @@ async fn derive_and_persist_session_memories(
                 importance_score: draft.importance_score,
                 confidence_score: draft.confidence_score,
                 metadata: metadata_value.clone(),
+                source_time,
             },
         )
         .await?;
@@ -4841,7 +4845,10 @@ fn map_session_event_record(row: &SessionEventRow) -> SessionEventRecord {
         id: row.id,
         event_type: parse_canonical_event_type(&row.event_type),
         payload: serde_json::from_value(row.payload.clone()).unwrap_or_default(),
-        created_at: format_time(row.created_at),
+        // The pipeline treats this as the event's own time (episode bounds,
+        // graph `eventTime`, memory dating — D6), so use event_time: for an
+        // imported session the row's created_at is the import time.
+        created_at: format_time(row.event_time),
     }
 }
 

@@ -21,7 +21,7 @@ pub use compile::compile_minimal_proof_set;
 pub use context::build_context_pack;
 pub use derivation::{
     DerivedMemoryDraft, SessionEpisodeDraft, SessionEventRecord, SessionRelationshipScore,
-    SessionSimilaritySignals, derive_memories_from_session, derive_session_episodes, embed_text, embed_texts, init_embedder, EMBEDDING_MODEL_LABEL,
+    SessionSimilaritySignals, derive_memories_from_session, derive_session_episodes, is_injected_event_text, memory_source_time, embed_text, embed_texts, init_embedder, EMBEDDING_MODEL_LABEL,
     event_text, extract_session_signals, score_session_relationship,
 };
 pub use jobs::{SessionCompletionJobPlan, build_session_completion_job_plan};

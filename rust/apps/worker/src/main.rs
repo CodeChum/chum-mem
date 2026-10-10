@@ -1017,10 +1017,12 @@ fn map_session_event_record(row: &chum_mem_db::SessionEventRow) -> SessionEventR
             _ => CanonicalEventType::Annotation,
         },
         payload: serde_json::from_value(row.payload.clone()).unwrap_or_default(),
+        // The event's own time (graph `eventTime`); created_at is the import
+        // time for backfilled sessions (D6).
         created_at: row
-            .created_at
+            .event_time
             .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_else(|_| row.created_at.unix_timestamp().to_string()),
+            .unwrap_or_else(|_| row.event_time.unix_timestamp().to_string()),
     }
 }
 

@@ -361,12 +361,32 @@ fn derive_atomic_claim_memories(
             .iter()
             .find(|episode| episode.provenance_event_ids.contains(&event.id));
         let text = event_text(event);
+        // D5: compaction summaries, slash-command / skill bodies, background
+        // task notifications and hook text arrive as `prompt` events but were
+        // not written by the engineer. They never originate a claim.
+        if is_injected_event_text(&text) {
+            // A compaction summary is model-written but restates decisions
+            // from the compacted part of the session. Keep only its explicit
+            // "Decision:" lines, at assistant-answer authority (model_derived,
+            // inferred), never as user-confirmed text.
+            if is_compaction_summary(&text) {
+                memories.extend(extract_model_text_claims(
+                    session_id,
+                    episode,
+                    event,
+                    &text,
+                    ModelTextSource::CompactionSummary,
+                ));
+            }
+            continue;
+        }
         if final_answers.contains(&event.id) {
-            memories.extend(extract_assistant_answer_claims(
+            memories.extend(extract_model_text_claims(
                 session_id,
                 episode,
                 event,
                 &text,
+                ModelTextSource::FinalAnswer,
             ));
             continue;
         }
@@ -495,10 +515,7 @@ fn classify_claim_type(event: Option<&SessionEventRecord>, segment: &str) -> Opt
     let is_errorish = event.is_some_and(|evt| {
         evt.event_type == CanonicalEventType::Error
             || evt.payload.exit_code.is_some_and(|code| code != 0)
-    }) || lower.contains("failed")
-        || lower.contains("error")
-        || lower.contains("exception")
-        || lower.contains("bug:");
+    }) || has_defect_signal(&lower);
     // Open questions need an explicit marker. A bare "?" used to be enough, which
     // turned every user prompt into an `open_question` memory and made a
     // question's own echo the top recall hit (FINDINGS F36). The hook-side
@@ -545,17 +562,37 @@ fn classify_claim_type(event: Option<&SessionEventRecord>, segment: &str) -> Opt
     {
         return Some(MemoryType::Task);
     }
-    if lower.contains("fix:")
-        || lower.contains("the fix was")
-        || lower.contains("the fix is")
-        || lower.contains("root cause")
-        || lower.contains("workaround:")
-        || lower.contains("fixed")
-        || lower.contains("resolved")
-        || lower.contains("verified fix")
-        || lower.contains("confirmed fix")
-    {
+    let explicit_fix_marker = [
+        "fix:",
+        "the fix was",
+        "the fix is",
+        "root cause",
+        "workaround:",
+        "verified fix",
+        "confirmed fix",
+        "fixed by",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    // A bare "fixed" / "resolved" is a fix only when the segment also names the
+    // defect or the cause; "Page 6 is fixed and verified" is a status line,
+    // not a fix (D5).
+    let bare_fix_word = lower.contains("fixed") || lower.contains("resolved");
+    if explicit_fix_marker || (bare_fix_word && (is_errorish || has_fix_context(&lower))) {
         return Some(MemoryType::Fix);
+    }
+    // Success-only status chatter ("smoke2 passed 4/4 no errors", "all green
+    // now") carries no subject or decision; it is not a fact, bug or detail.
+    // Only for text the engineer did not type: a user's own short statement
+    // keeps its old typing.
+    let typed_by_user = event.is_some_and(|evt| {
+        matches!(
+            evt.event_type,
+            CanonicalEventType::Prompt | CanonicalEventType::Annotation
+        )
+    });
+    if !typed_by_user && !is_errorish && is_status_only(&lower) {
+        return None;
     }
     if is_errorish {
         return Some(MemoryType::Bug);
@@ -676,12 +713,25 @@ const MAX_ASSISTANT_ANSWER_CLAIMS: usize = 4;
 /// `inferred` with lower importance and confidence than user-confirmed text,
 /// so a user's own statement always outranks and is never superseded by it
 /// (reconcile only lets an equal-or-stronger claim supersede).
-fn extract_assistant_answer_claims(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelTextSource {
+    /// The assistant's final answer of a turn: decision / fix / fact markers.
+    FinalAnswer,
+    /// A compaction summary injected as a prompt: decision markers only (D5).
+    CompactionSummary,
+}
+
+fn extract_model_text_claims(
     session_id: Uuid,
     episode: Option<&SessionEpisodeDraft>,
     event: &SessionEventRecord,
     text: &str,
+    source: ModelTextSource,
 ) -> Vec<DerivedMemoryDraft> {
+    let (derivation, claim_source) = match source {
+        ModelTextSource::FinalAnswer => ("assistant_answer_claim_v1", "assistant_final_answer"),
+        ModelTextSource::CompactionSummary => ("compaction_summary_claim_v1", "compaction_summary"),
+    };
     let cleaned = strip_template_noise(text);
     let mut claims = Vec::new();
     for segment in claim_segments(&cleaned) {
@@ -699,6 +749,7 @@ fn extract_assistant_answer_claims(
             || lower.contains("might be")
             || lower.contains("maybe")
             || lower.contains("probably")
+            || is_status_only(&lower)
         {
             continue;
         }
@@ -707,6 +758,8 @@ fn extract_assistant_answer_claims(
             .any(|marker| lower.contains(marker))
         {
             MemoryType::Decision
+        } else if source == ModelTextSource::CompactionSummary {
+            continue;
         } else if ["fix:", "the fix was", "the fix is", "root cause", "fixed by"]
             .iter()
             .any(|marker| lower.contains(marker))
@@ -730,13 +783,13 @@ fn extract_assistant_answer_claims(
             confidence_score: 0.5,
             provenance_event_ids: vec![event.id],
             metadata: json!({
-                "derivation": "assistant_answer_claim_v1",
+                "derivation": derivation,
                 "sessionId": session_id,
                 "episodeOrdinal": episode.map(|value| value.episode_ordinal),
                 "episodeType": episode.map(|value| value.episode_type.clone()),
                 "claimKey": claim_key,
                 "claimPolarity": if is_negative_claim(&lower) { "negative" } else { "positive" },
-                "claimSource": "assistant_final_answer",
+                "claimSource": claim_source,
                 "proofType": "session_event",
                 "authorityClass": "model_derived",
                 "verificationStatus": "inferred",
@@ -750,6 +803,169 @@ fn extract_assistant_answer_claims(
     claims
 }
 
+/// D5: text that reaches the store as a `prompt` event but was injected by
+/// the client, not typed by the engineer: compaction summaries, slash-command
+/// and skill bodies, background-task notifications, local-command echoes and
+/// hook feedback. Checked on the start of the event text only, so a prompt
+/// that merely quotes one of these later on is still classified normally.
+fn is_compaction_summary(text: &str) -> bool {
+    text.trim_start()
+        .to_lowercase()
+        .starts_with("this session is being continued from a previous conversation")
+}
+
+pub fn is_injected_event_text(text: &str) -> bool {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static SLASH_COMMAND_BODY: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^#\s+/[a-z][\w:-]*(?:\s|$)").unwrap());
+    static HOOK_FEEDBACK: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"^(?:stop|subagentstop|pretooluse|posttooluse|userpromptsubmit|sessionstart|sessionend|precompact|notification)(?::|\s+hook\b)",
+        )
+        .unwrap()
+    });
+    const PREFIXES: &[&str] = &[
+        "this session is being continued from a previous conversation",
+        "base directory for this skill:",
+        "caveat: the messages below were generated by the user while running local commands",
+        "[request interrupted by user",
+        "<command-name>",
+        "<command-message>",
+        "<command-args>",
+        "<task-notification>",
+        "<local-command-caveat>",
+        "<local-command-stdout>",
+        "<local-command-stderr>",
+        "<bash-input>",
+        "<bash-stdout>",
+        "<bash-stderr>",
+        "<system-reminder>",
+        "<user-prompt-submit-hook>",
+        "<artifact-content-authored-by-others",
+    ];
+    let head: String = text.trim_start().chars().take(200).collect::<String>().to_lowercase();
+    PREFIXES.iter().any(|prefix| head.starts_with(prefix))
+        || SLASH_COMMAND_BODY.is_match(&head)
+        || HOOK_FEEDBACK.is_match(&head)
+}
+
+/// Remove negated defect mentions ("no errors", "0 failed", "errors: 0",
+/// "error-free") so a success report does not read as a bug.
+fn strip_negated_defects(lower: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static NEGATED: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+        [
+            r"\b(?:no|0|zero|without|never any)\s+(?:new\s+|more\s+|other\s+|remaining\s+)?(?:errors?|exceptions?|failures?|failed(?:\s+tests?)?|bugs?)\b",
+            r"\b(?:errors?|failures?|failed|exceptions?)\s*[:=]\s*0\b",
+            r"\berror[- ]free\b",
+        ]
+        .iter()
+        .map(|pattern| Regex::new(pattern).unwrap())
+        .collect()
+    });
+    let mut text = lower.to_string();
+    for pattern in NEGATED.iter() {
+        text = pattern.replace_all(&text, " ").into_owned();
+    }
+    text
+}
+
+/// A defect signal for bug typing: a failure/error/exception word that is not
+/// negated, or an explicit "bug:" marker (D5: "smoke2 passed 4/4 no errors"
+/// used to become a bug because it contains "error").
+fn has_defect_signal(lower: &str) -> bool {
+    let text = strip_negated_defects(lower);
+    text.contains("failed")
+        || text.contains("error")
+        || text.contains("exception")
+        || text.contains("bug:")
+}
+
+/// Words that tie a bare "fixed"/"resolved" to an actual defect or cause.
+fn has_fix_context(lower: &str) -> bool {
+    [
+        "bug", "issue", "because", "caused", "due to", " by ", "regression", "crash", "broken",
+        "leak", "race", "timeout", "deadlock", "flaky",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Short success-only status lines with no subject or decision content:
+/// "Page 6 is fixed and verified, and every suite passes.", "smoke2 passed
+/// 4/4 no errors.", "All green, deployed." At most one content word may
+/// remain once status words, filler and numbers are removed, and the line
+/// must not carry a reason, a mechanism or a negated-away defect.
+fn is_status_only(lower: &str) -> bool {
+    const STATUS: &[&str] = &[
+        "fixed", "verified", "confirmed", "passes", "passed", "passing", "pass", "done",
+        "complete", "completed", "green", "works", "working", "succeeded", "succeeds",
+        "successful", "successfully", "deployed", "merged", "pushed", "ready", "finished",
+        "resolved", "ok", "okay", "landed", "shipped", "clean", "live",
+    ];
+    const FILLER: &[&str] = &[
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "and", "or", "but",
+        "it", "its", "this", "that", "these", "those", "now", "all", "every", "everything",
+        "each", "both", "has", "have", "had", "of", "on", "in", "at", "to", "for", "with", "i",
+        "we", "you", "also", "still", "as", "expected", "so", "far", "too", "again", "already",
+        "just", "fully", "looks", "look", "good", "great", "fine", "nice", "test", "tests",
+        "suite", "suites", "check", "checks", "smoke", "result", "results", "run", "runs",
+        "build", "builds", "ci", "lint", "typecheck", "no", "errors", "error", "failures",
+        "failed", "warnings", "warning", "zero", "should", "will", "here", "there", "my", "our",
+        "your", "me", "us", "they", "then", "and", "now", "yes", "both",
+    ];
+    if [
+        "because", "since ", "instead", "so that", " by ", " via ", "`", "=", "->", "→",
+        "root cause", "decid", "fix was", "fix is", "caused", "due to", "means",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+    let text = strip_negated_defects(lower);
+    if has_defect_signal(&text) {
+        return false;
+    }
+    let tokens: Vec<&str> = text
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    if !tokens.iter().any(|token| STATUS.contains(token)) {
+        return false;
+    }
+    let content_words = tokens
+        .iter()
+        .filter(|token| {
+            token.chars().count() >= 2
+                && !token.chars().all(|ch| ch.is_ascii_digit())
+                && !STATUS.contains(token)
+                && !FILLER.contains(token)
+        })
+        .count();
+    content_words <= 1
+}
+
+/// D6: the time a derived memory refers to — the latest `created_at` among
+/// its provenance events (the API maps that field from `session_events.
+/// event_time`). `None` when no provenance event is known or parsable; the
+/// caller then falls back to its old rule.
+pub fn memory_source_time(
+    draft: &DerivedMemoryDraft,
+    events: &[SessionEventRecord],
+) -> Option<String> {
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+    events
+        .iter()
+        .filter(|event| draft.provenance_event_ids.contains(&event.id))
+        .filter_map(|event| OffsetDateTime::parse(&event.created_at, &Rfc3339).ok())
+        .max()
+        .and_then(|value| value.format(&Rfc3339).ok())
+}
+
 /// Drop template- and shell-shaped text before claim extraction (recall
 /// review: `<summary>`/`<event>` blocks, `[structured-output-enforce]`
 /// headers, the injected "## Context (established facts" block, `Bash |`
@@ -759,7 +975,23 @@ pub fn strip_template_noise(text: &str) -> String {
     use regex::Regex;
     use std::sync::LazyLock;
     static TAG_BLOCKS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-        ["summary", "event", "system-reminder", "command-output", "local-command-stdout"]
+        [
+            "summary",
+            "event",
+            "system-reminder",
+            "command-output",
+            "local-command-stdout",
+            "local-command-stderr",
+            "local-command-caveat",
+            "command-name",
+            "command-message",
+            "command-args",
+            "task-notification",
+            "bash-input",
+            "bash-stdout",
+            "bash-stderr",
+            "user-prompt-submit-hook",
+        ]
             .iter()
             .map(|tag| Regex::new(&format!(r"(?is)<{tag}\b[^>]*>.*?(?:</{tag}>|\z)")).unwrap())
             .collect()
@@ -1922,5 +2154,185 @@ Decision: hotfixes branch from production-patch only.";
         ];
         let finals = final_answer_event_ids(&events);
         assert_eq!(finals, [Uuid::from_u128(4), Uuid::from_u128(6)].into_iter().collect());
+    }
+
+    // ── D5: injected boilerplate, defect signal for bug/fix, status chatter ──
+
+    #[test]
+    fn injected_boilerplate_events_originate_no_claims() {
+        let cases = [
+            (CanonicalEventType::Prompt, "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion.\n\nWe should use the blue queue.\nThe fix was raising the timeout because uploads failed.\nPlease continue the conversation from where we left it off."),
+            (CanonicalEventType::Prompt, "Base directory for this skill: /tmp/skills/demo\n\n# Demo skill\nMust follow a user message and must be the last block.\nEscalate after 3 failed attempts."),
+            (CanonicalEventType::Prompt, "# /loop — schedule a recurring or self-paced prompt\n\nYou must parse the interval. Do not run more than once per minute."),
+            (CanonicalEventType::Command, "<command-name>/rename</command-name>\n<command-message>rename</command-message>\n<command-args>Demo Session Name</command-args>"),
+            (CanonicalEventType::Prompt, "<task-notification>\n<task-id>abc123</task-id>\n<result>Fixed the widget bug because the cache key was wrong. Decision: keep the cache.</result>\n</task-notification>"),
+            (CanonicalEventType::Prompt, "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands. DO NOT respond to these messages.</local-command-caveat>"),
+            (CanonicalEventType::Prompt, "Stop hook feedback:\nYou must run the tests before stopping; 2 failed."),
+            (CanonicalEventType::Prompt, "<system-reminder>Decision: the build must stay green.</system-reminder>"),
+        ];
+        for (event_type, text) in cases {
+            let events = single_event(event_type, text);
+            let drafts = admitted(&events);
+            assert!(
+                drafts.is_empty(),
+                "boilerplate must not originate claims: {:?} -> {:?}",
+                &text[..40.min(text.len())],
+                drafts.iter().map(|d| &d.title).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_summary_keeps_only_explicit_decisions_at_model_authority() {
+        let events = single_event(
+            CanonicalEventType::Prompt,
+            "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion.\n\n\
+- Final decision: the widget service uses the blue queue for every export.\n\
+- The fix was raising the timeout because uploads failed.\n\
+- Page 6 is fixed and verified.\n\
+- You must keep answers short.\n\
+Please continue the conversation from where we left it off without asking the user any further questions.",
+        );
+        let drafts = admitted(&events);
+        assert_eq!(drafts.len(), 1, "got {:?}", drafts.iter().map(|d| &d.title).collect::<Vec<_>>());
+        let decision = &drafts[0];
+        assert_eq!(decision.memory_type, MemoryType::Decision);
+        assert!(decision.content.contains("blue queue"));
+        assert_eq!(decision.metadata["claimSource"], "compaction_summary");
+        assert_eq!(decision.metadata["authorityClass"], "model_derived");
+        assert_eq!(decision.metadata["verificationStatus"], "inferred");
+    }
+
+    #[test]
+    fn injected_detection_only_looks_at_the_start() {
+        assert!(!is_injected_event_text(
+            "Decision: drop lines like 'This session is being continued from a previous conversation' before extraction."
+        ));
+        assert!(!is_injected_event_text("# Release notes for the widget service"));
+        assert!(!is_injected_event_text("Stop the worker before running the backfill."));
+        assert!(is_injected_event_text("  # /review-all-changes\nRun lint checks."));
+        let events = single_event(
+            CanonicalEventType::Prompt,
+            "Decision: drop lines like 'This session is being continued from a previous conversation' before extraction.",
+        );
+        assert!(admitted_types(&events).contains(&MemoryType::Decision));
+    }
+
+    #[test]
+    fn real_decisions_are_kept_alongside_boilerplate() {
+        let events = vec![
+            event_at(1, CanonicalEventType::Prompt, "This session is being continued from a previous conversation that ran out of context. Decision: use Redis."),
+            event_at(2, CanonicalEventType::Prompt, "I'm going with Cloud Tasks for the import retries because Celery has no retry visibility."),
+            event_at(3, CanonicalEventType::Prompt, "Decision: widget exports are A4 only."),
+            event_at(4, CanonicalEventType::Response, "Page 6 is fixed and verified, and every suite passes."),
+        ];
+        let drafts = admitted(&events);
+        let decisions: Vec<_> = drafts
+            .iter()
+            .filter(|d| d.memory_type == MemoryType::Decision)
+            .map(|d| d.content.clone())
+            .collect();
+        assert_eq!(decisions.len(), 2, "got {decisions:?}");
+        assert!(decisions.iter().any(|c| c.contains("Cloud Tasks")));
+        assert!(decisions.iter().any(|c| c.contains("A4")));
+        // The compaction summary's short "Decision: use Redis." is under the
+        // 30-char floor for model-written text, so nothing comes from it.
+        assert!(!drafts.iter().any(|d| d.content.contains("Redis")));
+        assert!(!drafts.iter().any(|d| d.provenance_event_ids == vec![Uuid::from_u128(4)]));
+    }
+
+    #[test]
+    fn success_reports_are_not_bugs() {
+        for (event_type, text) in [
+            (CanonicalEventType::Prompt, "smoke2 passed 4/4 no errors."),
+            (CanonicalEventType::ToolResult, "test result: ok. 12 passed; 0 failed; 0 ignored"),
+            (CanonicalEventType::ToolResult, "Lint finished with zero errors and errors: 0 warnings: 3"),
+            (CanonicalEventType::Response, "All checks passed without errors on the second run."),
+        ] {
+            let events = single_event(event_type, text);
+            let types = admitted_types(&events);
+            assert!(
+                !types.contains(&MemoryType::Bug) && !types.contains(&MemoryType::Fix),
+                "{text:?} must not be a bug/fix, got {types:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_defects_are_still_bugs_and_fixes() {
+        let bug = single_event(
+            CanonicalEventType::ToolResult,
+            "TypeError: cannot read properties of undefined (reading 'score') in grade.ts",
+        );
+        assert!(admitted_types(&bug).contains(&MemoryType::Bug));
+        let partial = single_event(
+            CanonicalEventType::ToolResult,
+            "test result: FAILED. 11 passed; 1 failed; 0 ignored",
+        );
+        assert!(admitted_types(&partial).contains(&MemoryType::Bug));
+        let fix = single_event(
+            CanonicalEventType::Prompt,
+            "Fixed the 413 on Android uploads by raising the body limit to 25mb.",
+        );
+        assert!(admitted_types(&fix).contains(&MemoryType::Fix));
+        let status = single_event(CanonicalEventType::ToolResult, "Page 6 is fixed.");
+        assert!(!admitted_types(&status).contains(&MemoryType::Fix));
+    }
+
+    #[test]
+    fn status_only_detection() {
+        for line in [
+            "page 6 is fixed and verified, and every suite passes.",
+            "smoke2 passed 4/4 no errors.",
+            "all green, deployed and verified.",
+        ] {
+            assert!(is_status_only(line), "{line:?} should be status-only");
+        }
+        for line in [
+            "verified: the rubric endpoint returns 400 when no answer key arrives within 65 seconds.",
+            "the extractor is fixed because the vertex region moved to us-central1.",
+            "tests failed on the widget page.",
+            "decision: we use the widget queue.",
+        ] {
+            assert!(!is_status_only(line), "{line:?} should not be status-only");
+        }
+        // Substantive assistant facts are still taken.
+        let events = vec![
+            event_at(1, CanonicalEventType::Prompt, "What does the rubric endpoint do without a key?"),
+            event_at(
+                2,
+                CanonicalEventType::Response,
+                "Verified: the rubric endpoint returns 400 when no answer key arrives within 65 seconds.",
+            ),
+        ];
+        assert!(admitted(&events).iter().any(|d| d.memory_type == MemoryType::Fact
+            && d.metadata.get("claimSource").and_then(Value::as_str) == Some("assistant_final_answer")));
+    }
+
+    // ── D6: a memory is dated at its source event, not the session end ──
+
+    #[test]
+    fn memory_time_is_the_source_event_time() {
+        let mut first = event_at(1, CanonicalEventType::Prompt, "Decision: widget exports are A4 only.");
+        first.created_at = "2026-10-02T09:15:00Z".to_string();
+        let mut second = event_at(2, CanonicalEventType::Prompt, "Constraint: never deploy the widget API on Fridays.");
+        second.created_at = "2026-10-05T14:00:00.250Z".to_string();
+        let mut last = event_at(3, CanonicalEventType::Prompt, "thanks, that is all for today");
+        last.created_at = "2026-10-09T18:00:00Z".to_string();
+        let events = vec![first, second, last];
+        let drafts = admitted(&events);
+        let time_of = |needle: &str| {
+            let draft = drafts.iter().find(|d| d.content.contains(needle)).expect(needle);
+            memory_source_time(draft, &events)
+        };
+        assert_eq!(time_of("A4").as_deref(), Some("2026-10-02T09:15:00Z"));
+        assert_eq!(time_of("Fridays").as_deref(), Some("2026-10-05T14:00:00.25Z"));
+
+        // Several provenance events: the latest one; none known: None.
+        let mut multi = drafts[0].clone();
+        multi.provenance_event_ids = vec![Uuid::from_u128(1), Uuid::from_u128(2)];
+        assert_eq!(memory_source_time(&multi, &events).as_deref(), Some("2026-10-05T14:00:00.25Z"));
+        multi.provenance_event_ids = vec![Uuid::from_u128(77)];
+        assert_eq!(memory_source_time(&multi, &events), None);
     }
 }

@@ -58,6 +58,9 @@ pub struct SessionEventRow {
     pub event_type: String,
     pub payload: Value,
     pub created_at: time::OffsetDateTime,
+    /// When the event happened on the client (transcript / hook time). For
+    /// imported sessions `created_at` is the import time instead.
+    pub event_time: time::OffsetDateTime,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -77,6 +80,9 @@ pub struct MemoryInsertParams {
     pub importance_score: f64,
     pub confidence_score: f64,
     pub metadata: Value,
+    /// RFC 3339 time of the event the memory came from (D6). `None` keeps the
+    /// old rule (session end for backfills, otherwise now).
+    pub source_time: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -954,7 +960,7 @@ pub async fn load_session_events_limited(
 ) -> Result<Vec<SessionEventRow>, DbError> {
     sqlx::query_as::<_, SessionEventRow>(
         r#"
-        select id, event_type, payload, created_at
+        select id, event_type, payload, created_at, event_time
         from public.session_events
         where session_id = $1
         order by created_at asc
@@ -1084,14 +1090,18 @@ pub async fn insert_memory(
         )
         values (
           $1, $2, $3, $4, $5, $6::public.memory_type, $7, $8, $9, $10, $11, $12, $13,
-          -- Backfilled sessions end in the past (the importer sends the
-          -- transcript's last event time); date their memories then, not at
-          -- import time, so recency ranks real history correctly.
-          coalesce(
-            (select s.ended_at from public.sessions s
-             where s.id = $4 and s.ended_at < now() - interval '1 hour'),
-            now()
-          )
+          -- D6: date a memory at the event it came from ($14, the source
+          -- event's event_time), capped at now() against client clock skew.
+          -- Without one, keep the old rule: backfilled sessions end in the
+          -- past, so use the session end, otherwise now().
+          case
+            when $14::timestamptz is not null then least($14::timestamptz, now())
+            else coalesce(
+              (select s.ended_at from public.sessions s
+               where s.id = $4 and s.ended_at < now() - interval '1 hour'),
+              now()
+            )
+          end
         )
         returning id
         "#,
@@ -1109,6 +1119,7 @@ pub async fn insert_memory(
     .bind(params.confidence_score)
     .bind(&params.metadata)
     .bind(created_by)
+    .bind(params.source_time.as_deref())
     .fetch_one(&mut **tx)
     .await
     .map_err(DbError::from)
