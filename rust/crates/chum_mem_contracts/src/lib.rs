@@ -697,6 +697,22 @@ pub struct RepositorySyncRequest {
     pub manifest: std::collections::HashMap<String, String>,
     #[serde(default = "default_true")]
     pub merge_with_existing: bool,
+    /// Sync protocol 2: `manifest` is the COMPLETE filtered tree of the
+    /// repository's default branch at `source_commit` (path -> git blob id).
+    /// The server then derives deletions itself (snapshot paths missing from
+    /// the manifest), refuses a commit older than the snapshot's, and answers
+    /// with `neededPaths`. `removedPaths` is ignored in this mode.
+    #[serde(default)]
+    pub manifest_complete: bool,
+    /// e.g. `origin/main` (informational).
+    #[serde(default)]
+    pub source_ref: Option<String>,
+    #[serde(default)]
+    pub source_commit: Option<String>,
+    /// Committer time of `source_commit`, unix seconds. Required with
+    /// `manifest_complete`.
+    #[serde(default)]
+    pub source_commit_time: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -712,6 +728,11 @@ pub struct RepositorySyncResponse {
     pub accepted_paths: Vec<String>,
     #[serde(default)]
     pub missing_paths: Vec<String>,
+    /// Protocol 2: manifest paths whose content the snapshot does not hold at
+    /// the manifest's blob id (new, changed, or never parsed); the client
+    /// uploads these next.
+    #[serde(default)]
+    pub needed_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

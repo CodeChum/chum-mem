@@ -11,6 +11,7 @@
 #   BASH_BIN        bash used to run the hooks (default /bin/bash = 3.2 on macOS)
 #   CHUM_TEST_API   a real chum-mem API (local stack only, NEVER the team server):
 #                   enables deferred_start_replay, which proxies to it
+#   CHUM_TEST_TOKEN_FILE  optional file with that stack's team token
 #   CHUM_TEST_PSQL  optional psql command for that stack's DB (for example
 #                   "docker exec -i cb-postgres-1 psql -U chum_mem -d chum_mem -At")
 #                   to check the replayed session row and its events
@@ -20,6 +21,9 @@ SCRIPTS="$(cd "$HERE/../scripts" && pwd)"
 BASH_BIN="${BASH_BIN:-/bin/bash}"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/chum-hook-tests.XXXXXX")"
 mkdir -p "$TMP/home"
+if [[ -n "${CHUM_TEST_TOKEN_FILE:-}" ]]; then  # a token-protected test stack: the hooks read this file
+  mkdir -p "$TMP/home/.config/chum-mem"; ( umask 077; cp "$CHUM_TEST_TOKEN_FILE" "$TMP/home/.config/chum-mem/token" )
+fi
 PASS=0; FAIL=0; SKIP=0; FAKE_PIDS=""
 PID_FAKE="cbcbcbcb-0000-4000-8000-0000000000ff"
 
@@ -371,7 +375,85 @@ test_quarantine_send_locked() {
   check "the held file is gone and the lock released" '[[ ! -e "$q" && ! -d "$out.lock" ]]'
 }
 
-ALL="concurrent_append fence_forgery tokenizer docs_relevance_gate deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked"
+
+# ── review 2, 5b: the API token never appears in a curl argv ──
+test_token_not_in_argv() {
+  echo "token_not_in_argv"
+  local r tok wrap real
+  tok="test-token-$RANDOM$RANDOM$RANDOM"
+  r=$(mkrepo tokargv)
+  start_fake tokargv || { bad "fake api"; return; }
+  wrap="$TMP/curlwrap"; mkdir -p "$wrap"; : > "$wrap/argv.log"
+  real=$(command -v curl)
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/argv.log"\nexec "%s" "$@"\n' "$wrap" "$real" > "$wrap/curl"
+  chmod +x "$wrap/curl"
+  PATH="$wrap:$PATH" hook "$r" "$FAKE_URL" "$(payload SessionStart tok-1 "$r")" CHUM_MEMORY_API_TOKEN="$tok" >/dev/null 2>&1
+  PATH="$wrap:$PATH" hook "$r" "$FAKE_URL" "$(payload UserPromptSubmit tok-1 "$r" '{"prompt":"please check the export queue"}')" CHUM_MEMORY_API_TOKEN="$tok" >/dev/null 2>&1
+  PATH="$wrap:$PATH" hook "$r" "$FAKE_URL" "$(payload Stop tok-1 "$r" '{"last_assistant_message":"done"}')" CHUM_MEMORY_API_TOKEN="$tok" >/dev/null 2>&1
+  check "curl was called" '[[ $(wc -l < "$wrap/argv.log") -ge 3 ]]'
+  check "the API received X-Chum-Token" 'grep -qxF "$tok" "$FAKE_STATE/tokens.log" 2>/dev/null'
+  check "the token is in no curl argv" '! grep -qF "$tok" "$wrap/argv.log"'
+}
+
+# ── review 2, finding 5: docs sync follows the default branch, needs no python3 ──
+nopy_path() {  # a PATH with only the tools the hooks need (no python3)
+  local d="$TMP/nopy-bin" t
+  if [[ ! -d "$d" ]]; then
+    mkdir -p "$d"
+    for t in bash sh git jq curl tr cut wc mktemp date base64 cat rm mkdir cp mv sed head env uname dirname basename sleep find grep awk ls; do
+      command -v "$t" >/dev/null 2>&1 && ln -s "$(command -v "$t")" "$d/$t"
+    done
+  fi
+  echo "$d"
+}
+export_files() {  # $1 project -> sorted file paths in the repository snapshot
+  local hdr="$TMP/export-hdr"; : > "$hdr"
+  [[ -n "${CHUM_TEST_TOKEN_FILE:-}" ]] && printf 'X-Chum-Token: %s\n' "$(tr -d '[:space:]' < "$CHUM_TEST_TOKEN_FILE")" > "$hdr"
+  curl -s -H @"$hdr" "$CHUM_TEST_API/api/knowledge/export?projectId=$1&layer=repository" \
+    | jq -r '[.. | objects | .id? | strings | select(startswith("file:")) | ltrimstr("file:")] | unique | .[]' | tr '\n' ' '
+}
+docsync() {  # $1 checkout $2 project -> prints sync.sh's status
+  env -i PATH="$(nopy_path)" HOME="$TMP/home" TMPDIR="$TMP" CHUM_MEM_PROJECT_ID="$2" \
+    CHUM_MEMORY_API_URL="$CHUM_TEST_API" CHUM_SYNC_TIMEOUT_SECS=60 \
+    bash "$SCRIPTS/sync.sh" "$1" 2>"$TMP/docsync.err" | jq -r '.status' 2>/dev/null
+}
+test_docs_sync_default_branch() {
+  echo "docs_sync_default_branch"
+  if [[ -z "${CHUM_TEST_API:-}" ]]; then skip "CHUM_TEST_API not set (needs a local stack)"; return; fi
+  local o="$TMP/docs-origin.git" seed="$TMP/docs-seed" a="$TMP/docs-a" b="$TMP/docs-b" c="$TMP/docs-c" p first
+  p=$(uuidgen | tr '[:upper:]' '[:lower:]')
+  git init -q --bare -b main "$o"
+  git clone -q "$o" "$seed" 2>/dev/null
+  git -C "$seed" config user.email t@example.com; git -C "$seed" config user.name t
+  mkdir -p "$seed/docs"
+  printf '# Alpha\n\nThe alpha export uses the blue queue.\n' > "$seed/docs/a.md"
+  printf '# Beta\n\nThe beta service retries three times.\n' > "$seed/docs/b.md"
+  git -C "$seed" add -A && git -C "$seed" commit -q -m one && git -C "$seed" push -q origin main 2>/dev/null
+  first=$(git -C "$seed" rev-parse HEAD)
+  git clone -q "$o" "$b" 2>/dev/null; git -C "$b" config user.email t@example.com; git -C "$b" config user.name t
+  check "python3 is not on the sync PATH" '! PATH="$(nopy_path)" command -v python3 >/dev/null'
+  check "first sync (on main) completes" '[[ "$(docsync "$b" "$p")" == SUCCESSFUL ]]'
+  check "snapshot = main's docs" '[[ "$(export_files "$p")" == "docs/a.md docs/b.md " ]]'
+  # Engineer B moves to a branch that deletes b.md, adds c.md, edits a.md locally.
+  git -C "$b" checkout -q -b feature
+  git -C "$b" rm -q docs/b.md
+  printf '# Gamma\n\nBranch-only notes.\n' > "$b/docs/c.md"; git -C "$b" add docs/c.md; git -C "$b" commit -q -m feature
+  printf '\nUncommitted edit.\n' >> "$b/docs/a.md"
+  check "a sync from the branch changes nothing" '[[ "$(docsync "$b" "$p")" == NO_CHANGES ]]'
+  check "b.md not deleted for everyone, c.md not added" '[[ "$(export_files "$p")" == "docs/a.md docs/b.md " ]]'
+  # b.md is deleted on main; B fetches: now it goes.
+  sleep 1  # a later committer time than "one" (the snapshot never moves to an older or same-second other commit)
+  git -C "$seed" rm -q docs/b.md && git -C "$seed" commit -q -m "drop b" && git -C "$seed" push -q origin main 2>/dev/null
+  git -C "$b" fetch -q origin
+  check "after the deletion lands on main, the sync succeeds" '[[ "$(docsync "$b" "$p")" == SUCCESSFUL ]]'
+  check "b.md removed once it is gone from main" '[[ "$(export_files "$p")" == "docs/a.md " ]]'
+  # A checkout whose origin/main is older cannot revert the snapshot.
+  git clone -q "$o" "$c" 2>/dev/null; git -C "$c" update-ref refs/remotes/origin/main "$first"
+  check "an older commit is refused" '[[ "$(docsync "$c" "$p")" == STALE ]]'
+  check "snapshot unchanged by the stale checkout" '[[ "$(export_files "$p")" == "docs/a.md " ]]'
+}
+
+ALL="concurrent_append fence_forgery tokenizer docs_relevance_gate deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked token_not_in_argv docs_sync_default_branch"
 for t in ${*:-$ALL}; do "test_$t"; done
 echo "passed $PASS, failed $FAIL, skipped $SKIP  (scratch: $TMP)"
 [[ "$FAIL" -eq 0 ]]

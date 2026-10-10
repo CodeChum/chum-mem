@@ -3450,7 +3450,19 @@ async fn perform_repository_sync(
             })
         })
         .collect::<Result<_, DomainError>>()?;
-    let removed_paths = input.removed_paths.clone();
+    // Protocol 2 derives deletions from the complete manifest (below); the
+    // client's own removedPaths would be its branch's view, so it is ignored.
+    let manifest_complete = input.manifest_complete;
+    let mut removed_paths = if manifest_complete {
+        Vec::new()
+    } else {
+        input.removed_paths.clone()
+    };
+    if manifest_complete && input.source_commit_time.is_none() {
+        return Err(DomainError::BadRequest(
+            "sourceCommitTime is required with manifestComplete".to_string(),
+        ));
+    }
 
     let (mut new_nodes, new_edges) = if !file_payloads.is_empty() {
         tokio::task::spawn_blocking(move || {
@@ -3468,6 +3480,20 @@ async fn perform_repository_sync(
             }
         }
     }
+    // Remember which content each file node was parsed from, so a protocol-2
+    // sync can tell which manifest entries the snapshot already holds.
+    let sent_hashes: HashMap<String, String> = input
+        .files
+        .iter()
+        .map(|file| (format!("file:{}", file.path), file.hash.clone()))
+        .collect();
+    for node in new_nodes.iter_mut() {
+        if let Some(hash) = sent_hashes.get(&node.id)
+            && let Value::Object(map) = &mut node.metadata
+        {
+            map.insert("contentHash".to_string(), Value::String(hash.clone()));
+        }
+    }
 
     let mut tx = begin_tx(state, &context).await?;
     sqlx::query("select pg_advisory_xact_lock($1)")
@@ -3481,11 +3507,117 @@ async fn perform_repository_sync(
     ensure_scope_entities(&mut tx, &state.scope).await?;
     upsert_ingested_project(&mut tx, &state.scope, project_id, None).await?;
 
+    // Docs snapshot follows the default branch and only moves forward (review
+    // 2: an engineer on a branch without a doc deleted it for everyone).
+    let watermark = sqlx::query(
+        "select extract(epoch from repository_commit_at)::bigint as at, repository_ref, repository_commit from public.projects where id = $1",
+    )
+    .bind(project_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(DbError::from)?;
+    let stored_at: Option<i64> = watermark.as_ref().and_then(|row| row.try_get("at").ok().flatten());
+    let stored_ref: Option<String> =
+        watermark.as_ref().and_then(|row| row.try_get("repository_ref").ok().flatten());
+    let stored_commit: Option<String> =
+        watermark.as_ref().and_then(|row| row.try_get("repository_commit").ok().flatten());
+    match sync_watermark_check(
+        manifest_complete,
+        merge_with_existing,
+        stored_at.map(|at| (at, stored_commit.as_deref())),
+        input.source_commit_time.map(|at| (at, input.source_commit.as_deref())),
+    ) {
+        WatermarkCheck::Accept => {}
+        WatermarkCheck::Advance(at) => {
+            sqlx::query(
+                r#"
+                update public.projects
+                set repository_commit_at = to_timestamp($2::double precision),
+                    repository_commit = $3,
+                    repository_ref = $4
+                where id = $1
+                "#,
+            )
+            .bind(project_id)
+            .bind(at as f64)
+            .bind(input.source_commit.as_deref())
+            .bind(input.source_ref.as_deref())
+            .execute(&mut *tx)
+            .await
+            .map_err(DbError::from)?;
+        }
+        WatermarkCheck::Reset => {
+            sqlx::query(
+                "update public.projects set repository_commit_at = null, repository_commit = null, repository_ref = null where id = $1",
+            )
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(DbError::from)?;
+        }
+        WatermarkCheck::Stale => {
+            return Err(DomainError::Conflict(format!(
+                "stale: this project's docs snapshot already reflects a newer commit of {}; fetch and sync again",
+                stored_ref.as_deref().unwrap_or("the default branch")
+            )));
+        }
+        WatermarkCheck::OldClient => {
+            return Err(DomainError::Conflict(format!(
+                "this project's docs snapshot follows {} (sync protocol 2); update the chum-mem client scripts",
+                stored_ref.as_deref().unwrap_or("the default branch")
+            )));
+        }
+    }
+
     let existing = if merge_with_existing {
         load_latest_knowledge_graph_by_type(&mut tx, &context, Some("repository")).await?
     } else {
         None
     };
+    if manifest_complete {
+        let snapshot_hashes = existing
+            .as_ref()
+            .map(snapshot_file_hashes)
+            .unwrap_or_default();
+        removed_paths = protocol2_removed_paths(&snapshot_hashes, &input.manifest);
+        if input.files.is_empty() && removed_paths.is_empty() {
+            // Nothing to write: answer with what the snapshot still needs and
+            // do not rebuild or persist the graph.
+            commit_tx(tx).await?;
+            let needed_paths =
+                protocol2_needed_paths(&input.manifest, &snapshot_hashes, &HashSet::new());
+            let stats = existing.as_ref().map(|graph| graph.statistics.clone());
+            let total_files = snapshot_hashes.len() as u32;
+            return Ok(RepositorySyncResponse {
+                status: "SUCCESSFUL".to_string(),
+                project_id,
+                merged_with_existing: existing.is_some(),
+                generated_at: existing
+                    .as_ref()
+                    .map(|graph| graph.generated_at.clone())
+                    .unwrap_or_default(),
+                stats: RepositorySyncStats {
+                    files_added: 0,
+                    files_removed: 0,
+                    files_unchanged: total_files,
+                    total_files,
+                },
+                graph_summary: ProjectImportGraphSummary {
+                    node_count: stats.as_ref().map_or(0, |s| s.node_count as u32),
+                    edge_count: stats.as_ref().map_or(0, |s| s.edge_count as u32),
+                    community_count: stats.as_ref().map_or(0, |s| s.community_count as u32),
+                    evidence_distribution: chum_mem_contracts::EvidenceDistributionContract {
+                        extracted: stats.as_ref().map_or(0, |s| s.evidence_distribution.extracted as u32),
+                        inferred: stats.as_ref().map_or(0, |s| s.evidence_distribution.inferred as u32),
+                        ambiguous: stats.as_ref().map_or(0, |s| s.evidence_distribution.ambiguous as u32),
+                    },
+                },
+                accepted_paths: Vec::new(),
+                missing_paths: Vec::new(),
+                needed_paths,
+            });
+        }
+    }
 
     let graph = if let Some(mut existing_graph) = existing.clone() {
         // Remove nodes/edges belonging to removed or re-synced files
@@ -3578,12 +3710,31 @@ async fn perform_repository_sync(
         .filter(|p| graph_file_paths.contains(p))
         .collect();
 
-    let missing_paths: Vec<String> = input
-        .manifest
-        .keys()
-        .filter(|p| !graph_file_paths.contains(p.as_str()))
-        .cloned()
-        .collect();
+    // Protocol 2 sends the whole tree as the manifest: report only the files
+    // of THIS request that produced no node (the client parks those at that
+    // blob id), and list what the snapshot still needs.
+    let sent_paths: HashSet<String> = input.files.iter().map(|f| f.path.clone()).collect();
+    let missing_paths: Vec<String> = if manifest_complete {
+        let mut missing: Vec<String> = sent_paths
+            .iter()
+            .filter(|p| !graph_file_paths.contains(p.as_str()))
+            .cloned()
+            .collect();
+        missing.sort();
+        missing
+    } else {
+        input
+            .manifest
+            .keys()
+            .filter(|p| !graph_file_paths.contains(p.as_str()))
+            .cloned()
+            .collect()
+    };
+    let needed_paths = if manifest_complete {
+        protocol2_needed_paths(&input.manifest, &snapshot_file_hashes(&graph), &sent_paths)
+    } else {
+        Vec::new()
+    };
 
     persist_knowledge_snapshot_typed(&mut tx, &context, project_id, &graph, "repository").await?;
     commit_tx(tx).await?;
@@ -3611,7 +3762,109 @@ async fn perform_repository_sync(
         },
         accepted_paths,
         missing_paths,
+        needed_paths,
     })
+}
+
+/// Outcome of the docs-snapshot watermark check (sync protocol 2).
+#[derive(Debug, PartialEq, Eq)]
+enum WatermarkCheck {
+    /// Old-protocol request on a project with no watermark: as before.
+    Accept,
+    /// Protocol 2 at an equal or newer commit: record it and go on.
+    Advance(i64),
+    /// Admin full replace: the snapshot no longer follows any commit.
+    Reset,
+    /// Protocol 2 from an older commit than the snapshot's: refuse.
+    Stale,
+    /// Old-protocol merge on a project that follows the default branch:
+    /// refuse, it would write a working copy over the canonical tree.
+    OldClient,
+}
+
+/// `stored` / `request`: (committer time in unix seconds, commit id).
+/// A sync advances the snapshot only to a strictly newer committer time, or
+/// to the very commit it already reflects; a different commit with the same
+/// timestamp is refused too (it cannot be ordered, and refusing is safe: the
+/// next commit on the default branch moves it on).
+fn sync_watermark_check(
+    manifest_complete: bool,
+    merge_with_existing: bool,
+    stored: Option<(i64, Option<&str>)>,
+    request: Option<(i64, Option<&str>)>,
+) -> WatermarkCheck {
+    if !merge_with_existing {
+        return match (manifest_complete, request) {
+            (true, Some((at, _))) => WatermarkCheck::Advance(at),
+            _ => WatermarkCheck::Reset,
+        };
+    }
+    match (manifest_complete, request, stored) {
+        (true, Some((at, _)), Some((stored_at, _))) if at < stored_at => WatermarkCheck::Stale,
+        (true, Some((at, commit)), Some((stored_at, stored_commit)))
+            if at == stored_at && commit != stored_commit =>
+        {
+            WatermarkCheck::Stale
+        }
+        (true, Some((at, _)), _) => WatermarkCheck::Advance(at),
+        (true, None, _) => WatermarkCheck::Stale,
+        (false, _, Some(_)) => WatermarkCheck::OldClient,
+        (false, _, None) => WatermarkCheck::Accept,
+    }
+}
+
+/// path -> contentHash of every file/document node in a repository snapshot
+/// (`None` for nodes written before content hashes were recorded).
+fn snapshot_file_hashes(graph: &KnowledgeGraph) -> HashMap<String, Option<String>> {
+    graph
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == "file" || n.node_type == "document")
+        .filter_map(|n| {
+            n.id.strip_prefix("file:").map(|path| {
+                (
+                    path.to_string(),
+                    n.metadata
+                        .get("contentHash")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Snapshot files that are not in the default branch's tree any more.
+fn protocol2_removed_paths(
+    snapshot: &HashMap<String, Option<String>>,
+    manifest: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut removed: Vec<String> = snapshot
+        .keys()
+        .filter(|path| !manifest.contains_key(*path))
+        .cloned()
+        .collect();
+    removed.sort();
+    removed
+}
+
+/// Manifest entries the snapshot does not hold at that blob id, minus the
+/// files of the current request (accepted or parked by the client).
+fn protocol2_needed_paths(
+    manifest: &HashMap<String, String>,
+    snapshot: &HashMap<String, Option<String>>,
+    sent: &HashSet<String>,
+) -> Vec<String> {
+    let mut needed: Vec<String> = manifest
+        .iter()
+        .filter(|(path, hash)| {
+            !sent.contains(*path)
+                && snapshot.get(*path).and_then(|h| h.as_deref()) != Some(hash.as_str())
+        })
+        .map(|(path, _)| path.clone())
+        .collect();
+    needed.sort();
+    needed
 }
 
 async fn derive_and_persist_session_memories(
@@ -5843,11 +6096,13 @@ fn map_domain_error(error: DomainError) -> ApiError {
         DomainError::Db(DbError::NotFound(_)) => ApiError::not_found("Resource not found"),
         DomainError::Db(error) => ApiError::internal(error.to_string()),
         DomainError::Internal(message) => ApiError::internal(message),
+        DomainError::Conflict(message) => ApiError::conflict(message),
     }
 }
 
 #[derive(Debug)]
 enum DomainError {
+    Conflict(String),
     BadRequest(String),
     NotFound(String),
     Db(DbError),
@@ -6623,6 +6878,60 @@ mod review_2026_10_09_tests {
         let hit = map_memory_detail_to_ranked_memory(&orphan);
         assert_eq!(hit.author_email, None);
         assert!(hit.session_ids.is_empty());
+    }
+
+    #[test]
+    fn docs_snapshot_only_moves_forward() {
+        use WatermarkCheck::*;
+        let c = |t: i64, id: &'static str| Some((t, Some(id)));
+        // Protocol 2: same commit or a newer one advances, older is refused.
+        assert_eq!(sync_watermark_check(true, true, None, c(100, "a")), Advance(100));
+        assert_eq!(sync_watermark_check(true, true, c(100, "a"), c(100, "a")), Advance(100));
+        assert_eq!(sync_watermark_check(true, true, c(100, "a"), c(200, "b")), Advance(200));
+        assert_eq!(sync_watermark_check(true, true, c(200, "b"), c(100, "a")), Stale);
+        // Another commit with the same second cannot be ordered: refused.
+        assert_eq!(sync_watermark_check(true, true, c(200, "b"), c(200, "x")), Stale);
+        assert_eq!(sync_watermark_check(true, true, c(200, "b"), None), Stale);
+        // Old clients: fine until the project follows a commit, then refused.
+        assert_eq!(sync_watermark_check(false, true, None, None), Accept);
+        assert_eq!(sync_watermark_check(false, true, c(200, "b"), None), OldClient);
+        // Admin full replace resets (or re-pins with protocol 2).
+        assert_eq!(sync_watermark_check(false, false, c(200, "b"), None), Reset);
+        assert_eq!(sync_watermark_check(true, false, c(200, "b"), c(50, "z")), Advance(50));
+    }
+
+    #[test]
+    fn protocol2_derives_removals_and_needs_from_the_tree() {
+        let snapshot: HashMap<String, Option<String>> = [
+            ("docs/a.md", Some("h-a")),
+            ("docs/b.md", Some("h-b-old")),
+            ("docs/legacy.md", None),
+            ("docs/gone.md", Some("h-g")),
+        ]
+        .into_iter()
+        .map(|(p, h)| (p.to_string(), h.map(str::to_string)))
+        .collect();
+        let manifest: HashMap<String, String> = [
+            ("docs/a.md", "h-a"),
+            ("docs/b.md", "h-b-new"),
+            ("docs/legacy.md", "h-l"),
+            ("docs/new.md", "h-n"),
+        ]
+        .into_iter()
+        .map(|(p, h)| (p.to_string(), h.to_string()))
+        .collect();
+        // Only files missing from the default branch's tree are removed; a
+        // client's branch never decides that.
+        assert_eq!(protocol2_removed_paths(&snapshot, &manifest), vec!["docs/gone.md"]);
+        assert_eq!(
+            protocol2_needed_paths(&manifest, &snapshot, &HashSet::new()),
+            vec!["docs/b.md", "docs/legacy.md", "docs/new.md"]
+        );
+        let sent: HashSet<String> = ["docs/new.md".to_string()].into_iter().collect();
+        assert_eq!(
+            protocol2_needed_paths(&manifest, &snapshot, &sent),
+            vec!["docs/b.md", "docs/legacy.md"]
+        );
     }
 
     #[test]

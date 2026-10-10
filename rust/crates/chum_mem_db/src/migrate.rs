@@ -5,7 +5,7 @@ use sqlx::PgPool;
 use thiserror::Error;
 
 const MIGRATION_LOCK_KEY: i64 = 42_424_201;
-pub const EXPECTED_MIGRATION_HEAD: &str = "0025_project_repository_remote.sql";
+pub const EXPECTED_MIGRATION_HEAD: &str = "0026_project_repository_commit.sql";
 
 #[derive(Debug, Clone, Copy)]
 pub struct MigrationFile {
@@ -173,6 +173,12 @@ pub const MIGRATION_FILES: &[MigrationFile] = &[
     MigrationFile {
         name: "0025_project_repository_remote.sql",
         contents: include_str!("../../../../infra/migrations/0025_project_repository_remote.sql"),
+        sentinel: None,
+        transactional: true,
+    },
+    MigrationFile {
+        name: "0026_project_repository_commit.sql",
+        contents: include_str!("../../../../infra/migrations/0026_project_repository_commit.sql"),
         sentinel: None,
         transactional: true,
     },

@@ -192,9 +192,19 @@ When the hooks cannot capture (API unreachable or too slow, token rejected), a
 one-line warning appears in your terminal at most once every 10 minutes per
 checkout; events are spooled and replayed. `CHUM_NOTICES=0` silences it.
 
-The docs sync uploads only files git tracks (plus the rules in
-`.chum-sync-rules.json`); loose notes and untracked files stay on your laptop.
-`CHUM_SYNC_INCLUDE_UNTRACKED=1` restores the old full walk.
+The docs sync uploads the repository's **default branch as of your last
+fetch** (`origin/HEAD`, e.g. `origin/main`), read from git objects, filtered by
+the `.chum-sync-rules.json` committed on that branch. Your checked-out branch,
+uncommitted edits, untracked files and loose notes are never uploaded, so every
+engineer describes the same tree. The server keeps one snapshot per project that
+only moves forward: each sync sends the full file list of that commit, the
+server removes files that are gone from the default branch and asks for files
+it does not hold yet, and a sync from an older commit than the snapshot's is
+refused (409) and changes nothing. A doc therefore disappears for the team only
+once it is deleted on the default branch, and a branch-only doc shows up once
+it is merged and fetched. `sync.sh` needs only bash, git and jq (no python3);
+`CHUM_SYNC_REF` overrides the ref. Old `sync.sh` copies get 409 once a project
+has had a protocol-2 sync: re-copy the scripts.
 
 Pause capture for one session with `CHUM_CAPTURE=0 claude`: every hook becomes
 a no-op (nothing captured, spooled or recalled). A spool file that still cannot
@@ -241,8 +251,8 @@ ever does, list its origin in `CHUM_MEM_CORS_ORIGINS`.
 
 The repository snapshot is pinned to the first git remote that syncs into the
 project (`projects.repository_remote`); a checkout of another remote gets 409.
-A clone of the same remote can still add files (sync uploads untracked files;
-see the review report).
+A clone of the same remote uploads the same default-branch tree, so it cannot
+add or remove files of its own.
 
 ## Sensitive-content guard (hold and ask)
 
