@@ -188,10 +188,10 @@ Both layers feed from the same agent plugin hook (`hook-dispatch.sh`), which fir
 
 ### Repository: `sync.sh` → `POST /api/knowledge/repository-sync`
 
-1. Enumerates files via `git ls-files`, applies sync rules, SHA-256 hashes each file
-2. Diffs against the cached manifest — only changed/new files are sent
-3. If nothing changed, exits in **~108ms** with zero API calls
-4. Otherwise POSTs file contents; the API parses via tree-sitter, merges into the graph, re-runs Leiden clustering
+1. Reads the tree of the repository's default branch (`origin/HEAD`) from git objects — never the working copy or the checked-out branch — and applies the sync rules committed on that branch (bash + git + jq; no python3)
+2. If that commit and the rules were already synced, exits with zero API calls
+3. Otherwise sends the complete manifest (path → git blob id) with the commit and its time; the API removes files gone from the tree, refuses commits older than the snapshot's (409), and answers with the paths it still needs
+4. POSTs those files in bounded chunks; the API parses via tree-sitter, merges into the graph, re-runs Leiden clustering
 
 ### Sessions: `session-sync.sh` → `/v1/ingest/session/*`
 

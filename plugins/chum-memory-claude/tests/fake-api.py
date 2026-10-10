@@ -2,7 +2,8 @@
 
 usage: python3 -I fake-api.py <port> <state-dir> [upstream-url]
 
-Every request is logged as "<METHOD> <path>" to <state-dir>/requests.log.
+Every request is logged as "<METHOD> <path>" to <state-dir>/requests.log, and
+the X-Chum-Token it carried (a test token) to <state-dir>/tokens.log.
 Behaviour is switched at run time by files in <state-dir>:
   health-down   GET /health answers 503
   start-503     POST /v1/ingest/session/start answers 503
@@ -53,6 +54,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _log(self):
         with open(os.path.join(STATE, "requests.log"), "a") as fh:
             fh.write("%s %s\n" % (self.command, self.path))
+        token = self.headers.get("X-Chum-Token")
+        if token:  # test tokens only
+            with open(os.path.join(STATE, "tokens.log"), "a") as fh:
+                fh.write(token + "\n")
 
     def _send(self, code, body):
         raw = json.dumps(body).encode()

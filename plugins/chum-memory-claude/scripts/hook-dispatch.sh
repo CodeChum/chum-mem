@@ -102,7 +102,11 @@ AUTH_HEADER=""
 if [[ -z "${CHUM_MEMORY_API_TOKEN:-}" && -r "${HOME}/.config/chum-mem/token" ]]; then
   CHUM_MEMORY_API_TOKEN="$(tr -d '[:space:]' < "${HOME}/.config/chum-mem/token")"; export CHUM_MEMORY_API_TOKEN
 fi
-if [[ -n "${CHUM_MEMORY_API_TOKEN:-}" ]]; then AUTH_HEADER="-HX-Chum-Token:${CHUM_MEMORY_API_TOKEN}"; fi
+# The token travels in a here-string on fd 9 that curl reads as a header file
+# (`-H @/dev/fd/9`), never in curl's argv where `ps` shows it to every user.
+# Each curl that sends $AUTH_HEADER also carries 9<<<"$AUTH_LINE".
+AUTH_LINE=""
+if [[ -n "${CHUM_MEMORY_API_TOKEN:-}" ]]; then AUTH_HEADER="-H@/dev/fd/9"; AUTH_LINE="X-Chum-Token: ${CHUM_MEMORY_API_TOKEN}"; fi
 API_HEALTHY=1
 # Health gate. The default budget is 5 s (was 2 s): through the IAP tunnel a
 # healthy API answers in ~0.5 s idle but 1-2 s when several sessions share the
@@ -148,7 +152,7 @@ if __health_cached; then
   :
 elif __health_down_recent; then
   API_HEALTHY=0
-elif curl -sf $AUTH_HEADER --max-time "$HEALTH_TIMEOUT" "${API_URL}/health" >/dev/null 2>&1; then
+elif curl -sf $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time "$HEALTH_TIMEOUT" "${API_URL}/health" >/dev/null 2>&1; then
   rm -f "$HEALTH_DOWN" 2>/dev/null || true
   if [[ "$HEALTH_CACHE_SECS" -gt 0 ]] && mkdir -p "${PROJECT_DIR}/.chum-cache" 2>/dev/null; then
     printf '%s %s\n' "$(date +%s)" "$API_URL" > "${HEALTH_CACHE}.$$" 2>/dev/null \
@@ -237,7 +241,7 @@ if [[ "$CHUM_MEM_EXISTED" -eq 1 && -e "$RESOLVE_MARKER" && -z "$(find "$RESOLVE_
 else
   RESOLVE_PAYLOAD=$(jq -n --arg projectId "$CANDIDATE_PROJECT_ID" --arg name "$PROJECT_NAME" \
     '{projectId: $projectId, name: $name}')
-  RESOLVE_RESP=$(curl -sf $AUTH_HEADER --max-time 5 -X POST -H "Content-Type: application/json" \
+  RESOLVE_RESP=$(curl -sf $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time 5 -X POST -H "Content-Type: application/json" \
     -d "$RESOLVE_PAYLOAD" "${API_URL}/v1/projects/resolve" 2>/dev/null) || RESOLVE_RESP=""
   if [[ -n "$RESOLVE_RESP" ]]; then
     RESOLVED_PROJECT_ID=$(echo "$RESOLVE_RESP" | jq -r '.projectId // ""' 2>/dev/null || echo "")
@@ -383,7 +387,7 @@ fetch_prompt_memory_escaped() {
   # A failed call (timeout, refused, HTTP error) leaves a .fail marker: it drops
   # the cached health result so the next hook checks /health again.
   if [[ "$AUTO_RECALL_SESSIONS" == "1" ]]; then
-    { curl -sf $AUTH_HEADER --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
+    { curl -sf $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
       -d "$body" "${api_url}/api/search" > "$tmpd/mem" 2>/dev/null || : > "$tmpd/mem.fail"; } &
   fi
   local docs_n="${CHUM_AUTO_RECALL_DOCS:-3}"
@@ -393,7 +397,7 @@ fetch_prompt_memory_escaped() {
     { jq -n --arg t "${prompt:0:300}" --arg pid "$CHUM_MEM_PROJECT_ID" \
       '{jsonrpc:"2.0", id:1, method:"tools/call", params:{name:"knowledge_query",
         arguments:{query:"search", text:$t, layer:"repository", projectId:$pid, limit:8}}}' \
-    | curl -sf $AUTH_HEADER --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
+    | curl -sf $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
         -H 'Accept: application/json, text/event-stream' --data-binary @- \
         "${api_url}/mcp?projectId=${CHUM_MEM_PROJECT_ID}" > "$tmpd/docs" 2>/dev/null || : > "$tmpd/docs.fail"; } &
   fi
@@ -511,7 +515,7 @@ fetch_knowledge_report_escaped() {
   local qs="layer=unified"
   [[ -n "${CHUM_MEM_PROJECT_ID:-}" ]] && qs="${qs}&projectId=${CHUM_MEM_PROJECT_ID}"
   local report=""
-  report=$(curl -sf $AUTH_HEADER --max-time 5 "${api_url}/api/knowledge/report?${qs}" 2>/dev/null) || return 1
+  report=$(curl -sf $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time 5 "${api_url}/api/knowledge/report?${qs}" 2>/dev/null) || return 1
   [[ -z "$report" ]] && return 1
   if echo "$report" | jq -e '.report.markdown? // empty' >/dev/null 2>&1; then
     report=$(printf '%s' "$report" | jq -r '.report.markdown')

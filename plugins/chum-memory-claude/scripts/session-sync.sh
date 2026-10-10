@@ -31,7 +31,11 @@ AUTH_HEADER=""
 if [[ -z "${CHUM_MEMORY_API_TOKEN:-}" && -r "${HOME}/.config/chum-mem/token" ]]; then
   CHUM_MEMORY_API_TOKEN="$(tr -d '[:space:]' < "${HOME}/.config/chum-mem/token")"; export CHUM_MEMORY_API_TOKEN
 fi
-if [[ -n "${CHUM_MEMORY_API_TOKEN:-}" ]]; then AUTH_HEADER="-HX-Chum-Token:${CHUM_MEMORY_API_TOKEN}"; fi
+# The token travels in a here-string on fd 9 that curl reads as a header file
+# (`-H @/dev/fd/9`), never in curl's argv where `ps` shows it to every user.
+# Each curl that sends $AUTH_HEADER also carries 9<<<"$AUTH_LINE".
+AUTH_LINE=""
+if [[ -n "${CHUM_MEMORY_API_TOKEN:-}" ]]; then AUTH_HEADER="-H@/dev/fd/9"; AUTH_LINE="X-Chum-Token: ${CHUM_MEMORY_API_TOKEN}"; fi
 # Budget for the live session/start and session/event calls. It must stay well
 # under the shortest hook timeout (PostToolUse, Notification, SubagentStop:
 # 10 s): with 10 s here, an API that accepted the connection but hung got the
@@ -175,12 +179,12 @@ flush_one() {
     api=$(printf '%s' "$line" | jq -r '.api // empty'); api="${api:-$API_URL}"
     start=$(printf '%s' "$line" | jq -c '.start')
     body=$(printf '%s' "$line" | jq -c '.body')
-    sid=$(printf '%s' "$start" | curl -sS $AUTH_HEADER --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- \
+    sid=$(printf '%s' "$start" | curl -sS $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- \
       "${api}/v1/ingest/session/start" 2>/dev/null | jq -r '.sessionId // empty' 2>/dev/null) || sid=""
     [[ -n "$sid" ]] || break
     body=$(printf '%s' "$body" | jq -c --arg sid "$sid" '.sessionId = $sid')
     case "$kind" in end) ep="session/end" ;; *) ep="session/event" ;; esac
-    code=$(printf '%s' "$body" | curl -sS $AUTH_HEADER --max-time 15 -o /dev/null -w "%{http_code}" -X POST \
+    code=$(printf '%s' "$body" | curl -sS $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time 15 -o /dev/null -w "%{http_code}" -X POST \
       -H 'Content-Type: application/json' --data-binary @- "${api}/v1/ingest/${ep}" 2>/dev/null) || code="000"
     [[ "$code" == 2* ]] || break
     sent=$((sent + 1))
@@ -236,7 +240,7 @@ close_stale_sessions() {
       rm -f "$st"; continue   # never reached the server; its spooled lines replay on their own
     fi
     code=$(jq -c -n --arg sid "$sid" '{sessionId:$sid, summary:"[session ended without a Stop hook; closed by chum-mem at the next session start]"}' \
-      | curl -sS $AUTH_HEADER --max-time 5 -o /dev/null -w "%{http_code}" -X POST -H 'Content-Type: application/json' \
+      | curl -sS $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time 5 -o /dev/null -w "%{http_code}" -X POST -H 'Content-Type: application/json' \
           --data-binary @- "${API_URL}/v1/ingest/session/end" 2>/dev/null) || code="000"
     case "$code" in 2*|404) rm -f "$st"; echo "session-sync: closed stale session $sid" >&2 ;; esac
   done < <(find "$CACHE_DIR" -maxdepth 1 -name "session-${PROVIDER}-*.json" -mmin +720 2>/dev/null)
@@ -328,7 +332,7 @@ ensure_session_started() {
   payload=$(session_start_payload)
 
   local response http_code
-  response=$(curl -sS $AUTH_HEADER --max-time "$LIVE_CALL_TIMEOUT" \
+  response=$(curl -sS $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time "$LIVE_CALL_TIMEOUT" \
     -o /tmp/chum-session-start-resp.$$.json \
     -w "%{http_code}" \
     -X POST \
@@ -453,7 +457,7 @@ post_event() {
     spool_line event "$full_payload"
     return 0
   fi
-  http_code=$(printf '%s' "$full_payload" | curl -sS $AUTH_HEADER --max-time "$LIVE_CALL_TIMEOUT" \
+  http_code=$(printf '%s' "$full_payload" | curl -sS $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time "$LIVE_CALL_TIMEOUT" \
     -o /tmp/chum-session-event-resp.$$.json \
     -w "%{http_code}" \
     -X POST \
@@ -527,7 +531,7 @@ end_session() {
   local http_code
   # 20 s, under the Stop/SessionEnd hook timeout (30 s) so a hung API spools
   # the end instead of the hook being killed with it in flight.
-  http_code=$(curl -sS $AUTH_HEADER --max-time 20 \
+  http_code=$(curl -sS $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time 20 \
     -o /tmp/chum-session-end-resp.$$.json \
     -w "%{http_code}" \
     -X POST \
