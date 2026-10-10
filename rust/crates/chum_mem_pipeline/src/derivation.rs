@@ -364,6 +364,9 @@ fn derive_atomic_claim_memories(
         // D5: compaction summaries, slash-command / skill bodies, background
         // task notifications and hook text arrive as `prompt` events but were
         // not written by the engineer. They never originate a claim.
+        if is_file_content_tool_event(event) {
+            continue;
+        }
         if is_injected_event_text(&text) {
             // A compaction summary is model-written but restates decisions
             // from the compacted part of the session. Keep only its explicit
@@ -442,6 +445,9 @@ fn extract_claims_from_text(
     let mut claims = Vec::new();
     let cleaned = strip_template_noise(text);
     for segment in claim_segments(&cleaned) {
+        if looks_like_code_line(&segment) {
+            continue;
+        }
         let Some(memory_type) = classify_claim_type(event, &segment) else {
             continue;
         };
@@ -739,7 +745,7 @@ fn extract_model_text_claims(
             break;
         }
         let length = segment.chars().count();
-        if !(30..=400).contains(&length) {
+        if !(30..=400).contains(&length) || looks_like_code_line(&segment) {
             continue;
         }
         let lower = segment.to_lowercase();
@@ -801,6 +807,169 @@ fn extract_model_text_claims(
         });
     }
     claims
+}
+
+/// Tools whose captured text is file content (an edit/write input or a read
+/// result), never a statement about the project. Their events originate no
+/// claims at all.
+fn is_file_content_tool_event(event: &SessionEventRecord) -> bool {
+    if !matches!(
+        event.event_type,
+        CanonicalEventType::ToolCall | CanonicalEventType::ToolResult | CanonicalEventType::FileChange
+    ) {
+        return false;
+    }
+    let Some(tool) = event.payload.tool_name.as_deref() else {
+        return false;
+    };
+    let tool = tool.trim().to_ascii_lowercase();
+    [
+        "edit",
+        "write",
+        "multiedit",
+        "notebookedit",
+        "read",
+        "notebookread",
+        "apply_patch",
+        "str_replace_editor",
+        "str_replace_based_edit_tool",
+    ]
+    .contains(&tool.as_str())
+}
+
+/// Source code, SQL, JSON and test-fixture lines (follow-up to D5: Bash
+/// heredocs and pasted code were stored as fix/decision memories). A line
+/// counts as code on strong syntax markers, a code-shaped start, an
+/// indented identifier followed by call/assignment syntax, or a high share of
+/// brackets, quotes and operators. Inline `code` spans are neutralised first,
+/// so a prose sentence that mentions `foo::bar` is still prose.
+pub fn looks_like_code_line(line: &str) -> bool {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static INLINE_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`[^`]*`").unwrap());
+    static CODE_START: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(concat!(
+            r#"^(?://|/\*|\*/|#\[|#!|#include\b|"[^"]*"\s*[:,)\]]"#,
+            r"|(?:let|const|var)\s+(?:mut\s+)?\w+\s*[:=]",
+            r"|(?:fn|def|class|struct|enum|impl|mod|interface|type)\s+\w+\s*[(<:{=]",
+            r"|(?:pub(?:\(crate\))?|async|export)\s+(?:fn|struct|enum|mod|use|const|crate|default|function|class|type|interface|async)\b",
+            r"|use\s+[\w:]+::|(?:import|from)\s+[\w.]+(?:\s+import\b|\s*;|$)",
+            r"|return\b.*;$|(?:if|for|while|match|switch)\s*\(|assert\w*!?\s*\(|\.\w+\s*\(|@\w+\s*\()",
+        ))
+        .unwrap()
+    });
+    static SQL_START: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            // Lower-case or upper-case keywords only: a capitalised "Set"
+            // or "With" starts a sentence, not a query.
+            r"^(?:select|insert\s+into|update|delete\s+from|create|alter|drop|with|from|where|and|or|order\s+by|group\s+by|having|limit|join|left\s+join|inner\s+join|values|returning|set|on\s+conflict|SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|CREATE|ALTER|DROP|WITH|FROM|WHERE|AND|OR|ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT|JOIN|LEFT\s+JOIN|INNER\s+JOIN|VALUES|RETURNING|SET|ON\s+CONFLICT)\b",
+        )
+        .unwrap()
+    });
+    static SQL_SELECT: LazyLock<Regex> = LazyLock::new(|| {
+        // A select list with a comma, star or call, or a FROM followed by a
+        // clause keyword. "select the preset from the dropdown" stays prose.
+        Regex::new(concat!(
+            r"^(?:select\s[^.]*?[,*(][^.]*\sfrom\s+\w",
+            r"|select\s.+\sfrom\s+[\w.]+(?:\s+\w+)?\s+(?:where|join|left|inner|order|group|limit)\b",
+            r"|SELECT\s.+\sFROM\s+\w)",
+        ))
+        .unwrap()
+    });
+    static SQL_LITERAL: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?:^|[\s(=,])'[^']*'(?:$|[\s),;])").unwrap());
+    static INDENTED_IDENT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(?:\t|\s{2,})[A-Za-z_][\w.]*(?:::\w+)*\s*(?:\(|=[^=]|\.\w|\[|:\s*$|\?)").unwrap()
+    });
+    // Never in prose: escaped newlines/quotes, JSON keys, closing tags,
+    // shell heredocs, interpolation, SQL pattern matching.
+    const DEFINITE: &[&str] = &[
+        "\\n", "\\\"", "{\"", "</", "<<'", "<<\"", "<<eof", "${", " ilike ", " like '%",
+    ];
+    // Code-typical, but a quoting sentence can contain them.
+    const LIKELY: &[&str] = &[
+        "::", "=>", "\");", "\"),", "\"],", "\"},", "');", "();", "/>", "&&", "||", "!=", "==",
+        "+=",
+    ];
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let text = INLINE_CODE.replace_all(trimmed, "x");
+    let text = text.replace("**", "").replace("__", "");
+    let lower = text.to_lowercase();
+    if DEFINITE.iter().any(|marker| lower.contains(marker))
+        || CODE_START.is_match(&text)
+        || INDENTED_IDENT.is_match(line)
+        || SQL_SELECT.is_match(&text)
+        || (SQL_START.is_match(&text)
+            && (SQL_LITERAL.is_match(&text)
+                || text.contains('=')
+                || lower.contains("select *")
+                || text.contains("(*)")
+                || text.trim_end().ends_with(';')))
+    {
+        return true;
+    }
+    // A line opening with a bracket is a literal only with literal syntax in
+    // it; "(Note: ...)" and "[Image #2] ..." are prose.
+    if text.starts_with(['(', '[', '{', '}', ']', ')'])
+        && (text.contains('"')
+            || text.contains('=')
+            || text.contains(';')
+            || text.contains('{')
+            || text.contains('}')
+            || text.trim_end().ends_with([',', '(', '[', '{']))
+    {
+        return true;
+    }
+    // A line that reads as a sentence (mostly plain words) stays prose even
+    // when it quotes something code-like.
+    if reads_as_prose(&text) {
+        return false;
+    }
+    if LIKELY.iter().any(|marker| lower.contains(marker)) {
+        return true;
+    }
+    let non_space: Vec<char> = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if non_space.len() >= 8 {
+        let symbols = non_space
+            .iter()
+            .filter(|ch| "(){}[]<>;=&\"\\$^~".contains(**ch))
+            .count();
+        if symbols * 100 >= non_space.len() * 15 {
+            return true;
+        }
+    }
+    let end = text.trim_end();
+    end.ends_with('{')
+        || end.ends_with('(')
+        || end.ends_with('[')
+        || end.ends_with("),")
+        || end.ends_with("],")
+        || end.ends_with("},")
+        || end.ends_with("\",")
+        || end.ends_with('\\')
+        || (end.ends_with(';') && (text.contains('(') || text.contains('=') || text.contains('"')))
+}
+
+/// At least eight whitespace-separated tokens, 70% of them plain words.
+fn reads_as_prose(text: &str) -> bool {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() < 8 {
+        return false;
+    }
+    let plain = words
+        .iter()
+        .filter(|word| {
+            let core = word.trim_matches(|ch: char| !ch.is_alphanumeric());
+            core.chars().count() >= 2
+                && core
+                    .chars()
+                    .all(|ch| ch.is_alphabetic() || matches!(ch, '\'' | '\u{2019}' | '-'))
+        })
+        .count();
+    plain * 100 >= words.len() * 70
 }
 
 /// D5: text that reaches the store as a `prompt` event but was injected by
@@ -1013,8 +1182,17 @@ pub fn strip_template_noise(text: &str) -> String {
     }
     let mut kept = Vec::new();
     let mut in_context_block = false;
+    let mut in_fence = false;
     for line in text.lines() {
         let trimmed = line.trim();
+        // Fenced code blocks never carry a claim.
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || looks_like_code_line(line) {
+            continue;
+        }
         let lower = trimmed.to_lowercase();
         if lower.starts_with("## context (established facts") {
             in_context_block = true;
@@ -2334,5 +2512,149 @@ Please continue the conversation from where we left it off without asking the us
         assert_eq!(memory_source_time(&multi, &events).as_deref(), Some("2026-10-05T14:00:00.25Z"));
         multi.provenance_event_ids = vec![Uuid::from_u128(77)];
         assert_eq!(memory_source_time(&multi, &events), None);
+    }
+
+    // ── D5 follow-up: code-shaped content from tool calls is not a memory ──
+
+    fn tool_event(
+        id: u128,
+        event_type: CanonicalEventType,
+        tool: &str,
+        command: Option<&str>,
+        message: Option<&str>,
+    ) -> SessionEventRecord {
+        SessionEventRecord {
+            id: Uuid::from_u128(id),
+            event_type,
+            payload: SessionEventPayload {
+                tool_name: Some(tool.to_string()),
+                command: command.map(str::to_string),
+                message: message.map(str::to_string),
+                ..SessionEventPayload::default()
+            },
+            created_at: format!("2026-10-10T00:00:{:02}Z", id % 60),
+        }
+    }
+
+    fn admitted_contents(events: &[SessionEventRecord]) -> Vec<(MemoryType, String)> {
+        admitted(events)
+            .into_iter()
+            .map(|d| (d.memory_type, d.content))
+            .collect()
+    }
+
+    #[test]
+    fn rust_test_tuple_in_a_bash_heredoc_is_not_a_fix() {
+        let command = r#"python3 - <<'PY'
+p='derivation.rs'; s=open(p).read()
+cases = """
+            (CanonicalEventType::Prompt, "<task-notification>\n<task-id>abc123</task-id>\n<result>Fixed the widget bug because the cache key was wrong. Decision: keep the cache.</result>\n</task-notification>"),
+"""
+open(p,'w').write(s)
+PY"#;
+        let events = vec![tool_event(1, CanonicalEventType::ToolResult, "Bash", Some(command), Some("Bash"))];
+        let got = admitted_contents(&events);
+        assert!(got.is_empty(), "got {got:?}");
+    }
+
+    #[test]
+    fn sql_in_a_bash_heredoc_is_not_a_fix() {
+        let command = r#"timeout 60 psql <<'SQL'
+select type, left(regexp_replace(content,'\s+',' ','g'),90) c from memories where superseded_at is null
+ and (content ilike '%session is being continued%' or content ilike '# /loop%' or content ilike '%is fixed and verified%') limit 40;
+SQL"#;
+        let events = vec![tool_event(2, CanonicalEventType::ToolResult, "Bash", Some(command), Some("Bash"))];
+        let got = admitted_contents(&events);
+        assert!(got.is_empty(), "got {got:?}");
+    }
+
+    #[test]
+    fn fixture_tuples_are_not_decisions() {
+        let command = r#"cat > e2e.py <<'PY'
+E = [
+ ("2026-10-03T10:05:00Z", "prompt",  {"message": "Base directory for this skill: /tmp/skills/widget-demo\n\nMust follow a user message. Do not edit generated files."}),
+ ("2026-10-06T13:00:00Z", "prompt",  {"message": "Decision: widget API deploys only on Tuesdays and Thursdays."}),
+ ("2026-10-07T14:00:00Z", "prompt",  {"message": "Constraint: never deploy the widget API on Fridays."}),
+]
+PY"#;
+        let events = vec![tool_event(3, CanonicalEventType::ToolResult, "Bash", Some(command), Some("Bash"))];
+        let got = admitted_contents(&events);
+        assert!(got.is_empty(), "got {got:?}");
+        // The same fixture pasted into a prompt is also not a decision.
+        let pasted = single_event(
+            CanonicalEventType::Prompt,
+            r#" ("2026-10-06T13:00:00Z", "prompt",  {"message": "Decision: widget API deploys only on Tuesdays and Thursdays."}),"#,
+        );
+        assert!(admitted_types(&pasted).is_empty());
+    }
+
+    #[test]
+    fn file_content_tools_originate_no_claims() {
+        let events = vec![
+            tool_event(4, CanonicalEventType::ToolCall, "Edit", None, Some("Decision: widget exports are A4 only. The fix was raising the timeout.")),
+            tool_event(5, CanonicalEventType::ToolResult, "Write", None, Some("Constraint: never deploy on Fridays.")),
+            tool_event(6, CanonicalEventType::ToolResult, "Read", None, Some("Root cause: the renderer waited 30 seconds for fonts.")),
+            tool_event(7, CanonicalEventType::ToolResult, "MultiEdit", None, Some("Decision: keep the cache.")),
+            tool_event(8, CanonicalEventType::ToolResult, "NotebookEdit", None, Some("Decision: keep the notebook.")),
+        ];
+        let got = admitted_contents(&events);
+        assert!(got.is_empty(), "got {got:?}");
+    }
+
+    #[test]
+    fn prose_decisions_inside_tool_output_and_prompts_are_kept() {
+        let command = "git commit -F - <<'EOF'\nfix(widgets): retry exports\n\nDecision: widget exports retry through Cloud Tasks because Celery hides retries.\nEOF";
+        let events = vec![tool_event(9, CanonicalEventType::ToolResult, "Bash", Some(command), Some("Bash"))];
+        let got = admitted_contents(&events);
+        assert!(
+            got.iter().any(|(t, c)| *t == MemoryType::Decision && c.contains("Cloud Tasks")),
+            "got {got:?}"
+        );
+
+        let prompt = single_event(
+            CanonicalEventType::Prompt,
+            "Here is the old code:\n```rust\nlet decision = \"Decision: fake\";\n```\nDecision: route widget retries through `chum_mem::jobs::enqueue` instead of Celery.",
+        );
+        let got = admitted_contents(&prompt);
+        assert_eq!(got.len(), 1, "got {got:?}");
+        assert_eq!(got[0].0, MemoryType::Decision);
+        assert!(got[0].1.contains("chum_mem::jobs::enqueue"));
+    }
+
+    #[test]
+    fn code_line_detection() {
+        for code in [
+            r#"            (CanonicalEventType::Prompt, "<task-notification>\n<task-id>abc</task-id>"),"#,
+            " and (content ilike '%session is being continued%' or content ilike '# /loop%')",
+            r#" ("2026-10-03T10:05:00Z", "prompt",  {"message": "Decision: x"}),"#,
+            "select id, type from memories where project_id = $1;",
+            "select type, left(content,90) from memories where superseded_at is null",
+            "    memories.extend(extract_claims(event));",
+            "let source_time = memory_source_time(&draft, &records);",
+            "import json",
+            r#"{"type": "decision", "content": "Decision: keep it"}"#,
+            "fn is_status_only(lower: &str) -> bool {",
+        ] {
+            assert!(looks_like_code_line(code), "{code:?} should be code");
+        }
+        for prose in [
+            "I'm going with Cloud Tasks for the widget export retries because Celery has no retry visibility.",
+            "Decision: widget API deploys only on Tuesdays and Thursdays.",
+            "export runs on the GCP memory VM pilot, not the Mac Studio.",
+            "let's go with Cloud Tasks for the retries.",
+            "Update: the rubrics timeout is now 60 seconds (was 45).",
+            "With Cloud Tasks we're safe, it's visible in the console.",
+            "Decision: use `chum_mem::jobs::enqueue` for retries.",
+            "found and quantified 5 root causes;",
+            "Model policy: \"we're going to use gemini 3-flash-preview\" for the experiment.",
+            "(Note: for additive and deductive, it will be a multiple toggle).",
+            "[Image #2] this should not be possible.",
+            "select the widget preset from the dropdown before exporting.",
+            "and the strict rule is *my* choice from your answer, not something he confirmed.",
+            "Set 3 is live and verified: subtitled *Civil Engineering*, all 10 problems.",
+            "**On \"the goal is 5 seconds\": not reachable with correct values.**",
+        ] {
+            assert!(!looks_like_code_line(prose), "{prose:?} should be prose");
+        }
     }
 }

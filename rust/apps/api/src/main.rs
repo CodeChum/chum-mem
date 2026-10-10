@@ -3750,6 +3750,10 @@ async fn derive_and_persist_session_memories(
             continue;
         }
 
+        // D6: the time of the event this draft came from (capped at now() in
+        // SQL); used for a new memory's created_at and a duplicate's lastSeenAt.
+        let source_time = memory_source_time(&draft, &records);
+
         // Cross-session dedupe (recall review: one prompt sentence existed as
         // 1,121 active fix memories). If the project already holds an active
         // memory with the same type, claim key and normalised content, record
@@ -3766,7 +3770,14 @@ async fn derive_and_persist_session_memories(
                 update public.memories
                 set metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object(
                   'seenCount', coalesce((metadata->>'seenCount')::int, 1) + 1,
-                  'lastSeenAt', now(),
+                  -- The source event's time (capped at now()), not the time
+                  -- the session was processed; never moves backwards when an
+                  -- older session is imported after a newer one.
+                  'lastSeenAt', greatest(
+                    case when metadata->>'lastSeenAt' ~ '^\d{4}-\d{2}-\d{2}'
+                         then (metadata->>'lastSeenAt')::timestamptz end,
+                    least(coalesce($6::timestamptz, now()), now())
+                  ),
                   'lastSeenSessionId', $5::text
                 )
                 where id = (
@@ -3787,6 +3798,7 @@ async fn derive_and_persist_session_memories(
             .bind(&claim_key)
             .bind(&normalised)
             .bind(session_id.to_string())
+            .bind(source_time.as_deref())
             .fetch_optional(&mut **tx)
             .await
             .map_err(DbError::from)?;
@@ -3803,8 +3815,6 @@ async fn derive_and_persist_session_memories(
             }
         }
 
-        // D6: date the memory at its source event, before draft.metadata moves.
-        let source_time = memory_source_time(&draft, &records);
         let mut metadata = match draft.metadata {
             Value::Object(existing) => existing,
             _ => serde_json::Map::new(),
