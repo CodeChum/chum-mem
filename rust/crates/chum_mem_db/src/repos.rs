@@ -588,6 +588,50 @@ pub async fn resolve_session(
     row.ok_or(DbError::NotFound("session"))
 }
 
+/// [`resolve_session`] for the event-append paths: also takes the session
+/// row lock (`FOR NO KEY UPDATE`) for the rest of the transaction.
+///
+/// Without it an append could read the session as `active` while a
+/// concurrent `session/end` had already marked it completed (uncommitted) and
+/// loaded the events: the end derived without the new event and stamped
+/// `derivedAt`, the append saw "not late" and scheduled nothing, and the
+/// event was never derived. With the lock the append waits for that end to
+/// commit, then sees `completed` and schedules a late derivation; and an end
+/// that starts after the append took the lock waits, then loads the event.
+pub async fn resolve_session_for_append(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &RepositoryContext,
+    session_id: Uuid,
+) -> Result<SessionRow, DbError> {
+    let row = sqlx::query_as::<_, SessionRow>(
+        r#"
+        select
+          id,
+          provider::text as provider,
+          project_id,
+          external_session_id,
+          status::text as status,
+          branch,
+          coalesce(metadata ? 'derivedAt', false) as derived
+        from public.sessions
+        where id = $1
+          and organization_id = $2
+          and team_id = $3
+          and ($4::uuid is null or project_id = $4)
+        limit 1
+        for no key update
+        "#,
+    )
+    .bind(session_id)
+    .bind(context.organization_id)
+    .bind(context.team_id)
+    .bind(context.project_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    row.ok_or(DbError::NotFound("session"))
+}
+
 pub async fn insert_session_event(
     tx: &mut Transaction<'_, Postgres>,
     context: &RepositoryContext,
@@ -1100,13 +1144,18 @@ pub async fn insert_memory(
           $1, $2, $3, $4, $5, $6::public.memory_type, $7, $8, $9, $10, $11, $12, $13,
           -- D6: date a memory at the event it came from ($14, the source
           -- event's event_time), capped at now() against client clock skew.
-          -- Without one, keep the old rule: backfilled sessions end in the
-          -- past, so use the session end, otherwise now().
+          -- Without one, use the session's latest event (a backfilled session
+          -- lies in the past), never its ended_at: a multi-turn session idle
+          -- for over an hour kept the previous turn's ended_at through the
+          -- late-derivation callback, so the next turn's memories were
+          -- backdated to it.
           case
             when $14::timestamptz is not null then least($14::timestamptz, now())
-            else coalesce(
-              (select s.ended_at from public.sessions s
-               where s.id = $4 and s.ended_at < now() - interval '1 hour'),
+            else least(
+              coalesce(
+                (select max(e.event_time) from public.session_events e where e.session_id = $4),
+                now()
+              ),
               now()
             )
           end
@@ -1658,7 +1707,10 @@ pub async fn enqueue_worker_job(
           payload = excluded.payload,
           available_at = least(public.worker_jobs.available_at, excluded.available_at),
           priority = least(public.worker_jobs.priority, excluded.priority),
-          updated_at = now()
+          -- clock_timestamp(), not now(): a merge into a RUNNING job is
+          -- detected by `complete_worker_job` as "updated_at changed since the
+          -- claim", which must hold even if this transaction began earlier.
+          updated_at = clock_timestamp()
         returning
           id, organization_id, team_id, project_id, session_id, memory_id, job_type, dedupe_key,
           status::text as status, priority, attempts, max_attempts, available_at, claimed_at,
@@ -1676,6 +1728,72 @@ pub async fn enqueue_worker_job(
     .bind(max_attempts)
     .bind(available_at)
     .bind(payload)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(DbError::from)
+}
+
+/// Like [`enqueue_worker_job`], but a real debounce: a repeat enqueue of a
+/// pending job moves `available_at` forward to the new value (each new event
+/// restarts the quiet period) instead of keeping the earlier one, capped at
+/// `created_at + max_delay_secs` so a steady trickle cannot starve the job.
+/// A repeat enqueue of a RUNNING job stores the new payload and time; the
+/// worker then puts the job back to pending when it finishes (see
+/// [`complete_worker_job`]) instead of completing it.
+#[allow(clippy::too_many_arguments)]
+pub async fn enqueue_debounced_worker_job(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &RepositoryContext,
+    project_id: Uuid,
+    session_id: Option<Uuid>,
+    job_type: &str,
+    dedupe_key: &str,
+    priority: i32,
+    max_attempts: i32,
+    available_at: &str,
+    max_delay_secs: i64,
+    payload: &Value,
+) -> Result<WorkerJobRecord, DbError> {
+    sqlx::query_as::<_, WorkerJobRecord>(
+        r#"
+        insert into public.worker_jobs (
+          organization_id, team_id, project_id, session_id, memory_id, job_type, dedupe_key,
+          priority, max_attempts, available_at, payload
+        )
+        values ($1, $2, $3, $4, null, $5, $6, $7, $8, $9::timestamptz, $10)
+        on conflict (project_id, job_type, dedupe_key) where status in ('pending', 'running')
+        do update set
+          payload = excluded.payload,
+          available_at = case
+            when public.worker_jobs.status = 'pending'::public.worker_job_status then
+              least(
+                excluded.available_at,
+                greatest(
+                  public.worker_jobs.available_at,
+                  public.worker_jobs.created_at + make_interval(secs => $11::double precision)
+                )
+              )
+            else excluded.available_at
+          end,
+          priority = least(public.worker_jobs.priority, excluded.priority),
+          updated_at = clock_timestamp()
+        returning
+          id, organization_id, team_id, project_id, session_id, memory_id, job_type, dedupe_key,
+          status::text as status, priority, attempts, max_attempts, available_at, claimed_at,
+          completed_at, worker_id, payload, last_error, created_at, updated_at
+        "#,
+    )
+    .bind(context.organization_id)
+    .bind(context.team_id)
+    .bind(project_id)
+    .bind(session_id)
+    .bind(job_type)
+    .bind(dedupe_key)
+    .bind(priority)
+    .bind(max_attempts)
+    .bind(available_at)
+    .bind(payload)
+    .bind(max_delay_secs as f64)
     .fetch_one(&mut **tx)
     .await
     .map_err(DbError::from)
@@ -1824,19 +1942,38 @@ pub async fn requeue_running_worker_jobs(
     Ok(outcome)
 }
 
+/// Settle a successful run. Returns `true` when the job was put back to
+/// `pending` instead of completed: someone enqueued the same dedupe key while
+/// it was running (the enqueue merged into this row and changed its
+/// `updated_at` after the claim), so the run may have missed that work — for
+/// example a late session event inserted after the derivation loaded the
+/// events. The re-run keeps the `available_at` and payload the enqueue set.
+/// Completing it anyway used to drop that work for good.
 pub async fn complete_worker_job(
     tx: &mut Transaction<'_, Postgres>,
     job: &WorkerJobRecord,
-) -> Result<(), DbError> {
-    sqlx::query(
+) -> Result<bool, DbError> {
+    // All CASE arms read the row as it was before this UPDATE.
+    let status: String = sqlx::query_scalar(
         r#"
         update public.worker_jobs
-        set status = 'completed'::public.worker_job_status, completed_at = now(), updated_at = now(), last_error = null
+        set
+          status = case when updated_at is distinct from $2
+                        then 'pending'::public.worker_job_status
+                        else 'completed'::public.worker_job_status end,
+          completed_at = case when updated_at is distinct from $2 then null else now() end,
+          worker_id = case when updated_at is distinct from $2 then null else worker_id end,
+          claimed_at = case when updated_at is distinct from $2 then null else claimed_at end,
+          attempts = case when updated_at is distinct from $2 then 0 else attempts end,
+          updated_at = clock_timestamp(),
+          last_error = null
         where id = $1
+        returning status::text
         "#,
     )
     .bind(job.id)
-    .execute(&mut **tx)
+    .bind(job.updated_at)
+    .fetch_one(&mut **tx)
     .await?;
 
     sqlx::query(
@@ -1863,7 +2000,7 @@ pub async fn complete_worker_job(
     .execute(&mut **tx)
     .await?;
 
-    Ok(())
+    Ok(status == "pending")
 }
 
 /// Keep only the newest `keep` snapshots of one type per project (the current

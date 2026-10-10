@@ -49,8 +49,8 @@ use chum_mem_pipeline::{
     KnowledgeGraph, KnowledgeNode, MemorySearchEnvelope, RankedMemory, RankingContext,
     RepositoryFilePayload, SearchMetrics, SessionEventRecord, TurboVecScope, TurboVecStore,
     VectorSearchResult, build_context_pack, build_session_completion_job_plan,
-    community_relevance_from_query, compile_minimal_proof_set, derive_memories_from_session,
-    memory_source_time,
+    authority_rank, community_relevance_from_query, compile_minimal_proof_set,
+    derive_memories_from_session, memory_source_time,
     derive_session_episodes, embed_text, event_text, generate_knowledge_report,
     memory_community_map, merge_graphs, merge_hybrid_results, progressive_disclosure,
     project_graph_for_dashboard, query_chroma_memories_typed, rank_hybrid_results,
@@ -1602,7 +1602,11 @@ async fn perform_session_event(
     input.provider = normalize_provider_id(&input.provider)?;
 
     let mut tx = begin_tx(state, &state.scope).await?;
-    let session = resolve_session(&mut tx, &state.scope, input.session_id).await?;
+    // Row lock: serialises this append with a concurrent session/end (see
+    // resolve_session_for_append) so the event is either seen by that end's
+    // derivation or scheduled as a late event, never neither.
+    let session =
+        chum_mem_db::resolve_session_for_append(&mut tx, &state.scope, input.session_id).await?;
     let late = ensure_appendable(&session)?;
 
     let inserted = insert_session_event(
@@ -1666,12 +1670,20 @@ fn ensure_appendable(session: &chum_mem_db::SessionRow) -> Result<bool, DomainEr
 /// Seconds to wait after the last late event before deriving, so a burst of
 /// late events (or the rest of a turn) is derived once.
 const LATE_DERIVATION_DELAY_SECS: i64 = 60;
+/// Upper bound on that wait, counted from the first late event, so a steady
+/// trickle of events cannot postpone the derivation forever.
+const LATE_DERIVATION_MAX_DELAY_SECS: i64 = 600;
 
 /// Late events: mark the session not-derived and queue a debounced
 /// `derive-session-memories`. The worker calls session/end, which derives the
 /// whole session again (memories are keyed per session, so nothing doubles)
 /// and keeps `ended_at`. If a hook's session/end arrives first it derives
 /// inline and the queued job finds the session derived and does nothing.
+///
+/// Every late event is derived exactly once: each one restarts the 60 s quiet
+/// period (capped at 10 min), and an event that arrives while the job is
+/// running re-queues it (`complete_worker_job` sees the merge) instead of
+/// being dropped when the job completes.
 async fn schedule_late_derivation(
     tx: &mut Transaction<'_, Postgres>,
     state: &ApiState,
@@ -1701,17 +1713,17 @@ async fn schedule_late_derivation(
         + time::Duration::seconds(LATE_DERIVATION_DELAY_SECS))
     .format(&time::format_description::well_known::Rfc3339)
     .map_err(|error| DomainError::Internal(error.to_string()))?;
-    enqueue_worker_job(
+    chum_mem_db::enqueue_debounced_worker_job(
         tx,
         &state.scope,
         session.project_id,
         Some(session.id),
-        None,
         "derive-session-memories",
         &format!("derive:{}", session.id),
         50,
         3,
-        Some(&available_at),
+        &available_at,
+        LATE_DERIVATION_MAX_DELAY_SECS,
         &json!({
             "sessionId": session.id,
             "summary": summary,
@@ -1727,7 +1739,8 @@ async fn perform_session_events_batch(
     input: BatchAppendSessionEventsRequest,
 ) -> Result<BatchAppendSessionEventsResponse, DomainError> {
     let mut tx = begin_tx(state, &state.scope).await?;
-    let session = resolve_session(&mut tx, &state.scope, input.session_id).await?;
+    let session =
+        chum_mem_db::resolve_session_for_append(&mut tx, &state.scope, input.session_id).await?;
     let late = ensure_appendable(&session)?;
 
     // One multi-row INSERT per batch instead of one round trip per event.
@@ -3758,7 +3771,15 @@ async fn derive_and_persist_session_memories(
         // Cross-session dedupe (recall review: one prompt sentence existed as
         // 1,121 active fix memories). If the project already holds an active
         // memory with the same type, claim key and normalised content, record
-        // the repeat on it instead of creating another row.
+        // the repeat on it instead of creating another row — but only into a
+        // memory of equal or higher authority. A user-confirmed claim whose
+        // text an earlier assistant answer happened to contain used to be
+        // folded into that model-derived row and kept its low authority; it
+        // now gets its own row (and the reconcile job may supersede the
+        // weaker one).
+        let draft_authority_rank = authority_rank(
+            draft.metadata.get("authorityClass").and_then(Value::as_str),
+        );
         if !claim_key.is_empty() {
             let normalised = draft
                 .content
@@ -3788,6 +3809,16 @@ async fn derive_and_persist_session_memories(
                     and type::text = $2
                     and metadata->>'claimKey' = $3
                     and lower(btrim(regexp_replace(content, '\s+', ' ', 'g'))) = $4
+                    -- same ranks as chum_mem_pipeline::authority_rank
+                    and (case metadata->>'authorityClass'
+                           when 'repository' then 6
+                           when 'user_confirmed' then 5
+                           when 'test_verified' then 4
+                           when 'tool_verified' then 4
+                           when 'session_derived' then 2
+                           when 'model_derived' then 1
+                           else 3
+                         end) >= $7
                   order by created_at asc
                   limit 1
                 )
@@ -3800,6 +3831,7 @@ async fn derive_and_persist_session_memories(
             .bind(&normalised)
             .bind(session_id.to_string())
             .bind(source_time.as_deref())
+            .bind(draft_authority_rank)
             .fetch_optional(&mut **tx)
             .await
             .map_err(DbError::from)?;

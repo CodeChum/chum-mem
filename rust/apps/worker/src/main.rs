@@ -1310,10 +1310,18 @@ async fn settle_success(
     apply_repository_context(&mut *tx, &scoped)
         .await
         .map_err(|error| error.to_string())?;
-    complete_worker_job(&mut tx, job)
+    let rerun = complete_worker_job(&mut tx, job)
         .await
         .map_err(|error| error.to_string())?;
-    tx.commit().await.map_err(|error| error.to_string())
+    tx.commit().await.map_err(|error| error.to_string())?;
+    if rerun {
+        info!(
+            job_id = %job.id,
+            job_type = %job.job_type,
+            "job was re-enqueued while running; queued again instead of completed"
+        );
+    }
+    Ok(())
 }
 
 async fn settle_failure(
