@@ -117,7 +117,8 @@ shows `/ready`; in Claude Code `/mcp` shows `chum-memory` connected. Then, in
 one session, type `Decision: for the chum-mem setup check I am using <your
 name> as the test value.` and end the session; start a new session in the same
 checkout and ask `did anyone decide what test value to use for the chum-mem
-setup check?` The answer should quote the decision and name your git
+setup check?` Claude should call `mem_search` (session memory is searched on
+demand, not attached to the prompt) and quote the decision and name your git
 `user.email`. If it does not, the session was not stored: see the
 troubleshooting list below.
 Identity is your git `user.email` in that checkout.
@@ -148,23 +149,39 @@ this, because your sessions will stop showing up for everyone else.
 
 If the tunnel is slow (several sessions share it), the hooks' health gate can be
 widened per repo with `"healthTimeoutSecs": 8` in `.chum-mem` (default 5 s); a
-tripped gate spools the whole turn instead of sending it live.
+tripped gate spools the whole turn instead of sending it live. A successful
+health check is reused for 60 s (`.chum-cache/.health-ok`; any failed API call
+deletes it), so most hooks skip that round-trip; `CHUM_HEALTH_CACHE_SECS=0`
+checks on every hook.
 
-Auto-recall (the block added to every prompt) has two parts, fetched in
-parallel under one timeout (`CHUM_AUTO_RECALL_TIMEOUT_SECS`, default 6 s, output
-capped at 3,000 chars):
-- **Team memory**: up to 5 session-memory hits from a pool of 20. A hit needs 2
+Auto-recall (the block added to every prompt) attaches **repository docs only**
+by default (owner decision 2026-10-11: session memory as an automatic
+attachment proved noisy and once injected an outdated rule). Session memory is
+still captured and searchable on demand: the SessionStart context tells Claude
+to call the chum-memory MCP tool `mem_search` when a task may have history, and
+you can ask for it ("check team memory for …"). The calls run in parallel under
+one timeout (`CHUM_AUTO_RECALL_TIMEOUT_SECS`, default 6 s, output capped at
+3,000 chars):
+- **Team docs** (always): the top 3 repository-layer documents for the prompt as
+  `[doc] <path>` lines (the same search as `knowledge_query(layer:repository)`).
+  A doc is kept when its path or section heading shares 2 content words with
+  the prompt (words of 3+ letters; `analytics.gradechum.com` or
+  `upload-questionnaire` also count as their parts). In the 2026-10-09 recall
+  review this layer answered 6/15 real questions at rank 1 where session memory
+  answered 1/15. `CHUM_AUTO_RECALL_DOCS=0` turns it off.
+- **Team memory** (off by default; `CHUM_AUTO_RECALL_SESSIONS=1` in the
+  environment, or `"autoRecallSessions": true` in `.chum-mem` for the whole
+  repo; the env value wins, so `CHUM_AUTO_RECALL_SESSIONS=0` opts one engineer
+  out again): up to 5 session-memory hits from a pool of 20. A hit needs 2
   content words in common with the prompt (1 if the prompt has only one) AND
   semantic similarity >= 0.8, a lexical match, or 30% of the prompt's content
   words. `implementation_detail` hits and hits whose title is a shell command,
   a `X=/path` assignment or a bare path are dropped. A hit whose title repeats
   your own question is dropped too (every prompt is also stored as an "open
-  question" memory). Knobs: `CHUM_AUTO_RECALL_LIMIT`, `CHUM_AUTO_RECALL_POOL`,
+  question" memory). A claim mined from Claude's reply is shown as
+  `[type, from Claude's reply] … (in a session of <email>)`, not as the
+  engineer's own words. Knobs: `CHUM_AUTO_RECALL_LIMIT`, `CHUM_AUTO_RECALL_POOL`,
   `CHUM_AUTO_RECALL_MIN_SEMANTIC`.
-- **Team docs**: the top 3 repository-layer documents for the prompt as
-  `[doc] <path>` lines (the same search as `knowledge_query(layer:repository)`).
-  In the 2026-10-09 recall review this layer answered 6/15 real questions at
-  rank 1 where session memory answered 1/15. `CHUM_AUTO_RECALL_DOCS=0` turns it off.
 
 When the hooks cannot capture (API unreachable or too slow, token rejected), a
 one-line warning appears in your terminal at most once every 10 minutes per
@@ -197,10 +214,11 @@ cd "$HOME"                                  # run the nested claude outside the 
 
 What you will notice day to day: each prompt waits about 1–2 s for the hooks
 on an idle server (4–8 s when the server or tunnel is busy), each tool call
-about 0.25 s, and the reply stays on screen while the Stop hook finishes. The
-"Team memory" block is often filled with shell commands and paths from recent
-sessions rather than decisions; it is only useful when someone recorded a
-decision or fix in words ("Decision: …", "Fixed: …").
+about 0.25 s, and the reply stays on screen while the Stop hook finishes. With
+session recall switched on, the "Team memory" block is often filled with shell
+commands and paths from recent sessions rather than decisions; it is only
+useful when someone recorded a decision or fix in words ("Decision: …",
+"Fixed: …"). That is why it is off by default.
 
 Token auth is **on** (`CHUM_MEM_API_TOKENS` in the VM's `.env`; one shared team
 token for the pilot, comma-separated list for more). Rotate by editing `.env`
@@ -262,10 +280,12 @@ responsibility.
 
 ## What you get, and what you do not (yet)
 
-- Every prompt is auto-searched against team memory; hits are injected with
-  author, time and session (FINDINGS F29). Decisions, fixes and open questions
-  from any engineer's sessions are findable within seconds of their session
-  ending (F20, F28).
+- Every prompt is auto-searched against the repository docs and matching doc
+  paths are attached. Team session memory is searched on demand through the
+  `mem_search` MCP tool (auto-attach is opt-in, see the auto-recall section);
+  hits carry author, time and session (FINDINGS F29). Decisions, fixes and open
+  questions from any engineer's sessions are findable within seconds of their
+  session ending (F20, F28).
 - Repository docs (CLAUDE files, rules, notes) are searchable; the code graph of
   the monorepo is **not** indexed until F8 is fixed server-side.
 - Transcripts are stored raw with no redaction (team decision); the server's

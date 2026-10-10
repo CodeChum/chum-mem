@@ -103,19 +103,53 @@ session_start_payload() {
     )'
 }
 
+# Spool and quarantine files are appended to by parallel hooks: Claude Code runs
+# the PostToolUse hooks of parallel tool calls concurrently, and jq writes a long
+# line in several write() calls. With a plain `>>`, 3 parallel 20 KB events left
+# 2-3 of 3 lines corrupt (review 2, 2026-10-10) and the replayer parks corrupt
+# lines for good. Lines are staged in a private file and appended under a mkdir
+# lock (portable to bash 3.2, no flock on macOS). A lock older than a minute
+# (writer killed at the hook timeout) is broken; after ~10 s of waiting the line
+# is appended anyway rather than lost.
+lock_file() {  # $1 file -> 0 when its lock is held (1 = gave up waiting)
+  local lock="$1.lock" i=0
+  while ! mkdir "$lock" 2>/dev/null; do
+    i=$((i + 1))
+    if [[ $((i % 20)) -eq 0 && -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+      rmdir "$lock" 2>/dev/null || true
+    fi
+    [[ "$i" -lt 100 ]] || return 1
+    sleep 0.1
+  done
+  return 0
+}
+unlock_file() { rmdir "$1.lock" 2>/dev/null || true; }
+append_line() {  # $1 file; stdin: the line(s) to append
+  local f="$1" part="$1.part.$$" rc=0 locked=0
+  cat > "$part" || { rm -f "$part"; return 1; }
+  if lock_file "$f"; then locked=1; fi
+  cat "$part" >> "$f" || rc=$?
+  [[ "$locked" -eq 0 ]] || unlock_file "$f"
+  rm -f "$part"
+  return "$rc"
+}
+
 # Large bodies (a tool output can be hundreds of KB) go to jq and curl through
 # stdin, never as an argument: argv is capped at 1 MB on macOS and a single
 # argument at 128 KB on Linux ("Argument list too long" lost the event).
 spool_line() {  # $1 kind (event|end), $2 body json
   printf '%s' "$2" | jq -c --arg kind "$1" --arg ext "$AGENT_SESSION_ID" \
     --argjson start "$(session_start_payload)" --arg api "$API_URL" \
-    '{kind:$kind, ext:$ext, api:$api, start:$start, body:.}' >> "$OUTBOX"
+    '{kind:$kind, ext:$ext, api:$api, start:$start, body:.}' | append_line "$OUTBOX"
 }
 
 flush_one() {
-  local f="$1" tmp="$1.flushing.$$" line kind body start sid code ep api sent=0 total
+  local f="$1" tmp="$1.flushing.$$" line kind body start sid code ep api sent=0 total locked=0
   [[ -s "$f" ]] || { rm -f "$f"; return 0; }
-  mv "$f" "$tmp" || return 0
+  # Take the file under its append lock, so no writer is half-way through a line.
+  if lock_file "$f"; then locked=1; fi
+  mv "$f" "$tmp" || { [[ "$locked" -eq 0 ]] || unlock_file "$f"; return 0; }
+  [[ "$locked" -eq 0 ]] || unlock_file "$f"
   total=$(grep -c . "$tmp" || true)
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
@@ -143,8 +177,12 @@ flush_one() {
     sent=$((sent + 1))
   done < "$tmp"
   if [[ "$sent" -lt "$total" ]]; then
-    { grep . "$tmp" | tail -n +$((sent + 1)); [[ -s "$f" ]] && cat "$f"; } > "${f}.new"
+    # Unsent lines go back in front of anything spooled meanwhile, under the
+    # append lock so a line appended between the read and the mv is not lost.
+    locked=0; if lock_file "$f"; then locked=1; fi
+    { grep . "$tmp" | tail -n +$((sent + 1)); [[ ! -s "$f" ]] || cat "$f"; } > "${f}.new"
     mv "${f}.new" "$f"
+    [[ "$locked" -eq 0 ]] || unlock_file "$f"
     echo "session-sync: WARN outbox $(basename "$f"): replayed ${sent}/${total}, rest kept" >&2
     note_replay_failure "$f"
   else
@@ -166,8 +204,8 @@ note_replay_failure() {  # $1 outbox file
   n=$(( ${n:-0} + 1 )); first="${first:-$now}"
   if [[ "$n" -ge "${CHUM_SPOOL_MAX_REPLAYS:-50}" || $(( now - first )) -ge 604800 ]]; then
     mkdir -p "$QUARANTINE_DIR"
-    jq -c --arg at "$(date -u +%FT%TZ)" '. + {matched:"stale-spool", at:$at}' "$f" \
-      >> "$QUARANTINE_DIR/$(basename "$f")" 2>/dev/null && rm -f "$f" "$fails"
+    jq -c --arg at "$(date -u +%FT%TZ)" '. + {matched:"stale-spool", at:$at}' "$f" 2>/dev/null \
+      | append_line "$QUARANTINE_DIR/$(basename "$f")" && rm -f "$f" "$fails"
     printf 'chum-mem: spooled events in %s could not be delivered after %s attempts (target %s). They are held in .chum-cache/quarantine/: run /chum-quarantine list, then send or drop.' \
       "$(basename "$f")" "$n" "$(head -n 1 "$QUARANTINE_DIR/$(basename "$f")" | jq -r '.api // "?"' 2>/dev/null)" > "$QUARANTINE_DIR/.notice.global"
     echo "session-sync: WARN outbox $(basename "$f") moved to quarantine after ${n} failed replays" >&2
@@ -223,7 +261,7 @@ quarantine_line() {  # $1 kind (event|end), $2 body json, $3 matched names, $4 w
   printf '%s' "$2" | jq -c --arg kind "$1" --arg ext "$AGENT_SESSION_ID" --arg api "$API_URL" --arg matched "$3" \
     --arg at "$(date -u +%FT%TZ)" --argjson start "$(session_start_payload)" \
     '{kind:$kind, ext:$ext, api:$api, matched:$matched, at:$at, start:$start, body:.}' \
-    >> "$QUARANTINE_DIR/${PROVIDER}-${AGENT_SESSION_ID}.jsonl"
+    | append_line "$QUARANTINE_DIR/${PROVIDER}-${AGENT_SESSION_ID}.jsonl"
   # The notice is per agent session: with parallel sessions in one checkout a
   # shared file would surface session A's warning in session B's terminal.
   printf 'chum-mem: NOT sent to team memory — secret-shaped content (%s) found in your %s. It is held locally in .chum-cache/quarantine/. Run /chum-quarantine list to review, send to store it anyway, drop to discard. Held items are never sent on their own.' \
@@ -302,12 +340,37 @@ ensure_session_started() {
   if [[ "$http_code" != "200" && "$http_code" != "201" ]]; then
     local body
     body=$(cat /tmp/chum-session-start-resp.$$.json 2>/dev/null || echo "")
-    echo "session-sync: ERROR session_start returned HTTP ${http_code}: ${body}" >&2
     rm -f /tmp/chum-session-start-resp.$$.json
+    if spoolable_code "$http_code" "session_start"; then
+      CHUM_SPOOL_ONLY=1
+      printf '{"sessionId":"DEFERRED","deferredStart":true}\n' > "$SESSION_STATE_FILE"
+      return 0
+    fi
+    echo "session-sync: ERROR session_start returned HTTP ${http_code}: ${body}" >&2
     exit 1
   fi
 
   mv /tmp/chum-session-start-resp.$$.json "$SESSION_STATE_FILE"
+}
+
+# A transient server answer must not lose the event. 5xx (database restarting,
+# pool exhausted), 429 and 408 used to `exit 1` here and the prompt/tool
+# output/reply was gone (review 2: a 503 on session/event dropped the prompt and
+# the reply, and the Stop hook died before session/end). A 401/403 (token not
+# set up yet, or rotated) is spooled too, so the turn replays once the token is
+# fixed; it is still reported as an ERROR at the end so the user sees the notice.
+AUTH_FAILED_CODE=""
+spoolable_code() {  # $1 http code, $2 call name -> 0 when the caller should spool
+  case "$1" in
+    5??|429|408)
+      echo "session-sync: WARN $2 returned HTTP $1 — server busy or restarting; spooling" >&2
+      return 0 ;;
+    401|403)
+      echo "session-sync: WARN $2 returned HTTP $1 — token rejected; spooling until it is fixed" >&2
+      AUTH_FAILED_CODE="$1"
+      return 0 ;;
+  esac
+  return 1
 }
 
 # ── Helper: POST session_event_append ──────────────────────────────────────
@@ -397,8 +460,12 @@ post_event() {
   if [[ "$http_code" != "200" && "$http_code" != "201" && "$http_code" != "202" ]]; then
     local body
     body=$(cat /tmp/chum-session-event-resp.$$.json 2>/dev/null || echo "")
-    echo "session-sync: ERROR session_event_append returned HTTP ${http_code}: ${body}" >&2
     rm -f /tmp/chum-session-event-resp.$$.json
+    if spoolable_code "$http_code" "session_event_append"; then
+      spool_line event "$full_payload"
+      return 0
+    fi
+    echo "session-sync: ERROR session_event_append returned HTTP ${http_code}: ${body}" >&2
     exit 1
   fi
   rm -f /tmp/chum-session-event-resp.$$.json
@@ -463,8 +530,13 @@ end_session() {
   if [[ "$http_code" != "200" && "$http_code" != "201" && "$http_code" != "202" ]]; then
     local body
     body=$(cat /tmp/chum-session-end-resp.$$.json 2>/dev/null || echo "")
-    echo "session-sync: ERROR session_end returned HTTP ${http_code}: ${body}" >&2
     rm -f /tmp/chum-session-end-resp.$$.json
+    if spoolable_code "$http_code" "session_end"; then
+      spool_line end "$payload"
+      rm -f "$SESSION_STATE_FILE"
+      return 0
+    fi
+    echo "session-sync: ERROR session_end returned HTTP ${http_code}: ${body}" >&2
     exit 1
   fi
   rm -f /tmp/chum-session-end-resp.$$.json
@@ -570,3 +642,11 @@ case "$HOOK_EVENT" in
     echo "session-sync: unknown hook event '${HOOK_EVENT}', skipping" >&2
     ;;
 esac
+
+# A rejected token spooled the turn above; still fail so hook-dispatch shows the
+# "NOT being captured ... HTTP 401 = run install-tunnel-agent.sh token" notice.
+if [[ -n "$AUTH_FAILED_CODE" ]]; then
+  echo "session-sync: ERROR HTTP ${AUTH_FAILED_CODE} from ${API_URL} (token missing or wrong); this turn is spooled in .chum-cache/outbox/ and replays once the token works" >&2
+  exit 1
+fi
+exit 0
