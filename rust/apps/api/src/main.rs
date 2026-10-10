@@ -50,6 +50,7 @@ use chum_mem_pipeline::{
     RepositoryFilePayload, SearchMetrics, SessionEventRecord, TurboVecScope, TurboVecStore,
     VectorSearchResult, build_context_pack, build_session_completion_job_plan,
     community_relevance_from_query, compile_minimal_proof_set, derive_memories_from_session,
+    memory_source_time,
     derive_session_episodes, embed_text, event_text, generate_knowledge_report,
     memory_community_map, merge_graphs, merge_hybrid_results, progressive_disclosure,
     project_graph_for_dashboard, query_chroma_memories_typed, rank_hybrid_results,
@@ -3749,6 +3750,10 @@ async fn derive_and_persist_session_memories(
             continue;
         }
 
+        // D6: the time of the event this draft came from (capped at now() in
+        // SQL); used for a new memory's created_at and a duplicate's lastSeenAt.
+        let source_time = memory_source_time(&draft, &records);
+
         // Cross-session dedupe (recall review: one prompt sentence existed as
         // 1,121 active fix memories). If the project already holds an active
         // memory with the same type, claim key and normalised content, record
@@ -3765,7 +3770,14 @@ async fn derive_and_persist_session_memories(
                 update public.memories
                 set metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object(
                   'seenCount', coalesce((metadata->>'seenCount')::int, 1) + 1,
-                  'lastSeenAt', now(),
+                  -- The source event's time (capped at now()), not the time
+                  -- the session was processed; never moves backwards when an
+                  -- older session is imported after a newer one.
+                  'lastSeenAt', greatest(
+                    case when metadata->>'lastSeenAt' ~ '^\d{4}-\d{2}-\d{2}'
+                         then (metadata->>'lastSeenAt')::timestamptz end,
+                    least(coalesce($6::timestamptz, now()), now())
+                  ),
                   'lastSeenSessionId', $5::text
                 )
                 where id = (
@@ -3786,6 +3798,7 @@ async fn derive_and_persist_session_memories(
             .bind(&claim_key)
             .bind(&normalised)
             .bind(session_id.to_string())
+            .bind(source_time.as_deref())
             .fetch_optional(&mut **tx)
             .await
             .map_err(DbError::from)?;
@@ -3827,6 +3840,7 @@ async fn derive_and_persist_session_memories(
                 importance_score: draft.importance_score,
                 confidence_score: draft.confidence_score,
                 metadata: metadata_value.clone(),
+                source_time,
             },
         )
         .await?;
@@ -4841,7 +4855,10 @@ fn map_session_event_record(row: &SessionEventRow) -> SessionEventRecord {
         id: row.id,
         event_type: parse_canonical_event_type(&row.event_type),
         payload: serde_json::from_value(row.payload.clone()).unwrap_or_default(),
-        created_at: format_time(row.created_at),
+        // The pipeline treats this as the event's own time (episode bounds,
+        // graph `eventTime`, memory dating — D6), so use event_time: for an
+        // imported session the row's created_at is the import time.
+        created_at: format_time(row.event_time),
     }
 }
 
