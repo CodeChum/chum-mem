@@ -1675,6 +1675,35 @@ fn should_start_new_episode(
     current_events.len() >= 8 || gap_minutes > 15.0
 }
 
+/// Earliest and latest event time of an episode. Events arrive in receive
+/// order, but `created_at` here is the client's event time (D6): parallel
+/// PostToolUse hooks, or a spooled event replayed after later live ones, put
+/// an older event after a newer one. Taking the first/last event then gave
+/// `ended_at < started_at`, the `session_episodes_check` constraint failed,
+/// and session/end returned 500 on every retry (the session never derived).
+/// Unparseable times fall back to the first/last event's raw value.
+fn episode_bounds(events: &[SessionEventRecord]) -> (Option<String>, Option<String>) {
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+    let parsed: Vec<(OffsetDateTime, &String)> = events
+        .iter()
+        .filter_map(|event| {
+            OffsetDateTime::parse(&event.created_at, &Rfc3339)
+                .ok()
+                .map(|at| (at, &event.created_at))
+        })
+        .collect();
+    if parsed.is_empty() {
+        return (
+            events.first().map(|event| event.created_at.clone()),
+            events.last().map(|event| event.created_at.clone()),
+        );
+    }
+    let start = parsed.iter().min_by_key(|(at, _)| *at).map(|(_, raw)| (*raw).clone());
+    let end = parsed.iter().max_by_key(|(at, _)| *at).map(|(_, raw)| (*raw).clone());
+    (start, end)
+}
+
 fn materialize_episode(session_id: Uuid, bucket: &EpisodeBucket) -> SessionEpisodeDraft {
     let texts = bucket
         .events
@@ -1694,21 +1723,15 @@ fn materialize_episode(session_id: Uuid, bucket: &EpisodeBucket) -> SessionEpiso
         truncate(first_text, 80)
     );
 
+    let (started_at, ended_at) = episode_bounds(&bucket.events);
+
     SessionEpisodeDraft {
         episode_ordinal: bucket.episode_ordinal,
         episode_type: bucket.episode_type.clone(),
         title,
         summary,
-        started_at: bucket
-            .events
-            .first()
-            .map(|event| event.created_at.clone())
-            .unwrap_or_else(now_rfc3339),
-        ended_at: bucket
-            .events
-            .last()
-            .map(|event| event.created_at.clone())
-            .unwrap_or_else(now_rfc3339),
+        started_at: started_at.unwrap_or_else(now_rfc3339),
+        ended_at: ended_at.unwrap_or_else(now_rfc3339),
         provenance_event_ids: bucket.events.iter().map(|event| event.id).collect(),
         metadata: {
             use indexmap::IndexSet;
@@ -1837,6 +1860,43 @@ fn now_rfc3339() -> String {
 mod tests {
     use super::*;
     use chum_mem_contracts::{CanonicalEventType, EndSessionRequest, SessionEventPayload};
+
+    // Review 3: parallel tool hooks post out of event-time order; the
+    // episode must still satisfy ended_at >= started_at.
+    #[test]
+    fn episode_bounds_hold_when_events_arrive_out_of_time_order() {
+        let session_id = Uuid::nil();
+        let tool = |id: u128, at: &str| SessionEventRecord {
+            id: Uuid::from_u128(id),
+            event_type: CanonicalEventType::ToolResult,
+            payload: SessionEventPayload {
+                tool_name: Some("Bash".to_string()),
+                message: Some("Bash".to_string()),
+                ..SessionEventPayload::default()
+            },
+            created_at: at.to_string(),
+        };
+        // Receive order: the small output first, the earlier-started big one second.
+        let events = vec![
+            tool(10, "2026-10-11T02:00:05.250Z"),
+            tool(11, "2026-10-11T02:00:05.100Z"),
+        ];
+        let end_request = EndSessionRequest {
+            session_id,
+            summary: None,
+            metadata: json!({}),
+            defer: None,
+        };
+        let episodes = derive_session_episodes(session_id, "claude", &end_request, &events);
+        assert_eq!(episodes.len(), 1);
+        let parse = |raw: &str| {
+            time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        assert!(parse(&episodes[0].ended_at) >= parse(&episodes[0].started_at));
+        assert_eq!(episodes[0].started_at, "2026-10-11T02:00:05.100Z");
+        assert_eq!(episodes[0].ended_at, "2026-10-11T02:00:05.250Z");
+    }
 
     #[test]
     fn derives_atomic_bug_claim_for_debugging_session() {
