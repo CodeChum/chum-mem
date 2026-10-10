@@ -242,7 +242,23 @@ test_docs_only_default() {
     '[[ "$ctx" == *"NOT attached automatically: it is searchable on demand"*"mem_search for session memory"* ]]'
 }
 
-ALL="concurrent_append fence_forgery tokenizer deferred_start_replay health_cache docs_only_default"
+# ── R3: `chum-quarantine.sh list` never prints a held private key's body ──
+test_quarantine_list_masks_key_body() {
+  echo "quarantine_list_masks_key_body"
+  local r pem out
+  r=$(mkrepo qmask)
+  # Made-up key material, not a real key.
+  pem=$'-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAr3fakeBODYfakeBODYfakeBODYfakeBODYfakeBODYfakeBODYfakeBODY0123456789\nr3fakeTAILfakeTAILfakeTAILfakeTAILfakeTAIL==\n-----END RSA PRIVATE KEY-----'
+  payload PostToolUse qmask "$r" "$(jq -cn --arg k "$pem" '{tool_name:"Read", tool_input:{file_path:"id_rsa"}, tool_response:{file:{content:$k}}}')" \
+    | env -i PATH="$PATH" HOME="$TMP/home" CHUM_SPOOL_ONLY=1 CHUM_MEM_PROJECT_ID="$PID_FAKE" \
+        CHUM_MEMORY_API_URL=http://127.0.0.1:9 CLAUDE_PROJECT_DIR="$r" "$BASH_BIN" "$SCRIPTS/session-sync.sh" 2>/dev/null
+  check "the key was held" '[[ -s "$r/.chum-cache/quarantine/claude-qmask.jsonl" ]]'
+  out=$(env -i PATH="$PATH" HOME="$TMP/home" CLAUDE_PROJECT_DIR="$r" "$BASH_BIN" "$SCRIPTS/chum-quarantine.sh" list 2>&1)
+  check "list shows the held item" '[[ "$out" == *"[private-key]"* ]]'
+  check "list prints no part of the key body" '[[ "$out" != *"MIIEow"* && "$out" != *"fakeBODY"* && "$out" != *"fakeTAIL"* ]]'
+}
+
+ALL="concurrent_append fence_forgery tokenizer deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body"
 for t in ${*:-$ALL}; do "test_$t"; done
 echo "passed $PASS, failed $FAIL, skipped $SKIP  (scratch: $TMP)"
 [[ "$FAIL" -eq 0 ]]

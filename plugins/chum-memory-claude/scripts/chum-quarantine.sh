@@ -26,15 +26,22 @@ if [[ ${#files[@]} -eq 0 ]]; then echo "chum-quarantine: nothing held${WHO:+ for
 
 mask() { # replace every matched secret with *** so a listing never prints one
   local text="$1" line name flags re d=$'\001'
+  # The private-key rule matches only the BEGIN line, so the key body after it
+  # was printed (review 3), and the /chum-quarantine skill runs this inside
+  # Claude, where the PostToolUse hook would then send that body (no header
+  # left to match) to team memory. Hide everything from a PEM header on first.
+  text=$(printf '%s' "$text" | sed -E 's/-----BEGIN [A-Z ]*PRIVATE KEY-----.*/*** [private key hidden]/' 2>/dev/null || printf '***')
   # The substitution is delimited by \001, not "/": several rules contain "/"
   # (postgres://user:pw@, hooks.slack.com/services/) and with "/" sed rejected
   # the command, the fallback printed the text UNMASKED, and `list` showed the
   # password it was supposed to hide.
   while IFS='|' read -r name flags re; do
     [[ -z "$name" || "$name" == \#* || -z "$re" ]] && continue
-    if [[ "$flags" == *i* ]]; then text=$(printf '%s' "$text" | sed -E "s${d}${re}${d}***${d}Ig" 2>/dev/null || printf '%s' "$text")
-    else text=$(printf '%s' "$text" | sed -E "s${d}${re}${d}***${d}g" 2>/dev/null || printf '%s' "$text"); fi
+    if [[ "$flags" == *i* ]]; then text=$(printf '%s' "$text" | sed -E "s${d}${re}${d}***${d}Ig" 2>/dev/null || printf '***')
+    else text=$(printf '%s' "$text" | sed -E "s${d}${re}${d}***${d}g" 2>/dev/null || printf '***'); fi
   done < <(cat "$SCRIPTS_DIR/sensitive-patterns.txt" "$PROJECT_DIR/.chum-sensitive-patterns" 2>/dev/null)
+  # Long opaque token runs the rules have no shape for are hidden too.
+  text=$(printf '%s' "$text" | sed -E 's/[A-Za-z0-9+\/=_-]{40,}/***/g' 2>/dev/null || printf '***')
   printf '%s' "$text"
 }
 
