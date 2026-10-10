@@ -1522,7 +1522,8 @@ async fn perform_project_resolve(
     }
 
     let project_id = input.project_id.unwrap_or_else(Uuid::new_v4);
-    let slug = format!("project-{}", &project_id.simple().to_string()[..12]);
+    // Full id: a 12-hex prefix let two projects collide on (team_id, slug).
+    let slug = format!("project-{}", project_id.simple());
     sqlx::query(
         r#"
         insert into public.projects (id, organization_id, team_id, name, slug)

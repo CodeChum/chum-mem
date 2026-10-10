@@ -403,8 +403,10 @@ pub async fn upsert_ingested_project(
     project_id: Uuid,
     branch: Option<&str>,
 ) -> Result<(), DbError> {
+    // Full id: the old 8-hex prefix made a second project sharing it hit the
+    // (team_id, slug) conflict, skip this insert and fail later with a 500.
     let slug = format!("project-{}", project_id.simple());
-    let slug = &slug[..16.min(slug.len())];
+    let slug = slug.as_str();
     // Insert with bare ON CONFLICT DO NOTHING to handle both (id) and
     // (team_id, slug) constraints without aborting the transaction.
     sqlx::query(
