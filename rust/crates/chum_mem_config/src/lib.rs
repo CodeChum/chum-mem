@@ -66,6 +66,15 @@ pub struct AppConfig {
     pub team_role: TeamRole,
     /// Shared API tokens (CHUM_MEM_API_TOKENS, comma-separated). Empty = auth disabled.
     pub api_tokens: Vec<String>,
+    /// Admin tokens (CHUM_MEM_ADMIN_TOKENS, comma-separated). When set, the
+    /// destructive endpoints (`/api/admin/*`, `/v1/ingest/bulk/*`, and a
+    /// repository sync with `mergeWithExisting=false`) require one of these
+    /// instead of a plain API token. Empty = those endpoints accept any API token.
+    pub admin_tokens: Vec<String>,
+    /// Browser origins allowed by CORS (CHUM_MEM_CORS_ORIGINS, comma-separated).
+    /// Empty = no cross-origin access (the dashboard proxies server-side and the
+    /// hooks/MCP client are not browsers, so nothing needs it by default).
+    pub cors_origins: Vec<String>,
     pub worker_poll_interval_ms: u64,
     pub worker_concurrency: usize,
     pub knowledge_graph_max_cluster_nodes: u32,
@@ -134,14 +143,9 @@ impl AppConfig {
             user_id: optional_parse(values, "CHUM_MEM_USER_ID")?,
             actor_type: parse_or_default(values, "CHUM_MEM_ACTOR_TYPE", ActorType::System)?,
             team_role: parse_or_default(values, "CHUM_MEM_TEAM_ROLE", TeamRole::Admin)?,
-            api_tokens: optional(values, "CHUM_MEM_API_TOKENS")
-                .map(|raw| {
-                    raw.split(',')
-                        .map(|token| token.trim().to_string())
-                        .filter(|token| !token.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default(),
+            api_tokens: csv_list(values, "CHUM_MEM_API_TOKENS"),
+            admin_tokens: csv_list(values, "CHUM_MEM_ADMIN_TOKENS"),
+            cors_origins: csv_list(values, "CHUM_MEM_CORS_ORIGINS"),
             worker_poll_interval_ms: parse_or_default(values, "WORKER_POLL_INTERVAL_MS", 5_000u64)?,
             worker_concurrency: parse_or_default(values, "WORKER_CONCURRENCY", 4usize)?,
             knowledge_graph_max_cluster_nodes: parse_or_default(
@@ -207,6 +211,18 @@ fn required(values: &HashMap<String, String>, key: &'static str) -> Result<Strin
         .cloned()
         .filter(|value| !value.trim().is_empty())
         .ok_or(ConfigError::Missing(key))
+}
+
+/// Comma-separated list env var → trimmed, non-empty entries (missing = empty).
+fn csv_list(values: &HashMap<String, String>, key: &'static str) -> Vec<String> {
+    optional(values, key)
+        .map(|raw| {
+            raw.split(',')
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn optional(values: &HashMap<String, String>, key: &'static str) -> Option<String> {

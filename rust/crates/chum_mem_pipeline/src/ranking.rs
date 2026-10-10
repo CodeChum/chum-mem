@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chum_mem_contracts::{
     AuthorityClass, DisclosureLevel, MemoryType, ProofHandle, ProofType, ProvenanceHandle,
@@ -282,6 +282,59 @@ pub fn progressive_disclosure(
     }
 }
 
+/// Score multiplier for implementation details, open questions and
+/// shell-shaped titles.
+pub const LOW_VALUE_SCORE_FACTOR: f64 = 0.3;
+/// Recency term cap relative to the rest of the score (0.25 => 20% share).
+const RECENCY_MAX_SHARE_FACTOR: f64 = 0.25;
+/// Minimum semantic score (1 / (1 + distance)) for a hit with weak lexical
+/// overlap to be returned by search.
+pub const MIN_SEMANTIC_RELEVANCE: f64 = 0.75;
+
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "are", "was", "were", "with", "that", "this", "what", "which", "who",
+    "whom", "how", "why", "when", "where", "does", "did", "has", "have", "had", "can", "could",
+    "should", "would", "will", "our", "your", "you", "they", "them", "from", "into", "about",
+    "any", "anyone", "is", "not", "but", "use", "using", "used", "get", "got", "now", "there",
+    "their", "its", "it's", "we", "us", "all", "out", "one", "also", "just", "than", "then",
+    "been", "being", "some", "more", "most", "other", "such", "only", "own", "same", "too",
+    "very", "let", "lets", "let's", "please", "tell", "know", "need", "want", "make",
+];
+
+fn content_words(text: &str) -> HashSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+        .map(|token| token.trim_matches('-'))
+        .filter(|token| token.chars().count() >= 3 && !STOPWORDS.contains(token))
+        .map(|token| token.strip_suffix('s').filter(|t| t.len() >= 3).unwrap_or(token).to_string())
+        .collect()
+}
+
+/// Number of the query's content words present in the hit's title/summary.
+pub fn lexical_content_overlap(query: &str, hit: &RankedMemory) -> usize {
+    let wanted = content_words(query);
+    if wanted.is_empty() {
+        return 0;
+    }
+    let have = content_words(&format!("{} {}", hit.title, hit.summary));
+    wanted.intersection(&have).count()
+}
+
+/// Relevance floor for search results (recall review): keep a hit when its
+/// semantic score is at least `MIN_SEMANTIC_RELEVANCE`, or its text shares at
+/// least two of the query's content words (one, for a one-word query), or it
+/// belongs to the caller's own session. An empty query keeps everything.
+pub fn passes_relevance_floor(query: &str, hit: &RankedMemory) -> bool {
+    let query_words = content_words(query).len();
+    if query_words == 0 || hit.exact_session_match == Some(true) {
+        return true;
+    }
+    if hit.semantic_score.unwrap_or(0.0) >= MIN_SEMANTIC_RELEVANCE {
+        return true;
+    }
+    lexical_content_overlap(query, hit) >= query_words.min(2)
+}
+
 fn with_ranking_signals(mut hit: RankedMemory, context: &RankingContext) -> RankedMemory {
     let source_class = hit
         .source_class
@@ -342,6 +395,13 @@ fn with_ranking_signals(mut hit: RankedMemory, context: &RankingContext) -> Rank
     let semantic = normalize_score(hit.semantic_score.unwrap_or(0.0));
     let source_prior = source_prior(&hit, &source_class, context);
 
+    // Review 2026-10-09 (F36/F40, recall review): implementation details are
+    // mostly shell commands and paths, open questions are mostly the asker's
+    // own words, and shell-shaped titles match many prompts on one token.
+    // They stay findable but rank at 0.3x.
+    let low_value = matches!(source_class.as_str(), "implementation_detail" | "open_question")
+        || is_path_heavy(&hit.title);
+
     // v2.2.2: Type-fit boost — when caller requests specific claim types,
     // boost matching types and penalize non-matching.
     let type_fit_boost = if !context.requested_types.is_empty() {
@@ -399,11 +459,10 @@ fn with_ranking_signals(mut hit: RankedMemory, context: &RankingContext) -> Rank
         _ => 0.0,
     };
 
-    let score = lexical * 0.32
+    let base_score = lexical * 0.32
         + semantic * 0.30
         + normalize_score(session_relevance_score) * 0.12
         + normalize_score(graph_proximity_score) * 0.10
-        + normalize_score(recency_score) * 0.08
         + normalize_score(hit.importance_score.unwrap_or(0.0)) * 0.08
         + normalize_score(hit.confidence_score.unwrap_or(0.0)) * 0.06
         + source_prior
@@ -417,6 +476,14 @@ fn with_ranking_signals(mut hit: RankedMemory, context: &RankingContext) -> Rank
         - normalize_score(superseded_penalty) * 0.10
         - conflict_penalty
         + if exact_session_match { 0.5 } else { 0.0 };
+    // Recency may contribute at most 20% of the final score (r <= 0.25 * base
+    // <=> r <= 0.2 * (base + r)): with no relevance, "newest" must not win.
+    let recency_term =
+        (normalize_score(recency_score) * 0.08).min(RECENCY_MAX_SHARE_FACTOR * base_score.max(0.0));
+    let mut score = base_score + recency_term;
+    if low_value && score > 0.0 {
+        score *= LOW_VALUE_SCORE_FACTOR;
+    }
 
     hit.exact_session_match = Some(exact_session_match);
     hit.session_relevance_score = Some(session_relevance_score);
@@ -429,6 +496,30 @@ fn with_ranking_signals(mut hit: RankedMemory, context: &RankingContext) -> Rank
     hit.source_class = Some(source_class);
     hit.ranking_role = Some(ranking_role);
     hit
+}
+
+/// True when at least a third of the whitespace-separated tokens look like
+/// paths, flags (`-x`, `--flag`), env assignments or shell plumbing (`/a/b`, `--flag`, `X=y`,
+/// `$VAR`, `|`, `&&`). Needs three tokens to say anything.
+fn is_path_heavy(text: &str) -> bool {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    if tokens.len() < 3 {
+        return false;
+    }
+    let shell_like = tokens
+        .iter()
+        .filter(|token| {
+            let t = token.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | ',' | ';'));
+            t.contains('/')
+                || (t.starts_with('-') && t.len() > 1)
+                || t.starts_with('$')
+                || t == "|"
+                || t == "&&"
+                || t == "||"
+                || (t.contains('=') && !t.ends_with('='))
+        })
+        .count();
+    shell_like * 3 >= tokens.len()
 }
 
 fn infer_source_class(hit: &RankedMemory) -> String {
@@ -1121,5 +1212,135 @@ mod tests {
         hit2.id = Uuid::from_u128(42);
         let results = diversify_ranked_results(vec![hit1, hit2]);
         assert_eq!(results.len(), 1, "duplicate titles should be deduplicated");
+    }
+
+    // ── Review 2026-10-09 (F40): implementation details vs decisions ──
+
+    #[test]
+    fn path_heavy_detection() {
+        assert!(is_path_heavy(
+            "grep -rn 'rubrics' gradechum-api/gradechum/tasks/ai_utils.py | head -20"
+        ));
+        assert!(is_path_heavy(
+            "cd /private/tmp/claude-501/scratchpad/review && CHUM_API=http://localhost:63021 bash run.sh"
+        ));
+        assert!(!is_path_heavy(
+            "the rubrics request timeout is raised to 60 seconds because the Vertex p99 is 107 seconds"
+        ));
+        assert!(!is_path_heavy("short text"));
+    }
+
+    #[test]
+    fn decision_outranks_implementation_detail_on_equal_overlap() {
+        let mut decision = make_hit(
+            MemoryType::Decision,
+            "raise the rubrics request timeout to 60 seconds",
+        );
+        decision.importance_score = Some(0.92);
+        let mut detail = make_hit(
+            MemoryType::ImplementationDetail,
+            "the rubrics request timeout lives in ai_utils next to the retry wrapper",
+        );
+        detail.importance_score = Some(0.74);
+        detail.authority_class = Some(AuthorityClass::ToolVerified);
+        // Same lexical/semantic overlap for both (make_hit sets 0.5 / 0.5).
+        let ctx = default_context();
+        let ranked_decision = with_ranking_signals(decision, &ctx);
+        let ranked_detail = with_ranking_signals(detail, &ctx);
+        assert!(
+            ranked_detail.score <= ranked_decision.score * 0.5,
+            "implementation detail {} should be well below decision {}",
+            ranked_detail.score,
+            ranked_decision.score
+        );
+    }
+
+    #[test]
+    fn open_question_and_shell_titles_are_down_weighted() {
+        let ctx = default_context();
+        let fact = with_ranking_signals(make_hit(MemoryType::Fact, "rubrics timeout is 60 s"), &ctx);
+        let question = with_ranking_signals(
+            make_hit(MemoryType::OpenQuestion, "what is the rubrics timeout"),
+            &ctx,
+        );
+        let shell_fix = with_ranking_signals(
+            make_hit(
+                MemoryType::Fix,
+                "cd /tmp/x && grep -rn rubrics gradechum-api/ai_utils.py | head",
+            ),
+            &ctx,
+        );
+        assert!(question.score < fact.score * 0.5, "{} vs {}", question.score, fact.score);
+        assert!(shell_fix.score < fact.score * 0.5, "{} vs {}", shell_fix.score, fact.score);
+    }
+
+    #[test]
+    fn recency_share_is_capped_at_twenty_percent() {
+        let ctx = RankingContext {
+            retrieval_intent: RetrievalIntent::Hybrid,
+            now: Some(time::OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        // A hit with almost no relevance: only priors are left.
+        let weak = |created_at: &str| {
+            let mut hit = make_hit(MemoryType::Summary, "weak");
+            hit.lexical_score = Some(0.0);
+            hit.semantic_score = Some(0.0);
+            hit.importance_score = Some(0.0);
+            hit.confidence_score = Some(0.0);
+            hit.authority_class = Some(AuthorityClass::UserConfirmed);
+            hit.verification_status = None;
+            hit.created_at = created_at.to_string();
+            // Measure recency alone, not the separate staleness penalty.
+            hit.freshness_penalty = Some(0.0);
+            with_ranking_signals(hit, &ctx)
+        };
+        let fresh = weak(&now_rfc3339());
+        let old = weak("2020-01-01T00:00:00Z");
+        let recency_gain = fresh.score - old.score;
+        assert!(
+            recency_gain <= 0.2 * fresh.score.max(0.0) + 1e-9,
+            "recency added {recency_gain} to a score of {}",
+            fresh.score
+        );
+    }
+
+    #[test]
+    fn relevance_floor_requires_semantic_or_two_content_words() {
+        let query = "Where are we running the DepEd answer-sheet export pilot?";
+        let mut weak = make_hit(MemoryType::Decision, "export the grades report");
+        weak.semantic_score = Some(0.6);
+        assert!(!passes_relevance_floor(query, &weak), "one shared word, low semantic");
+        let mut two = make_hit(MemoryType::Decision, "DepEd export runs on the GCP memory VM");
+        two.semantic_score = Some(0.6);
+        assert!(passes_relevance_floor(query, &two), "two shared content words");
+        let mut semantic = make_hit(MemoryType::Decision, "pilot host chosen");
+        semantic.semantic_score = Some(0.8);
+        assert!(passes_relevance_floor(query, &semantic), "high semantic");
+        let mut one_word_query = make_hit(MemoryType::Fix, "hotfix branches from production-patch");
+        one_word_query.semantic_score = Some(0.1);
+        assert!(passes_relevance_floor("hotfix", &one_word_query), "single-word query");
+        assert!(passes_relevance_floor("", &weak), "empty query keeps everything");
+    }
+
+    #[test]
+    fn prose_implementation_detail_is_not_penalized_more_than_shell() {
+        let prose = make_hit(
+            MemoryType::ImplementationDetail,
+            "the importer stamps userEmail from CHUM_IMPORT_EMAIL before session start",
+        );
+        let shell = make_hit(
+            MemoryType::ImplementationDetail,
+            "CHUM_IMPORT_EMAIL=me@codechum.com pnpm sessions:import --roots /tmp/sessions --server http://10.140.0.9:63001",
+        );
+        let ctx = default_context();
+        let ranked_prose = with_ranking_signals(prose, &ctx);
+        let ranked_shell = with_ranking_signals(shell, &ctx);
+        assert!(
+            ranked_prose.score >= ranked_shell.score,
+            "prose detail {} should not rank below shell detail {}",
+            ranked_prose.score,
+            ranked_shell.score
+        );
     }
 }

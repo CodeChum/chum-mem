@@ -61,6 +61,28 @@ chunk_files = int(os.environ.get("CHUM_SYNC_CHUNK_FILES", "1000"))
 timeout_secs = int(os.environ.get("CHUM_SYNC_TIMEOUT_SECS", "120"))
 sync_log = os.environ.get("CHUM_SYNC_LOG", "")
 
+# Checkout identity for the server's remote pin (review 2026-10-09): the first
+# git remote that syncs into a project owns its repository snapshot; a clone of
+# another remote is rejected with 409. Credentials are stripped from the URL.
+def _repo_identity():
+    import subprocess, urllib.parse
+    out = {"X-Chum-Repo-Root": os.getcwd()[:512]}
+    try:
+        url = subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True,
+                             text=True, timeout=5).stdout.strip()
+    except Exception:
+        url = ""
+    if url:
+        if "://" in url:
+            parts = urllib.parse.urlsplit(url)
+            host = parts.hostname or ""
+            if parts.port:
+                host = f"{host}:{parts.port}"
+            url = urllib.parse.urlunsplit((parts.scheme, host, parts.path, "", ""))
+        out["X-Chum-Repo-Remote"] = url
+    return out
+repo_identity_headers = _repo_identity()
+
 with open(rules_file) as f:
     rules = json.load(f)
 
@@ -185,7 +207,7 @@ for i, files in enumerate(chunks):
     if project_id:
         payload["projectId"] = project_id
     body = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", **repo_identity_headers}
     if os.environ.get("CHUM_MEMORY_API_TOKEN"):
         headers["X-Chum-Token"] = os.environ["CHUM_MEMORY_API_TOKEN"]
     req = urllib.request.Request(f"{api_url}/api/knowledge/repository-sync", data=body,

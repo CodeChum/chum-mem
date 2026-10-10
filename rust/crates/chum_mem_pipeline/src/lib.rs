@@ -34,7 +34,8 @@ pub use knowledge::{
 };
 pub use ranking::{
     MemorySearchEnvelope, ProgressiveDisclosureResult, RankedMemory, RankingContext, SearchMetrics,
-    SemanticQueryResult, dedupe_hits_by_provenance, merge_hybrid_results, progressive_disclosure,
+    SemanticQueryResult, dedupe_hits_by_provenance, lexical_content_overlap, merge_hybrid_results,
+    passes_relevance_floor, progressive_disclosure,
     rank_hybrid_results,
 };
 pub use repository::{

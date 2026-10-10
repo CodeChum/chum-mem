@@ -5,7 +5,7 @@ use sqlx::PgPool;
 use thiserror::Error;
 
 const MIGRATION_LOCK_KEY: i64 = 42_424_201;
-pub const EXPECTED_MIGRATION_HEAD: &str = "0023_embeddings_bge_small_384.sql";
+pub const EXPECTED_MIGRATION_HEAD: &str = "0025_project_repository_remote.sql";
 
 #[derive(Debug, Clone, Copy)]
 pub struct MigrationFile {
@@ -161,6 +161,18 @@ pub const MIGRATION_FILES: &[MigrationFile] = &[
     MigrationFile {
         name: "0023_embeddings_bge_small_384.sql",
         contents: include_str!("../../../../infra/migrations/0023_embeddings_bge_small_384.sql"),
+        sentinel: None,
+        transactional: true,
+    },
+    MigrationFile {
+        name: "0024_memories_claim_key_index.sql",
+        contents: include_str!("../../../../infra/migrations/0024_memories_claim_key_index.sql"),
+        sentinel: None,
+        transactional: true,
+    },
+    MigrationFile {
+        name: "0025_project_repository_remote.sql",
+        contents: include_str!("../../../../infra/migrations/0025_project_repository_remote.sql"),
         sentinel: None,
         transactional: true,
     },

@@ -38,6 +38,9 @@ interface ImportOptions {
   concurrency: number;
   batchSize: number;
   fresh: boolean;
+  /** Exact project-folder names to import (see --allow-folders). */
+  allowFolders?: string[];
+  allFolders: boolean;
 }
 
 interface SessionStartPayload {
@@ -140,8 +143,22 @@ function parseArgs(argv: string[]): ImportOptions {
     dryRun: boolArg(args, '--dry-run'),
     concurrency: Number(stringArg(args, '--concurrency') ?? DEFAULT_CONCURRENCY),
     batchSize: Number(stringArg(args, '--batch-size') ?? DEFAULT_BATCH_SIZE),
-    fresh: boolArg(args, '--fresh')
+    fresh: boolArg(args, '--fresh'),
+    allFolders: boolArg(args, '--all-folders')
   };
+
+  // Review 2026-10-09: the backfill glob `-Users-<you>-gradechum-gradechum*`
+  // also matched sibling folders (the customer-bot project: 97.6% of the
+  // imported sessions, with customer chat). Imports now need an explicit list
+  // of project-folder names. Use the `=` form, because the folder names start
+  // with "-": --allow-folders=-Users-me-gradechum-gradechum,-Users-me-gradechum-gradechum--wt-x
+  const allowRaw = args.get('--allow-folders');
+  if (allowRaw === true) {
+    throw new Error('--allow-folders needs a value; use --allow-folders=<name>[,<name>…] (the = form, because folder names start with "-")');
+  }
+  if (typeof allowRaw === 'string') {
+    options.allowFolders = allowRaw.split(',').map((value) => value.trim()).filter((value) => value.length > 0);
+  }
 
   const from = stringArg(args, '--from');
   const to = stringArg(args, '--to');
@@ -219,8 +236,12 @@ function expandHome(input: string): string {
 
 // ─── File collection ────────────────────────────────────────────────
 
-async function collectSessionFiles(roots: string[]): Promise<string[]> {
+async function collectSessionFiles(
+  roots: string[],
+  allowFolders?: string[]
+): Promise<{ files: string[]; skippedFolders: string[] }> {
   const files: string[] = [];
+  const skippedFolders: string[] = [];
 
   async function walk(path: string): Promise<void> {
     let entries;
@@ -244,9 +265,36 @@ async function collectSessionFiles(roots: string[]): Promise<string[]> {
     await Promise.all(promises);
   }
 
-  await Promise.all(roots.map((root) => walk(root)));
+  if (!allowFolders) {
+    await Promise.all(roots.map((root) => walk(root)));
+  } else {
+    // A root whose own name is allowed is walked whole; otherwise only its
+    // immediate sub-folders whose names are listed exactly (no prefix match).
+    const allowed = new Set(allowFolders);
+    await Promise.all(roots.map(async (root) => {
+      if (allowed.has(basename(root))) {
+        await walk(root);
+        return;
+      }
+      let entries;
+      try {
+        entries = await readdir(root, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      await Promise.all(entries.map(async (entry) => {
+        if (!entry.isDirectory()) return;
+        if (allowed.has(entry.name)) {
+          await walk(join(root, entry.name));
+        } else {
+          skippedFolders.push(join(root, entry.name));
+        }
+      }));
+    }));
+  }
   files.sort();
-  return files;
+  skippedFolders.sort();
+  return { files, skippedFolders };
 }
 
 // ─── Provider & timestamp inference ─────────────────────────────────
@@ -731,8 +779,8 @@ async function parseSessionFile(filePath: string, options: ImportOptions): Promi
                 command = extractCommandOutput(String(parsedLine.content)).command || String(parsedLine.content);
              } else {
                 message = typeof parsedLine.message === 'object' && parsedLine.message !== null
-                  ? String((parsedLine.message as any).content || '')
-                  : String(parsedLine.content || '');
+                  ? contentText((parsedLine.message as any).content)
+                  : contentText(parsedLine.content);
              }
 
              const eventId = stableId(`${parsed.externalSessionId}:${parsed.events.length}:${parsedLine.uuid || lineIndex}`);
@@ -823,9 +871,15 @@ async function postJson<TResponse>(
   if (dryRun) {
     return undefined;
   }
+  // The server rejects requests without a token once CHUM_MEM_API_TOKENS is set
+  // (2026-10-09); without this header every session/start fails with 401 and
+  // the whole backfill is counted as "failed".
+  const headers: Record<string, string> = { 'content-type': 'application/json', 'connection': 'keep-alive' };
+  const token = (process.env.CHUM_MEMORY_API_TOKEN || process.env.CHUM_IMPORT_TOKEN || '').trim();
+  if (token) headers['x-chum-token'] = token;
   const response = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'connection': 'keep-alive' },
+    headers,
     body: JSON.stringify(body),
     keepalive: true
   });
@@ -889,13 +943,56 @@ async function sendEventBatch(
   return sent;
 }
 
+/**
+ * Text of a Claude message `content`: a string, or an array of blocks of which
+ * only `text` blocks are kept (tool_use / tool_result / thinking are not the
+ * user's or the assistant's words). It used to be `String(content)`, which
+ * stored every block-array reply as "[object Object]" (56,863 of 57,493
+ * imported responses in the review store).
+ */
+function contentText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((block) => (block && typeof block === 'object' && (block as any).type === 'text' && typeof (block as any).text === 'string')
+        ? (block as any).text as string
+        : '')
+      .filter((text) => text.length > 0)
+      .join('\n');
+  }
+  return '';
+}
+
+function toIso(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? undefined : new Date(ms).toISOString();
+}
+
+/** First event time of the transcript (falls back to the parsed start). */
+function transcriptStart(parsed: ParsedSession): string | undefined {
+  const times = parsed.events.map((event) => toIso(event.eventTime)).filter((t): t is string => !!t).sort();
+  return times[0] ?? toIso(parsed.startedAt);
+}
+
+/** Last event time of the transcript (falls back to the parsed end). */
+function transcriptEnd(parsed: ParsedSession): string | undefined {
+  const times = parsed.events.map((event) => toIso(event.eventTime)).filter((t): t is string => !!t).sort();
+  return times.at(-1) ?? toIso(parsed.endedAt);
+}
+
 async function importSession(parsed: ParsedSession, options: ImportOptions): Promise<{ events: number; duplicate: boolean }> {
   const startPayload: SessionStartPayload = {
     provider: parsed.provider,
     projectId: options.projectId,
     externalSessionId: parsed.externalSessionId,
     repo: parsed.repo,
-    metadata: parsed.metadata
+    // The server dates the session (and its memories) from these instead of
+    // the import time when they are present.
+    metadata: {
+      ...parsed.metadata,
+      ...(transcriptStart(parsed) ? { startedAt: transcriptStart(parsed) } : {})
+    }
   };
 
   let startResponse: { sessionId: string; status?: string } | undefined;
@@ -936,7 +1033,8 @@ async function importSession(parsed: ParsedSession, options: ImportOptions): Pro
     defer: true,
     metadata: {
       importedAt: new Date().toISOString(),
-      source: 'bulk-import'
+      source: 'bulk-import',
+      ...(transcriptEnd(parsed) ? { endedAt: transcriptEnd(parsed) } : {})
     }
   };
 
@@ -986,7 +1084,16 @@ function progressLine(stats: ImportStats, total: number, currentFile: string): s
 async function main(): Promise<void> {
   const startTime = Date.now();
   const options = parseArgs(process.argv.slice(2));
-  const files = await collectSessionFiles(options.roots);
+  if (!options.allowFolders && !options.allFolders) {
+    throw new Error(
+      'Refusing to import without an explicit folder allowlist. Pass --allow-folders=<project-folder>[,<project-folder>…] ' +
+      '(exact names under each --roots entry), or --all-folders to import everything under the roots.'
+    );
+  }
+  const { files, skippedFolders } = await collectSessionFiles(options.roots, options.allowFolders);
+  if (skippedFolders.length > 0) {
+    console.log(`Skipped ${skippedFolders.length} folder(s) not in --allow-folders: ${skippedFolders.map((f) => basename(f)).join(', ')}`);
+  }
   const stats: ImportStats = {
     filesDiscovered: files.length,
     filesProcessed: 0,
@@ -1050,17 +1157,24 @@ async function main(): Promise<void> {
   stats.filesProcessed = 0;
 
   // Drop non-unique indexes for bulk import throughput (optimization #6).
+  // Only `create-indexes` after a successful drop: an admin-token rejection
+  // (401/403) or an older server must not leave the importer thinking it owes
+  // a recreate, and a crash mid-import must still recreate (hence `finally`
+  // below; FINDINGS F31).
+  let indexesDropped = false;
   if (!options.dryRun && parsedSessions.length > 0) {
     try {
       await postJson(`${options.serverUrl}/v1/ingest/bulk/drop-indexes`, {}, false);
+      indexesDropped = true;
       console.log('Dropped session_events indexes for bulk import');
-    } catch {
-      // Endpoint may not exist on older server versions; proceed without
+    } catch (error) {
+      console.error(`Note: bulk drop-indexes skipped (${error instanceof Error ? error.message : String(error)}); importing with indexes in place`);
     }
   }
 
   // Import sessions concurrently
   const importStart = Date.now();
+  try {
   await runWithConcurrency(parsedSessions, options.concurrency, async ({ file, session }, index) => {
     stats.filesProcessed += 1;
     try {
@@ -1093,13 +1207,15 @@ async function main(): Promise<void> {
     }
   });
 
-  // Recreate indexes after bulk import (optimization #6).
-  if (!options.dryRun && parsedSessions.length > 0) {
-    try {
-      await postJson(`${options.serverUrl}/v1/ingest/bulk/create-indexes`, {}, false);
-      console.log('Recreated session_events indexes after bulk import');
-    } catch {
-      console.error('Warning: failed to recreate indexes. Run manually if needed.');
+  } finally {
+    // Recreate indexes after bulk import (optimization #6) — also on a crash.
+    if (indexesDropped) {
+      try {
+        await postJson(`${options.serverUrl}/v1/ingest/bulk/create-indexes`, {}, false);
+        console.log('Recreated session_events indexes after bulk import');
+      } catch {
+        console.error('Warning: failed to recreate indexes. Run manually: POST /v1/ingest/bulk/create-indexes');
+      }
     }
   }
 
