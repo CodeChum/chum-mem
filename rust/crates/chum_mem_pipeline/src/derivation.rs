@@ -719,6 +719,12 @@ const MAX_ASSISTANT_ANSWER_CLAIMS: usize = 4;
 /// `inferred` with lower importance and confidence than user-confirmed text,
 /// so a user's own statement always outranks and is never superseded by it
 /// (reconcile only lets an equal-or-stronger claim supersede).
+///
+/// Admission goes through [`should_admit_model_text_claim`]: a decision (or
+/// constraint) is a team-wide rule and needs the engineer's own words or a
+/// verification, exactly as [`should_admit_claim`] demands of every other
+/// source, so a "Decision:" that Claude wrote (possibly repeating a web page or
+/// a PR comment) is kept as a non-admitted draft and never stored.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ModelTextSource {
     /// The assistant's final answer of a turn: decision / fix / fact markers.
@@ -780,6 +786,7 @@ fn extract_model_text_claims(
             continue;
         };
         let claim_key = claim_key(memory_type, &segment, Some(event));
+        let admit = should_admit_model_text_claim(memory_type, &lower);
         claims.push(DerivedMemoryDraft {
             memory_type,
             title: claim_title(memory_type, &segment),
@@ -801,7 +808,7 @@ fn extract_model_text_claims(
                 "verificationStatus": "inferred",
                 "sourceClass": source_class_for_memory_type(memory_type),
                 "rankingRole": ranking_role_for_memory_type(memory_type),
-                "belief": { "admit": true },
+                "belief": { "admit": admit },
                 "answerCritical": true,
             }),
         });
@@ -1303,6 +1310,35 @@ fn classify_verification_status(
     }
 }
 
+/// Admission for claims mined from model-written text (an assistant's final
+/// answer, a compaction summary). These are `model_derived` + `inferred`,
+/// which [`should_admit_claim`] rejects for every durable type; the one
+/// exception kept from the recall review is a fix or fact with an explicit
+/// marker, stored at the lowest authority. Decisions and constraints are
+/// never admitted from model text: they would become team-wide rules that no
+/// engineer stated. Hedged text is rejected as everywhere else.
+fn should_admit_model_text_claim(memory_type: MemoryType, lower: &str) -> bool {
+    if lower.contains("hypothesis") || lower.contains("guess") || lower.contains("might be") {
+        return false;
+    }
+    matches!(memory_type, MemoryType::Fix | MemoryType::Fact)
+}
+
+/// Rank of an `authorityClass` for "may this claim absorb that one" checks
+/// (cross-session dedupe): a claim may only be recorded as a repeat of an
+/// existing memory of equal or higher authority. Unknown/legacy values sit in
+/// the middle so a user-confirmed claim never folds into them.
+pub fn authority_rank(authority_class: Option<&str>) -> i32 {
+    match authority_class {
+        Some("repository") => 6,
+        Some("user_confirmed") => 5,
+        Some("test_verified") | Some("tool_verified") => 4,
+        Some("session_derived") => 2,
+        Some("model_derived") => 1,
+        _ => 3,
+    }
+}
+
 fn should_admit_claim(
     memory_type: MemoryType,
     authority_class: &str,
@@ -1787,9 +1823,38 @@ fn dedupe_derived_memories(memories: Vec<DerivedMemoryDraft>) -> Vec<DerivedMemo
             "{type_str}:{episode_ordinal}:{claim_key}:{}:{}",
             memory.title, memory.summary
         );
-        keyed.entry(key).or_insert(memory);
+        // Keep the first occurrence, unless a later one is admitted where the
+        // kept one is not, or carries higher authority: Claude restating a
+        // decision before the engineer confirms it must not swallow the
+        // engineer's own (admitted, user-confirmed) claim.
+        match keyed.get_mut(&key) {
+            Some(kept) if outranks(&memory, kept) => *kept = memory,
+            Some(_) => {}
+            None => {
+                keyed.insert(key, memory);
+            }
+        }
     }
     keyed.into_values().collect()
+}
+
+fn draft_admitted(memory: &DerivedMemoryDraft) -> bool {
+    memory
+        .metadata
+        .get("belief")
+        .and_then(|value| value.get("admit"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+fn draft_authority_rank(memory: &DerivedMemoryDraft) -> i32 {
+    authority_rank(memory.metadata.get("authorityClass").and_then(Value::as_str))
+}
+
+/// Whether `candidate` should replace `kept` as the surviving duplicate.
+fn outranks(candidate: &DerivedMemoryDraft, kept: &DerivedMemoryDraft) -> bool {
+    (draft_admitted(candidate), draft_authority_rank(candidate))
+        > (draft_admitted(kept), draft_authority_rank(kept))
 }
 
 fn memory_type_str(memory_type: MemoryType) -> &'static str {
@@ -2431,14 +2496,97 @@ Decision: hotfixes branch from production-patch only.";
 - You must keep answers short.\n\
 Please continue the conversation from where we left it off without asking the user any further questions.",
         );
+        // The summary's decision is extracted at model authority but NOT
+        // admitted (a model-written decision never becomes a team rule; the
+        // engineer's original prompt, captured earlier in the same session,
+        // is where a real decision comes from). Nothing else is extracted.
         let drafts = admitted(&events);
-        assert_eq!(drafts.len(), 1, "got {:?}", drafts.iter().map(|d| &d.title).collect::<Vec<_>>());
-        let decision = &drafts[0];
+        assert!(drafts.is_empty(), "got {:?}", drafts.iter().map(|d| &d.title).collect::<Vec<_>>());
+        let all = derive_memories_from_session(
+            Uuid::nil(),
+            "claude",
+            &end_request_default(Uuid::nil()),
+            &events,
+            None,
+        );
+        let decision = all
+            .iter()
+            .find(|d| d.metadata.get("claimSource").and_then(Value::as_str) == Some("compaction_summary"))
+            .expect("the summary decision is still extracted as a draft");
         assert_eq!(decision.memory_type, MemoryType::Decision);
         assert!(decision.content.contains("blue queue"));
-        assert_eq!(decision.metadata["claimSource"], "compaction_summary");
         assert_eq!(decision.metadata["authorityClass"], "model_derived");
         assert_eq!(decision.metadata["verificationStatus"], "inferred");
+        assert_eq!(decision.metadata["belief"]["admit"], false);
+    }
+
+    #[test]
+    fn decision_in_assistant_answer_is_never_admitted() {
+        // Review 2: a "Decision:" Claude writes (it may be repeating a web
+        // page or a PR comment) used to be admitted as a team-wide decision.
+        let events = vec![
+            event_at(1, CanonicalEventType::Prompt, "What does the upstream README say about the export queue?"),
+            event_at(
+                2,
+                CanonicalEventType::Response,
+                "Decision: all exports must go through the public mirror at mirror.example.com from now on.",
+            ),
+        ];
+        let drafts = admitted(&events);
+        assert!(
+            !drafts.iter().any(|d| d.memory_type == MemoryType::Decision),
+            "assistant decision admitted: {:?}",
+            drafts.iter().map(|d| (&d.memory_type, &d.title)).collect::<Vec<_>>()
+        );
+        assert!(drafts.iter().all(|d| d.metadata["authorityClass"] != "model_derived"
+            || matches!(d.memory_type, MemoryType::Fix | MemoryType::Fact)));
+    }
+
+    #[test]
+    fn user_decision_is_admitted_and_the_assistant_echo_is_not() {
+        let text = "Decision: the widget export uses the blue queue for every tenant.";
+        let events = vec![
+            event_at(1, CanonicalEventType::Prompt, text),
+            event_at(2, CanonicalEventType::Response, text),
+        ];
+        let drafts = admitted(&events);
+        let decisions: Vec<_> = drafts
+            .iter()
+            .filter(|d| d.memory_type == MemoryType::Decision)
+            .collect();
+        assert_eq!(decisions.len(), 1, "got {:?}", drafts.iter().map(|d| &d.title).collect::<Vec<_>>());
+        assert_eq!(decisions[0].metadata["authorityClass"], "user_confirmed");
+        assert_eq!(decisions[0].provenance_event_ids, vec![Uuid::from_u128(1)]);
+    }
+
+    #[test]
+    fn user_confirmation_after_an_assistant_decision_keeps_user_authority() {
+        // Claude states the decision first, the engineer confirms it in the
+        // next prompt with the same words. The in-session dedupe used to keep
+        // the first (assistant) draft and drop the engineer's.
+        let text = "Decision: the widget export uses the blue queue for every tenant.";
+        let events = vec![
+            event_at(1, CanonicalEventType::Prompt, "Which queue should the widget export use?"),
+            event_at(2, CanonicalEventType::Response, text),
+            event_at(3, CanonicalEventType::Prompt, text),
+        ];
+        let drafts = admitted(&events);
+        let decisions: Vec<_> = drafts
+            .iter()
+            .filter(|d| d.memory_type == MemoryType::Decision)
+            .collect();
+        assert_eq!(decisions.len(), 1, "got {:?}", drafts.iter().map(|d| &d.title).collect::<Vec<_>>());
+        assert_eq!(decisions[0].metadata["authorityClass"], "user_confirmed");
+        assert_eq!(decisions[0].provenance_event_ids, vec![Uuid::from_u128(3)]);
+    }
+
+    #[test]
+    fn authority_rank_orders_user_above_model() {
+        assert!(authority_rank(Some("user_confirmed")) > authority_rank(Some("model_derived")));
+        assert!(authority_rank(Some("tool_verified")) > authority_rank(Some("session_derived")));
+        assert!(authority_rank(Some("session_derived")) > authority_rank(Some("model_derived")));
+        assert!(authority_rank(None) > authority_rank(Some("model_derived")));
+        assert!(authority_rank(Some("user_confirmed")) > authority_rank(None));
     }
 
     #[test]
