@@ -151,6 +151,12 @@ pub struct MemoryDetailRow {
     pub summary: String,
     pub metadata: Value,
     pub created_at: time::OffsetDateTime,
+    /// Source session of the memory and its author (`userEmail` in the
+    /// session metadata): vector-store-only search hits are built from this
+    /// row, and without them recall printed "(by unknown)" (review D3).
+    pub session_id: Option<Uuid>,
+    pub branch: Option<String>,
+    pub author_email: Option<String>,
     pub claim_id: Option<Uuid>,
     pub claim_type: Option<String>,
     pub claim_key: Option<String>,
@@ -2356,6 +2362,9 @@ pub async fn load_memory(
           m.summary,
           m.metadata,
           m.created_at,
+          m.session_id,
+          s.branch,
+          s.metadata->>'userEmail' as author_email,
           c.id as claim_id,
           c.claim_type::text as claim_type,
           c.claim_key,
@@ -2384,6 +2393,7 @@ pub async fn load_memory(
           ), 0)::bigint as active_conflict_count,
           c.governance_state as claim_governance_state
         from public.memories m
+        left join public.sessions s on s.id = m.session_id
         left join public.claims c on c.memory_id = m.id
         where m.id = $1
           and m.organization_id = $2
@@ -2421,6 +2431,9 @@ pub async fn load_memories_batch(
           m.summary,
           m.metadata,
           m.created_at,
+          m.session_id,
+          s.branch,
+          s.metadata->>'userEmail' as author_email,
           c.id as claim_id,
           c.claim_type::text as claim_type,
           c.claim_key,
@@ -2449,6 +2462,7 @@ pub async fn load_memories_batch(
           ), 0)::bigint as active_conflict_count,
           c.governance_state as claim_governance_state
         from public.memories m
+        left join public.sessions s on s.id = m.session_id
         left join public.claims c on c.memory_id = m.id
         where m.id = any($1)
           and m.organization_id = $2

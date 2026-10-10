@@ -4281,10 +4281,10 @@ fn map_memory_detail_to_ranked_memory(row: &chum_mem_db::MemoryDetailRow) -> Ran
         summary: row.summary.clone(),
         score: 0.0,
         created_at: format_time(row.created_at),
-        session_ids: Vec::new(),
+        session_ids: row.session_id.into_iter().collect(),
         provenance: Vec::new(),
         proof_handles: Vec::new(),
-        author_email: None,
+        author_email: row.author_email.clone(),
         lexical_score: None,
         semantic_score: None,
         exact_session_match: None,
@@ -4296,7 +4296,7 @@ fn map_memory_detail_to_ranked_memory(row: &chum_mem_db::MemoryDetailRow) -> Ran
         freshness_penalty: None,
         superseded_penalty: None,
         community_score: None,
-        branch: None,
+        branch: row.branch.clone(),
         superseded_at: None,
         related_memory_ids: Vec::new(),
         source_class: None,
@@ -6573,6 +6573,55 @@ mod review_2026_10_09_tests {
         assert!(!token_matches("abc123", "abc12"));
         assert!(!token_matches("abc123", "abc1234"));
         assert!(!token_matches("abc123", ""));
+    }
+
+    // D3: a hit only the vector store returned is built from a
+    // MemoryDetailRow; it must carry the author, session and branch like the
+    // lexical/pgvector hits do (recall printed "(by unknown)").
+    #[test]
+    fn vector_only_hits_carry_author_session_and_branch() {
+        let session_id = Uuid::new_v4();
+        let row = chum_mem_db::MemoryDetailRow {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            memory_type: "decision".to_string(),
+            title: "Decision: the widget cache uses a 5 minute TTL".to_string(),
+            content: String::new(),
+            summary: String::new(),
+            metadata: serde_json::json!({}),
+            created_at: time::OffsetDateTime::now_utc(),
+            session_id: Some(session_id),
+            branch: Some("main".to_string()),
+            author_email: Some("dev@example.com".to_string()),
+            claim_id: None,
+            claim_type: None,
+            claim_key: None,
+            claim_subject: None,
+            claim_predicate: None,
+            claim_object: None,
+            claim_polarity: None,
+            claim_authority_class: None,
+            claim_verification_status: None,
+            claim_valid_from: None,
+            claim_valid_to: None,
+            claim_superseded_by: None,
+            active_conflict_count: 0,
+            claim_governance_state: None,
+        };
+        let hit = map_memory_detail_to_ranked_memory(&row);
+        assert_eq!(hit.author_email.as_deref(), Some("dev@example.com"));
+        assert_eq!(hit.session_ids, vec![session_id]);
+        assert_eq!(hit.branch.as_deref(), Some("main"));
+
+        let orphan = chum_mem_db::MemoryDetailRow {
+            session_id: None,
+            branch: None,
+            author_email: None,
+            ..row
+        };
+        let hit = map_memory_detail_to_ranked_memory(&orphan);
+        assert_eq!(hit.author_email, None);
+        assert!(hit.session_ids.is_empty());
     }
 
     #[test]
