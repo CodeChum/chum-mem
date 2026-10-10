@@ -129,9 +129,27 @@ __health_cached() {
   [[ "$age" -ge 0 && "$age" -lt "$HEALTH_CACHE_SECS" ]]
 }
 __health_cache_drop() { rm -f "$HEALTH_CACHE" 2>/dev/null || true; }
+# A FAILED /health is remembered for CHUM_HEALTH_DOWN_SECS (default 30, 0 = off)
+# in .chum-cache/.health-down: with the VM down behind a running tunnel, every
+# hook used to wait the full health timeout again. Hooks inside that window
+# spool at once; the first one after it checks /health again.
+HEALTH_DOWN="${PROJECT_DIR}/.chum-cache/.health-down"
+HEALTH_DOWN_SECS="${CHUM_HEALTH_DOWN_SECS:-30}"
+[[ "$HEALTH_DOWN_SECS" =~ ^[0-9]+$ ]] || HEALTH_DOWN_SECS=30
+__health_down_recent() {
+  [[ "$HEALTH_DOWN_SECS" -gt 0 && -f "$HEALTH_DOWN" ]] || return 1
+  local at="" url="" age
+  read -r at url < "$HEALTH_DOWN" 2>/dev/null || true
+  [[ "$url" == "$API_URL" && "$at" =~ ^[0-9]+$ ]] || return 1
+  age=$(( $(date +%s) - at ))
+  [[ "$age" -ge 0 && "$age" -lt "$HEALTH_DOWN_SECS" ]]
+}
 if __health_cached; then
   :
+elif __health_down_recent; then
+  API_HEALTHY=0
 elif curl -sf $AUTH_HEADER --max-time "$HEALTH_TIMEOUT" "${API_URL}/health" >/dev/null 2>&1; then
+  rm -f "$HEALTH_DOWN" 2>/dev/null || true
   if [[ "$HEALTH_CACHE_SECS" -gt 0 ]] && mkdir -p "${PROJECT_DIR}/.chum-cache" 2>/dev/null; then
     printf '%s %s\n' "$(date +%s)" "$API_URL" > "${HEALTH_CACHE}.$$" 2>/dev/null \
       && mv -f "${HEALTH_CACHE}.$$" "$HEALTH_CACHE" 2>/dev/null || rm -f "${HEALTH_CACHE}.$$" 2>/dev/null
@@ -139,6 +157,9 @@ elif curl -sf $AUTH_HEADER --max-time "$HEALTH_TIMEOUT" "${API_URL}/health" >/de
 else
   API_HEALTHY=0
   __health_cache_drop
+  if [[ "$HEALTH_DOWN_SECS" -gt 0 ]] && mkdir -p "${PROJECT_DIR}/.chum-cache" 2>/dev/null; then
+    printf '%s %s\n' "$(date +%s)" "$API_URL" > "$HEALTH_DOWN" 2>/dev/null || true
+  fi
 fi
 export CHUM_API_HEALTHY="$API_HEALTHY"
 if [[ "$API_HEALTHY" -eq 0 ]]; then

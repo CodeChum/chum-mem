@@ -242,7 +242,97 @@ test_docs_only_default() {
     '[[ "$ctx" == *"NOT attached automatically: it is searchable on demand"*"mem_search for session memory"* ]]'
 }
 
-ALL="concurrent_append fence_forgery tokenizer deferred_start_replay health_cache docs_only_default"
+# ── R3: `chum-quarantine.sh list` never prints a held private key's body ──
+test_quarantine_list_masks_key_body() {
+  echo "quarantine_list_masks_key_body"
+  local r pem out
+  r=$(mkrepo qmask)
+  # Made-up key material, not a real key.
+  pem=$'-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAr3fakeBODYfakeBODYfakeBODYfakeBODYfakeBODYfakeBODYfakeBODY0123456789\nr3fakeTAILfakeTAILfakeTAILfakeTAILfakeTAIL==\n-----END RSA PRIVATE KEY-----'
+  payload PostToolUse qmask "$r" "$(jq -cn --arg k "$pem" '{tool_name:"Read", tool_input:{file_path:"id_rsa"}, tool_response:{file:{content:$k}}}')" \
+    | env -i PATH="$PATH" HOME="$TMP/home" CHUM_SPOOL_ONLY=1 CHUM_MEM_PROJECT_ID="$PID_FAKE" \
+        CHUM_MEMORY_API_URL=http://127.0.0.1:9 CLAUDE_PROJECT_DIR="$r" "$BASH_BIN" "$SCRIPTS/session-sync.sh" 2>/dev/null
+  check "the key was held" '[[ -s "$r/.chum-cache/quarantine/claude-qmask.jsonl" ]]'
+  out=$(env -i PATH="$PATH" HOME="$TMP/home" CLAUDE_PROJECT_DIR="$r" "$BASH_BIN" "$SCRIPTS/chum-quarantine.sh" list 2>&1)
+  check "list shows the held item" '[[ "$out" == *"[private-key]"* ]]'
+  check "list prints no part of the key body" '[[ "$out" != *"MIIEow"* && "$out" != *"fakeBODY"* && "$out" != *"fakeTAIL"* ]]'
+}
+
+# ── R3: a hung API (connection accepted, no answer) never costs an event ──
+# Claude Code kills PostToolUse at 10 s and Stop at 30 s (settings.json); the
+# kill is emulated with perl's alarm. The /health result is cached, so the
+# hook goes straight to the live calls.
+test_hung_api_spools() {
+  echo "hung_api_spools"
+  local r p kinds
+  r=$(mkrepo hung)
+  start_fake hung || { bad "fake api"; return; }
+  echo 40000 > "$FAKE_STATE/delay-ms"
+  mkdir -p "$r/.chum-cache"
+  printf '{"sessionId":"11111111-1111-4111-8111-111111111111"}\n' > "$r/.chum-cache/session-claude-hung.json"
+  : > "$r/.chum-cache/.resolved-$PID_FAKE"
+  printf '%s %s\n' "$(date +%s)" "$FAKE_URL" > "$r/.chum-cache/.health-ok"
+  p=$(payload PostToolUse hung "$r" '{"tool_name":"Bash","tool_input":{"command":"make test"},"tool_response":{"stdout":"ok"}}')
+  printf '%s' "$p" | perl -e 'alarm shift; exec @ARGV' 10 env -i PATH="$PATH" HOME="$TMP/home" TMPDIR="$TMP" \
+    CHUM_MEMORY_API_URL="$FAKE_URL" CLAUDE_PROJECT_DIR="$r" CHUM_NOTICES=0 "$BASH_BIN" "$r/.claude/chum-mem/scripts/hook-dispatch.sh" >/dev/null 2>&1
+  kinds=$(cat "$r/.chum-cache/outbox/"*.jsonl 2>/dev/null | jq -r .kind | tr '\n' ' ')
+  check "PostToolUse finishes inside its 10 s timeout with the event spooled ($kinds)" '[[ "$kinds" == "event " ]]'
+  check "the cached /health result is dropped" '[[ ! -f "$r/.chum-cache/.health-ok" ]]'
+  printf '%s %s\n' "$(date +%s)" "$FAKE_URL" > "$r/.chum-cache/.health-ok"
+  p=$(payload Stop hung "$r" '{"last_assistant_message":"all tests pass"}')
+  printf '%s' "$p" | perl -e 'alarm shift; exec @ARGV' 30 env -i PATH="$PATH" HOME="$TMP/home" TMPDIR="$TMP" \
+    CHUM_MEMORY_API_URL="$FAKE_URL" CLAUDE_PROJECT_DIR="$r" CHUM_NOTICES=0 "$BASH_BIN" "$r/.claude/chum-mem/scripts/hook-dispatch.sh" >/dev/null 2>&1
+  # The Stop hook starts the detached replayer, which may hold the first line
+  # in a .flushing file meanwhile: count every outbox file.
+  kinds=$(cat "$r/.chum-cache/outbox/"*.jsonl* 2>/dev/null | jq -r .kind | sort | tr '\n' ' ')
+  check "Stop finishes inside its 30 s timeout with reply and end spooled ($kinds)" '[[ "$kinds" == "end event event " ]]'
+}
+
+# ── A failed /health is remembered briefly, so a down VM costs one timeout ──
+test_health_down_cache() {
+  echo "health_down_cache"
+  local r p hc
+  r=$(mkrepo hdown)
+  start_fake hdown || { bad "fake api"; return; }
+  : > "$FAKE_STATE/health-down"
+  p=$(payload UserPromptSubmit hdown "$r" '{"prompt":"where is the bonus toggle?"}')
+  hc() { grep -c '^GET /health' "$FAKE_STATE/requests.log" 2>/dev/null || true; }
+  hook "$r" "$FAKE_URL" "$p" >/dev/null
+  check "first hook checks /health ($(hc))" '[[ $(hc) -eq 1 ]]'
+  check "the failure is remembered" '[[ -f "$r/.chum-cache/.health-down" ]]'
+  hook "$r" "$FAKE_URL" "$p" >/dev/null
+  check "the next hook inside the window skips /health ($(hc))" '[[ $(hc) -eq 1 ]]'
+  check "and still spools the event" '[[ -n "$(ls "$r/.chum-cache/outbox/" 2>/dev/null)" ]]'
+  hook "$r" "$FAKE_URL" "$p" CHUM_HEALTH_DOWN_SECS=0 >/dev/null
+  check "CHUM_HEALTH_DOWN_SECS=0 always checks ($(hc))" '[[ $(hc) -eq 2 ]]'
+  rm -f "$FAKE_STATE/health-down"
+  printf '%s %s\n' "$(( $(date +%s) - 60 ))" "$FAKE_URL" > "$r/.chum-cache/.health-down"
+  hook "$r" "$FAKE_URL" "$p" >/dev/null
+  check "after the window /health is checked again ($(hc))" '[[ $(hc) -eq 3 ]]'
+  check "a healthy answer clears the memory" '[[ ! -f "$r/.chum-cache/.health-down" ]]'
+}
+
+# ── `chum-quarantine.sh send` appends under the outbox lock ──
+test_quarantine_send_locked() {
+  echo "quarantine_send_locked"
+  local r q out
+  r=$(mkrepo qsend)
+  mkdir -p "$r/.chum-cache/quarantine" "$r/.chum-cache/outbox"
+  q="$r/.chum-cache/quarantine/claude-qsend.jsonl"
+  out="$r/.chum-cache/outbox/claude-qsend.jsonl"
+  jq -cn '{kind:"event", ext:"qsend", matched:"jwt", at:"x", body:{eventType:"prompt", payload:{message:"made-up"}}}' > "$q"
+  mkdir "$out.lock"   # a hook is mid-append
+  ( sleep 1; printf '{"kind":"event","ext":"qsend","body":{"eventType":"tool_result"}}\n' >> "$out"; rmdir "$out.lock" ) &
+  local bg=$!
+  env -i PATH="$PATH" HOME="$TMP/home" CLAUDE_PROJECT_DIR="$r" CHUM_MEMORY_API_URL=http://127.0.0.1:9 \
+    "$BASH_BIN" "$SCRIPTS/chum-quarantine.sh" send >/dev/null 2>&1
+  wait "$bg"
+  check "send waited for the lock: hook line first, released line second" \
+    '[[ "$(jq -r .body.eventType "$out" 2>/dev/null | tr "\n" " ")" == "tool_result prompt " || "$(cat "$out".flushing.* "$out" 2>/dev/null | jq -r .body.eventType | tr "\n" " ")" == "tool_result prompt " ]]'
+  check "the held file is gone and the lock released" '[[ ! -e "$q" && ! -d "$out.lock" ]]'
+}
+
+ALL="concurrent_append fence_forgery tokenizer deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked"
 for t in ${*:-$ALL}; do "test_$t"; done
 echo "passed $PASS, failed $FAIL, skipped $SKIP  (scratch: $TMP)"
 [[ "$FAIL" -eq 0 ]]

@@ -140,9 +140,11 @@ error in Claude Code):
   something; run `/chum-quarantine list`.
 
 Pausing capture for a session (say you are pasting customer data): start
-Claude Code with `CHUM_MEMORY_API_URL=http://127.0.0.1:1 claude`. Every event
-then goes to the local outbox, which is pinned to that dead URL and never
-replays. Delete those outbox files when you are done. Turning the hooks off for
+Claude Code with `CHUM_CAPTURE=0 claude`. Every hook is then a no-op: nothing
+is sent, spooled or written to `.chum-cache/`. (The older advice, a dead
+`CHUM_MEMORY_API_URL`, still wrote every prompt and tool output to the local
+outbox in clear, and after 50 failed replays offered it for `send` from
+`/chum-quarantine`; do not use it.) Turning the hooks off for
 good in your checkout means `"disableAllHooks": true` in
 `.claude/settings.local.json` (the monorepo does not gitignore it, so do not commit it). Tell the team if you do
 this, because your sessions will stop showing up for everyone else.
@@ -152,7 +154,10 @@ widened per repo with `"healthTimeoutSecs": 8` in `.chum-mem` (default 5 s); a
 tripped gate spools the whole turn instead of sending it live. A successful
 health check is reused for 60 s (`.chum-cache/.health-ok`; any failed API call
 deletes it), so most hooks skip that round-trip; `CHUM_HEALTH_CACHE_SECS=0`
-checks on every hook.
+checks on every hook. A failed check is remembered for 30 s
+(`.chum-cache/.health-down`), so with the server down only one hook in that
+window waits for the timeout and the rest spool at once;
+`CHUM_HEALTH_DOWN_SECS=0` turns that off.
 
 Auto-recall (the block added to every prompt) attaches **repository docs only**
 by default (owner decision 2026-10-11: session memory as an automatic
@@ -257,13 +262,13 @@ redaction), `drop` discards them. A session whose reply was held still closes
 normally with a placeholder summary. Clean events are not delayed; the scan is
 a few `grep -E` calls per event.
 
-Expect false positives when reading ordinary code: the generic
-`secret-assignment` rule matches lines such as `auth_token = request…` or
-`SECRET_KEY = os.getenv(…)`, so a session that reads
-`gradechum-api/gradechum/tasks/views/tasks.py` or `settings.py` gets the warning
-and those tool results stay local (go-live review, runs 800 and 805; a narrower
-rule is proposed). Run `/chum-quarantine list` and `send` if nothing in it is a
-real secret.
+Expect some false positives when reading ordinary code. The `secret-assignment`
+rule no longer matches code such as `auth_token = request…` or
+`SECRET_KEY = os.getenv(…)`, but it does match quoted literals, which test
+fixtures are full of (`password="testpass123"`, `client_secret="test-…"`): in
+review 3, 23 of the 1,280 non-migration Python files in `gradechum-api` (all
+tests or `settings_test.py`) would be held when read in full. Run
+`/chum-quarantine list` and `send` if nothing in it is a real secret.
 
 The list is a starting point, not a policy. Extend it per repo with a
 `.chum-sensitive-patterns` file at the repo root (same `name|flags|regex`
