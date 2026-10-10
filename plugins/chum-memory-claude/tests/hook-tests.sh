@@ -146,6 +146,45 @@ test_tokenizer() {
   check "unrelated doc still dropped" '[[ "$ctx" != *"unrelated.md"* ]]'
 }
 
+# ── A3b: a body-indexing server's relevance annotations drive the doc gate ──
+test_docs_relevance_gate() {
+  echo "docs_relevance_gate"
+  local r ctx prompt
+  r=$(mkrepo relgate)
+  start_fake relgate || { bad "fake api"; return; }
+  # The best doc matched in its BODY: its path and heading share no word with
+  # the prompt, so the path/heading rule alone would have dropped it.
+  jq -n '{jsonrpc:"2.0", id:1, result:{structuredContent:{nodes:[
+    {type:"section", label:"Why", metadata:{sourceFile:"notes/infra-a.md", searchScore:180, textScore:20, matchedTerms:5, queryTerms:6}},
+    {type:"document", label:"infra-a.md", metadata:{fullPath:"notes/infra-a.md", searchScore:170, textScore:19, matchedTerms:4, queryTerms:6}},
+    {type:"section", label:"Only one word", metadata:{sourceFile:"notes/one-term.md", searchScore:175, textScore:19, matchedTerms:1, queryTerms:6}},
+    {type:"section", label:"Close second", metadata:{sourceFile:"notes/second.md", searchScore:120, textScore:13, matchedTerms:3, queryTerms:6}},
+    {type:"section", label:"Weak tail", metadata:{sourceFile:"notes/tail.md", searchScore:90, textScore:9, matchedTerms:3, queryTerms:6}},
+    {type:"section", label:"Two terms", metadata:{sourceFile:"notes/two-terms.md", searchScore:178, textScore:19, matchedTerms:2, queryTerms:6}}]}}}' > "$FAKE_STATE/docs.json"
+  prompt='{"prompt":"why did the certificate renewal fail to bind port 80?"}'
+  ctx=$(hook "$r" "$FAKE_URL" "$(payload UserPromptSubmit relgate "$r" "$prompt")" | jq -r '.hookSpecificOutput.additionalContext // ""')
+  check "body-matched doc attached although its path shares no prompt word" '[[ "$ctx" == *"- [doc] notes/infra-a.md > Why"* ]]'
+  check "one doc per path" '[[ $(printf "%s\n" "$ctx" | grep -c "notes/infra-a.md") -eq 1 ]]'
+  check "a hit matching a single prompt term is dropped" '[[ "$ctx" != *"one-term.md"* ]]'
+  check "a hit matching 2 of 6 prompt terms is dropped (default minimum 3)" '[[ "$ctx" != *"two-terms.md"* ]]'
+  check "a hit within 0.6 of the best score is kept" '[[ "$ctx" == *"notes/second.md > Close second"* ]]'
+  check "a weak tail below 0.6 of the best score is dropped" '[[ "$ctx" != *"tail.md"* ]]'
+  ctx=$(hook "$r" "$FAKE_URL" "$(payload UserPromptSubmit relgate "$r" "$prompt")" CHUM_AUTO_RECALL_DOCS_RATIO=0.4 \
+    | jq -r '.hookSpecificOutput.additionalContext // ""')
+  check "CHUM_AUTO_RECALL_DOCS_RATIO=0.4 lets the tail in" '[[ "$ctx" == *"notes/tail.md"* ]]'
+  ctx=$(hook "$r" "$FAKE_URL" "$(payload UserPromptSubmit relgate "$r" "$prompt")" CHUM_AUTO_RECALL_DOCS_MIN_TERMS=2 \
+    | jq -r '.hookSpecificOutput.additionalContext // ""')
+  check "CHUM_AUTO_RECALL_DOCS_MIN_TERMS=2 admits the 2-term hit" '[[ "$ctx" == *"notes/two-terms.md"* ]]'
+  jq -n '{jsonrpc:"2.0", id:1, result:{structuredContent:{nodes:[
+    {type:"section", label:"Short", metadata:{sourceFile:"notes/short.md", searchScore:50, textScore:6, matchedTerms:2, queryTerms:2}}]}}}' > "$FAKE_STATE/docs.json"
+  ctx=$(hook "$r" "$FAKE_URL" "$(payload UserPromptSubmit relgate "$r" '{"prompt":"certificate renewal broken"}')" | jq -r '.hookSpecificOutput.additionalContext // ""')
+  check "a 2-term prompt needs both terms, not 3" '[[ "$ctx" == *"notes/short.md"* ]]'
+  jq -n '{jsonrpc:"2.0", id:1, result:{structuredContent:{nodes:[
+    {type:"section", label:"certificate renewal port", metadata:{sourceFile:"notes/x.md", searchScore:60, textScore:5, matchedTerms:1, queryTerms:6}}]}}}' > "$FAKE_STATE/docs.json"
+  ctx=$(hook "$r" "$FAKE_URL" "$(payload UserPromptSubmit relgate "$r" "$prompt")" | jq -r '.hookSpecificOutput.additionalContext // ""')
+  check "annotated hits all below 2 matched terms: no docs block (heading words do not override)" '[[ "$ctx" != *"Team docs"* ]]'
+}
+
 # ── A4: session/start 503 -> deferred start; replay lands events in a real session ──
 test_deferred_start_replay() {
   echo "deferred_start_replay"
@@ -332,7 +371,7 @@ test_quarantine_send_locked() {
   check "the held file is gone and the lock released" '[[ ! -e "$q" && ! -d "$out.lock" ]]'
 }
 
-ALL="concurrent_append fence_forgery tokenizer deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked"
+ALL="concurrent_append fence_forgery tokenizer docs_relevance_gate deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked"
 for t in ${*:-$ALL}; do "test_$t"; done
 echo "passed $PASS, failed $FAIL, skipped $SKIP  (scratch: $TMP)"
 [[ "$FAIL" -eq 0 ]]

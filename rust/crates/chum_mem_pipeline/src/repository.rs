@@ -1020,19 +1020,33 @@ fn extract_document_file(
 
     let heading_pattern = Regex::new(r"(?m)^(#{1,6})\s+(.+)$").unwrap();
     let headings = heading_pattern.captures_iter(content).collect::<Vec<_>>();
+    // Body text per section (and the preamble before the first heading on the
+    // file node), so the repository search can match what a document SAYS, not
+    // only its path and headings. Capped per node; stripped from every API
+    // response by the knowledge layer (it is an index field, not output).
+    let mut budget = DOC_TEXT_MAX_CHARS_PER_FILE;
+    if let Some(first) = headings.first().and_then(|captures| captures.get(0)) {
+        if let Some(text) = section_body_text(&content[..first.start()], &mut budget) {
+            set_metadata_text(&mut nodes[0].metadata, text);
+        }
+    }
     if headings.is_empty() {
         let section_id = format!("section:{}:root", file.relative_path);
+        let mut metadata = json!({
+            "headingLevel": 0,
+            "sourceFile": file.relative_path,
+            "heading": filename_of(&file.relative_path),
+        });
+        if let Some(text) = section_body_text(content, &mut budget) {
+            set_metadata_text(&mut metadata, text);
+        }
         nodes.push(KnowledgeNode {
             id: section_id.clone(),
             label: filename_of(&file.relative_path),
             node_type: "section".to_string(),
             source_type: "derived".to_string(),
             source_id: file.relative_path.clone(),
-            metadata: json!({
-                "headingLevel": 0,
-                "sourceFile": file.relative_path,
-                "heading": filename_of(&file.relative_path),
-            }),
+            metadata,
             community_id: None,
         });
         edges.push(edge(
@@ -1045,7 +1059,13 @@ fn extract_document_file(
         ));
     }
 
-    for captures in headings {
+    let section_ends: Vec<usize> = headings
+        .iter()
+        .skip(1)
+        .filter_map(|captures| captures.get(0).map(|value| value.start()))
+        .chain(std::iter::once(content.len()))
+        .collect();
+    for (index, captures) in headings.into_iter().enumerate() {
         let Some(markers) = captures.get(1).map(|value| value.as_str()) else {
             continue;
         };
@@ -1070,12 +1090,20 @@ fn extract_document_file(
             node_type: classify_heading(heading).to_string(),
             source_type: "derived".to_string(),
             source_id: file.relative_path.clone(),
-            metadata: json!({
-                "headingLevel": markers.len(),
-                "heading": heading,
-                "sourceFile": file.relative_path,
-                "sourceLocation": format!("L{line}"),
-            }),
+            metadata: {
+                let mut metadata = json!({
+                    "headingLevel": markers.len(),
+                    "heading": heading,
+                    "sourceFile": file.relative_path,
+                    "sourceLocation": format!("L{line}"),
+                });
+                let body_end = section_ends.get(index).copied().unwrap_or(content.len());
+                let body_start = source_match.end().min(body_end);
+                if let Some(text) = section_body_text(&content[body_start..body_end], &mut budget) {
+                    set_metadata_text(&mut metadata, text);
+                }
+                metadata
+            },
             community_id: None,
         });
         edges.push(edge(
@@ -1809,6 +1837,33 @@ fn normalize_relative_path(path: PathBuf) -> String {
         }
     }
     parts.join("/")
+}
+
+/// Body text kept per document node for the repository text search.
+const DOC_TEXT_MAX_CHARS_PER_NODE: usize = 6_000;
+/// Total body text kept per document across all of its nodes.
+const DOC_TEXT_MAX_CHARS_PER_FILE: usize = 24_000;
+
+/// Whitespace-collapsed section body, capped per node and against the file's
+/// remaining budget. `None` when empty or the budget is spent.
+fn section_body_text(raw: &str, budget: &mut usize) -> Option<String> {
+    if *budget == 0 {
+        return None;
+    }
+    let collapsed = collapse_ws(raw);
+    if collapsed.is_empty() {
+        return None;
+    }
+    let cap = DOC_TEXT_MAX_CHARS_PER_NODE.min(*budget);
+    let text = truncate(&collapsed, cap);
+    *budget = budget.saturating_sub(text.chars().count());
+    Some(text)
+}
+
+fn set_metadata_text(metadata: &mut serde_json::Value, text: String) {
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("text".to_string(), serde_json::Value::String(text));
+    }
 }
 
 fn classify_heading(heading: &str) -> &'static str {
@@ -2682,5 +2737,28 @@ def helper():
         }
 
         fs::remove_dir_all(&temp_root).expect("remove temp root");
+    }
+
+
+    #[test]
+    fn document_sections_carry_capped_body_text() {
+        let long = "word ".repeat(5_000);
+        let content = format!("preamble about hotfix rules\n# First\nalpha beta\n## Second\n{long}\n");
+        let (nodes, _) = parse_file_batch(&[("docs/a.md".to_string(), content)]);
+        let file = nodes.iter().find(|n| n.id == "file:docs/a.md").expect("file node");
+        assert_eq!(
+            file.metadata.get("text").and_then(|v| v.as_str()),
+            Some("preamble about hotfix rules")
+        );
+        let first = nodes.iter().find(|n| n.label == "First").expect("first section");
+        assert_eq!(first.metadata.get("text").and_then(|v| v.as_str()), Some("alpha beta"));
+        let second = nodes.iter().find(|n| n.label == "Second").expect("second section");
+        let text = second.metadata.get("text").and_then(|v| v.as_str()).unwrap_or_default();
+        assert_eq!(text.chars().count(), DOC_TEXT_MAX_CHARS_PER_NODE);
+        assert!(!text.contains("# Second"), "heading line is not body text");
+
+        let headless = parse_file_batch(&[("b.md".to_string(), "just a body\n".to_string())]).0;
+        let root = headless.iter().find(|n| n.id == "section:b.md:root").expect("root section");
+        assert_eq!(root.metadata.get("text").and_then(|v| v.as_str()), Some("just a body"));
     }
 }
