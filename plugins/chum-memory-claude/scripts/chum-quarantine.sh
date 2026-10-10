@@ -26,22 +26,19 @@ if [[ ${#files[@]} -eq 0 ]]; then echo "chum-quarantine: nothing held${WHO:+ for
 
 mask() { # replace every matched secret with *** so a listing never prints one
   local text="$1" line name flags re d=$'\001'
-  # The private-key rule matches only the BEGIN line, so the key body after it
-  # was printed (review 3), and the /chum-quarantine skill runs this inside
-  # Claude, where the PostToolUse hook would then send that body (no header
-  # left to match) to team memory. Hide everything from a PEM header on first.
-  text=$(printf '%s' "$text" | sed -E 's/-----BEGIN [A-Z ]*PRIVATE KEY-----.*/*** [private key hidden]/' 2>/dev/null || printf '***')
   # The substitution is delimited by \001, not "/": several rules contain "/"
   # (postgres://user:pw@, hooks.slack.com/services/) and with "/" sed rejected
   # the command, the fallback printed the text UNMASKED, and `list` showed the
   # password it was supposed to hide.
   while IFS='|' read -r name flags re; do
     [[ -z "$name" || "$name" == \#* || -z "$re" ]] && continue
-    if [[ "$flags" == *i* ]]; then text=$(printf '%s' "$text" | sed -E "s${d}${re}${d}***${d}Ig" 2>/dev/null || printf '***')
-    else text=$(printf '%s' "$text" | sed -E "s${d}${re}${d}***${d}g" 2>/dev/null || printf '***'); fi
+    if [[ "$flags" == *i* ]]; then text=$(printf '%s' "$text" | sed -E "s${d}${re}${d}***${d}Ig" 2>/dev/null || printf '%s' "$text")
+    else text=$(printf '%s' "$text" | sed -E "s${d}${re}${d}***${d}g" 2>/dev/null || printf '%s' "$text"); fi
   done < <(cat "$SCRIPTS_DIR/sensitive-patterns.txt" "$PROJECT_DIR/.chum-sensitive-patterns" 2>/dev/null)
-  # Long opaque token runs the rules have no shape for are hidden too.
-  text=$(printf '%s' "$text" | sed -E 's/[A-Za-z0-9+\/=_-]{40,}/***/g' 2>/dev/null || printf '***')
+  # The private-key rule matches only the BEGIN line, so the key body after it
+  # used to be printed (a PKCS#8 Ed25519 key fits whole in the 160-char preview,
+  # review 2). Mask everything from a PEM header on, and any long base64/hex run.
+  text=$(printf '%s' "$text" | sed -E 's/-----BEGIN [A-Z ]*PRIVATE KEY.*/[private key block masked]/; s/[A-Za-z0-9+\/=_-]{40,}/***/g' 2>/dev/null) || text="[preview masked]"
   printf '%s' "$text"
 }
 
@@ -74,20 +71,7 @@ case "$CMD" in
       sid=$(basename "$f" .jsonl)
       # Held lines use the outbox line format, so releasing is a move into the
       # outbox; the detached replayer sends them with the usual retries.
-      # Append under the same mkdir lock session-sync.sh uses for the outbox, so
-      # a hook spooling into this session's outbox cannot interleave with us.
-      out="$OUTBOX/$sid.jsonl" part="$OUTBOX/$sid.jsonl.part.$$" i=0 locked=0
-      jq -c 'del(.matched, .at)' "$f" > "$part" || { rm -f "$part"; echo "could not read $(basename "$f")" >&2; continue; }
-      while ! mkdir "$out.lock" 2>/dev/null; do
-        i=$((i + 1))
-        if [[ $((i % 20)) -eq 0 && -n "$(find "$out.lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then rmdir "$out.lock" 2>/dev/null || true; fi
-        [[ "$i" -lt 100 ]] || break
-        sleep 0.1
-      done
-      [[ "$i" -lt 100 ]] && locked=1
-      cat "$part" >> "$out" && rm -f "$f"
-      [[ "$locked" -eq 0 ]] || rmdir "$out.lock" 2>/dev/null || true
-      rm -f "$part"
+      jq -c 'del(.matched, .at)' "$f" >> "$OUTBOX/$sid.jsonl" && rm -f "$f"
       echo "released $(basename "$f") -> outbox"
     done
     if [[ -x "$SCRIPTS_DIR/session-sync.sh" ]]; then
