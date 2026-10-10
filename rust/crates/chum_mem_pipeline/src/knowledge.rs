@@ -386,6 +386,18 @@ pub fn project_graph_for_dashboard(
     max_nodes: usize,
     max_edges: usize,
 ) -> (KnowledgeGraph, GraphProjection) {
+    let (mut projected, projection) = project_graph_for_dashboard_inner(graph, max_nodes, max_edges);
+    if projected.nodes.iter().any(|node| node.metadata.get("text").is_some()) {
+        projected.nodes = projected.nodes.iter().map(without_search_text).collect();
+    }
+    (projected, projection)
+}
+
+fn project_graph_for_dashboard_inner(
+    graph: &KnowledgeGraph,
+    max_nodes: usize,
+    max_edges: usize,
+) -> (KnowledgeGraph, GraphProjection) {
     if graph.nodes.len() <= max_nodes && graph.edges.len() <= max_edges {
         return (
             graph.clone(),
@@ -762,6 +774,19 @@ pub fn run_knowledge_query(
     text: Option<&str>,
     depth: usize,
 ) -> GraphQueryResponse {
+    let mut response = run_knowledge_query_inner(graph, query, node_id, target_node_id, text, depth);
+    response.nodes = response.nodes.iter().map(without_search_text).collect();
+    response
+}
+
+fn run_knowledge_query_inner(
+    graph: &KnowledgeGraph,
+    query: &str,
+    node_id: Option<&str>,
+    target_node_id: Option<&str>,
+    text: Option<&str>,
+    depth: usize,
+) -> GraphQueryResponse {
     match query {
         "hub_nodes" => {
             let mut degree = HashMap::<&str, usize>::new();
@@ -865,18 +890,33 @@ pub fn run_knowledge_query(
                     .collect()
             };
 
+            // Function words ("the", "what", "and") matched nearly every node and
+            // filled the result with unrelated docs; they carry no topic.
+            let search_tokens: Vec<String> = search_tokens
+                .into_iter()
+                .filter(|token| !is_search_stopword(token))
+                .collect();
+            // Text relevance (BM25) over document and section bodies, so a prose
+            // question finds the doc that answers it even when its path and
+            // headings share no words with the question.
+            let query_terms = text_terms(&search);
+            let text_scores = text_relevance_scores(graph, &query_terms);
+
             // Score nodes with path-, symbol-, and section-aware heuristics.
             let mut scored: Vec<(f64, &KnowledgeNode)> = graph
                 .nodes
                 .iter()
-                .filter_map(|node| {
+                .enumerate()
+                .filter_map(|(index, node)| {
                     if !seed.is_empty() && node.id == seed {
                         return Some((1000.0, node));
                     }
-                    if search.is_empty() || search_tokens.is_empty() {
+                    if search.is_empty() || (search_tokens.is_empty() && query_terms.is_empty()) {
                         return None;
                     }
-                    let score = score_search_node(node, &search, &search_tokens);
+                    let text = text_scores.get(&index).map(|(score, _)| *score).unwrap_or(0.0);
+                    let score = score_search_node(node, &search, &search_tokens)
+                        + TEXT_RELEVANCE_WEIGHT * text;
 
                     if score > 0.0 {
                         Some((score, node))
@@ -892,7 +932,44 @@ pub fn run_knowledge_query(
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.1.label.cmp(&b.1.label))
             });
-            let nodes = diversify_scored_nodes(scored, 10);
+            // Annotate each hit so a client can gate on relevance instead of
+            // guessing from the path: searchScore (combined), textScore (BM25),
+            // matchedTerms / queryTerms (distinct query terms found in the body),
+            // and a short snippet around the first match.
+            let index_of: HashMap<&str, usize> = graph
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(index, node)| (node.id.as_str(), index))
+                .collect();
+            let annotated: Vec<(f64, KnowledgeNode)> = scored
+                .into_iter()
+                .map(|(score, node)| {
+                    let mut out = node.clone();
+                    let (text_score, matched) = index_of
+                        .get(node.id.as_str())
+                        .and_then(|index| text_scores.get(index))
+                        .copied()
+                        .unwrap_or((0.0, 0));
+                    let snippet = metadata_str(&node.metadata, "text")
+                        .and_then(|text| search_snippet(text, &query_terms));
+                    if let Value::Object(map) = &mut out.metadata {
+                        map.remove("text");
+                        map.insert("searchScore".to_string(), json!(round3(score)));
+                        map.insert("textScore".to_string(), json!(round3(text_score)));
+                        map.insert("matchedTerms".to_string(), json!(matched));
+                        map.insert("queryTerms".to_string(), json!(query_terms.len()));
+                        if let Some(snippet) = snippet {
+                            map.insert("snippet".to_string(), Value::String(snippet));
+                        }
+                    }
+                    (score, out)
+                })
+                .collect();
+            let nodes = diversify_scored_nodes(
+                annotated.iter().map(|(score, node)| (*score, node)).collect(),
+                10,
+            );
             let selected: HashSet<String> = nodes.iter().map(|node| node.id.clone()).collect();
             let edges = graph
                 .edges
@@ -915,7 +992,15 @@ pub fn run_knowledge_query(
 }
 
 fn score_search_node(node: &KnowledgeNode, search: &str, search_tokens: &[String]) -> f64 {
-    let haystack = format!("{} {} {}", node.id, node.label, node.metadata).to_lowercase();
+    let haystack = if node.metadata.get("text").is_some() {
+        let mut metadata = node.metadata.clone();
+        if let Value::Object(map) = &mut metadata {
+            map.remove("text");
+        }
+        format!("{} {} {}", node.id, node.label, metadata).to_lowercase()
+    } else {
+        format!("{} {} {}", node.id, node.label, node.metadata).to_lowercase()
+    };
     let id_lower = node.id.to_lowercase();
     let label_lower = node.label.to_lowercase();
     let source_id_lower = node.source_id.to_lowercase();
@@ -1110,6 +1195,179 @@ fn score_search_node(node: &KnowledgeNode, search: &str, search_tokens: &[String
     }
 
     score
+}
+
+/// How much one unit of BM25 text relevance weighs against the path/heading
+/// heuristic. Exact path or name matches (110-260) still win for path-like
+/// queries; for prose questions the body text decides.
+const TEXT_RELEVANCE_WEIGHT: f64 = 8.0;
+const BM25_K1: f64 = 1.2;
+const BM25_B: f64 = 0.75;
+/// Heading and path words count as this many body occurrences.
+const BM25_FIELD_BOOST: f64 = 2.0;
+
+const SEARCH_STOPWORDS: &[&str] = &[
+    "a", "about", "above", "after", "again", "against", "all", "also", "am", "an", "and",
+    "any", "are", "as", "at", "be", "because", "been", "before", "being", "below",
+    "between", "both", "but", "by", "can", "could", "did", "do", "does", "doing", "done",
+    "down", "during", "each", "either", "else", "even", "ever", "every", "few", "for",
+    "from", "further", "get", "got", "had", "has", "have", "having", "he", "her", "here",
+    "hers", "him", "his", "how", "i", "if", "in", "into", "is", "it", "its", "itself",
+    "just", "let", "me", "more", "most", "my", "no", "nor", "not", "now", "of", "off",
+    "on", "once", "only", "or", "other", "our", "out", "over", "own", "same", "she",
+    "should", "so", "some", "such", "than", "that", "the", "their", "them", "then",
+    "there", "these", "they", "this", "those", "through", "to", "too", "under", "until",
+    "up", "very", "was", "we", "were", "what", "when", "where", "which", "while", "who",
+    "whom", "why", "will", "with", "would", "you", "your", "yours", "yes", "via", "per",
+    "etc", "one", "two", "use", "used", "using",
+];
+
+fn is_search_stopword(token: &str) -> bool {
+    SEARCH_STOPWORDS.contains(&token)
+}
+
+/// Light suffix stemming so "failures"/"failure" and "lapsed"/"lapse" meet.
+fn stem_term(term: &str) -> String {
+    let n = term.len();
+    if n > 4 && term.ends_with("ies") {
+        format!("{}y", &term[..n - 3])
+    } else if n > 5 && term.ends_with("ing") {
+        term[..n - 3].to_string()
+    } else if n > 4 && term.ends_with("ed") {
+        term[..n - 2].to_string()
+    } else if n > 3 && term.ends_with('s') && !term.ends_with("ss") {
+        term[..n - 1].to_string()
+    } else {
+        term.to_string()
+    }
+}
+
+/// Lowercase word terms for the text index: `[a-z0-9_]+`, snake_case words
+/// also split into their parts, stopwords and 1-char terms dropped, stemmed.
+pub fn text_terms(text: &str) -> Vec<String> {
+    let lowered = text.to_lowercase();
+    let mut out = Vec::new();
+    for word in lowered
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .filter(|word| !word.is_empty())
+    {
+        let mut push = |part: &str| {
+            if part.len() >= 2 && !is_search_stopword(part) {
+                out.push(stem_term(part));
+            }
+        };
+        push(word);
+        if word.contains('_') {
+            for part in word.split('_').filter(|part| !part.is_empty()) {
+                push(part);
+            }
+        }
+    }
+    out
+}
+
+/// BM25 over every node that carries body text or is a document/section:
+/// fields = body text, heading/label (boosted) and path words (boosted).
+/// Returns node index -> (score, distinct query terms matched).
+fn text_relevance_scores(graph: &KnowledgeGraph, query_terms: &[String]) -> HashMap<usize, (f64, usize)> {
+    let mut scores = HashMap::new();
+    let mut unique: Vec<&String> = Vec::new();
+    for term in query_terms {
+        if !unique.contains(&term) {
+            unique.push(term);
+        }
+    }
+    if unique.is_empty() {
+        return scores;
+    }
+    let mut docs: Vec<(usize, HashMap<String, f64>, f64)> = Vec::new();
+    for (index, node) in graph.nodes.iter().enumerate() {
+        let text = metadata_str(&node.metadata, "text");
+        let is_doc_like = matches!(
+            node.node_type.as_str(),
+            "document" | "section" | "decision" | "task" | "rationale"
+        );
+        if text.is_none() && !is_doc_like {
+            continue;
+        }
+        let mut tf: HashMap<String, f64> = HashMap::new();
+        if let Some(text) = text {
+            for term in text_terms(text) {
+                *tf.entry(term).or_default() += 1.0;
+            }
+        }
+        for term in text_terms(&node.label) {
+            *tf.entry(term).or_default() += BM25_FIELD_BOOST;
+        }
+        let path = metadata_str(&node.metadata, "fullPath")
+            .or_else(|| metadata_str(&node.metadata, "sourceFile"))
+            .unwrap_or(node.source_id.as_str());
+        for term in text_terms(&path.replace(['/', '-', '.'], " ")) {
+            *tf.entry(term).or_default() += BM25_FIELD_BOOST;
+        }
+        let len = tf.values().sum::<f64>();
+        docs.push((index, tf, len));
+    }
+    if docs.is_empty() {
+        return scores;
+    }
+    let total = docs.len() as f64;
+    let avg_len = (docs.iter().map(|(_, _, len)| *len).sum::<f64>() / total).max(1.0);
+    let idf: Vec<f64> = unique
+        .iter()
+        .map(|term| {
+            let df = docs.iter().filter(|(_, tf, _)| tf.contains_key(term.as_str())).count() as f64;
+            (1.0 + (total - df + 0.5) / (df + 0.5)).ln()
+        })
+        .collect();
+    for (index, tf, len) in &docs {
+        let mut score = 0.0;
+        let mut matched = 0;
+        for (term, idf) in unique.iter().zip(&idf) {
+            let Some(freq) = tf.get(term.as_str()) else {
+                continue;
+            };
+            score += idf * freq * (BM25_K1 + 1.0)
+                / (freq + BM25_K1 * (1.0 - BM25_B + BM25_B * len / avg_len));
+            matched += 1;
+        }
+        if score > 0.0 {
+            scores.insert(*index, (score, matched));
+        }
+    }
+    scores
+}
+
+/// Up to ~240 chars of body text around the first query-term match.
+fn search_snippet(text: &str, query_terms: &[String]) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    let lowered = text.to_lowercase();
+    let position = query_terms
+        .iter()
+        .filter_map(|term| lowered.find(term.as_str()))
+        .min()
+        .unwrap_or(0);
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let at = chars.iter().position(|(byte, _)| *byte >= position).unwrap_or(0);
+    let start = at.saturating_sub(80);
+    let snippet: String = chars[start..].iter().take(240).map(|(_, ch)| *ch).collect();
+    let snippet = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!snippet.is_empty()).then_some(snippet)
+}
+
+fn round3(value: f64) -> f64 {
+    (value * 1000.0).round() / 1000.0
+}
+
+/// A node as shown to clients: the body text is an index field, never output.
+fn without_search_text(node: &KnowledgeNode) -> KnowledgeNode {
+    let mut out = node.clone();
+    if let Value::Object(map) = &mut out.metadata {
+        map.remove("text");
+    }
+    out
 }
 
 fn diversify_scored_nodes(scored: Vec<(f64, &KnowledgeNode)>, limit: usize) -> Vec<KnowledgeNode> {
@@ -3140,5 +3398,126 @@ mod tests {
         assert_eq!(map.get(&memory_a).copied(), Some(7));
         assert!(!map.contains_key(&memory_b), "unassigned memory filtered");
         assert_eq!(map.len(), 1, "non-memory nodes excluded");
+    }
+
+
+    fn docs_graph(files: &[(&str, &str)]) -> KnowledgeGraph {
+        let owned: Vec<(String, String)> = files
+            .iter()
+            .map(|(path, content)| (path.to_string(), content.to_string()))
+            .collect();
+        let (nodes, edges) = crate::parse_file_batch(&owned);
+        KnowledgeGraph {
+            version: "test".to_string(),
+            generated_at: "2026-10-11T00:00:00Z".to_string(),
+            project_id: Uuid::nil(),
+            nodes,
+            edges,
+            communities: Vec::new(),
+            statistics: GraphStatistics {
+                node_count: 0,
+                edge_count: 0,
+                community_count: 0,
+                evidence_distribution: EvidenceDistribution::default(),
+                avg_degree: 0.0,
+                density: 0.0,
+                isolated_nodes: 0,
+            },
+        }
+    }
+
+    fn search_paths(graph: &KnowledgeGraph, text: &str) -> Vec<String> {
+        let mut paths: Vec<String> = Vec::new();
+        for node in run_knowledge_query(graph, "search", None, None, Some(text), 1).nodes {
+            let path = metadata_str(&node.metadata, "fullPath")
+                .or_else(|| metadata_str(&node.metadata, "sourceFile"))
+                .unwrap_or(node.source_id.as_str())
+                .to_string();
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        paths
+    }
+
+    #[test]
+    fn search_finds_a_doc_by_its_body_text() {
+        // The answer is only in the body: neither path nor heading shares a word
+        // with the question.
+        let graph = docs_graph(&[
+            ("notes/infra-a.md", "# Notes\nThe certificate lapsed because certbot standalone could not bind port 80 once nginx owned it; renewal now uses webroot.\n"),
+            ("notes/infra-b.md", "# Notes\nThe queue worker polls every five seconds and keeps the database compute awake.\n"),
+            ("docs/certificates-and-tls-guide.md", "# TLS guide\nGeneral advice about choosing cipher suites.\n"),
+        ]);
+        let paths = search_paths(&graph, "Why did the certificate renewal fail to bind port 80?");
+        assert_eq!(paths.first().map(String::as_str), Some("notes/infra-a.md"), "{paths:?}");
+    }
+
+    #[test]
+    fn search_indexes_text_before_the_first_heading() {
+        let graph = docs_graph(&[
+            ("a.md", "---\ndescription: hotfixes branch from production-patch, never main\n---\nBody line.\n# How to apply\nFetch first.\n"),
+            ("b.md", "# Branching\nFeature work starts from staging.\n"),
+        ]);
+        let paths = search_paths(&graph, "do hotfixes go to production-patch or main?");
+        assert_eq!(paths.first().map(String::as_str), Some("a.md"), "{paths:?}");
+    }
+
+    #[test]
+    fn search_annotates_hits_and_never_returns_body_text() {
+        let graph = docs_graph(&[(
+            "notes/idle.md",
+            "# Cost\nThe processor idle wait polls up to 2700 seconds inside the request, so Cloud Run bills the wait.\n",
+        )]);
+        let response =
+            run_knowledge_query(&graph, "search", None, None, Some("processor idle wait cost"), 1);
+        let hit = response
+            .nodes
+            .iter()
+            .find(|node| node.node_type == "section")
+            .expect("section hit");
+        assert!(hit.metadata.get("text").is_none(), "body text must not be returned");
+        assert!(hit.metadata.get("searchScore").and_then(Value::as_f64).unwrap_or(0.0) > 0.0);
+        assert!(hit.metadata.get("matchedTerms").and_then(Value::as_u64).unwrap_or(0) >= 3);
+        assert_eq!(hit.metadata.get("queryTerms").and_then(Value::as_u64), Some(4));
+        let snippet = metadata_str(&hit.metadata, "snippet").unwrap_or_default();
+        assert!(snippet.contains("idle wait"), "{snippet}");
+        // Other query kinds strip it too.
+        let communities = run_knowledge_query(&graph, "communities", None, None, None, 1);
+        let neighbors =
+            run_knowledge_query(&graph, "neighbors", Some("file:notes/idle.md"), None, None, 1);
+        for node in communities.nodes.iter().chain(neighbors.nodes.iter()) {
+            assert!(node.metadata.get("text").is_none(), "{node:?}");
+        }
+        let (projected, _) = project_graph_for_dashboard(&graph, 1000, 1000);
+        assert!(projected.nodes.iter().all(|node| node.metadata.get("text").is_none()));
+    }
+
+    #[test]
+    fn stopword_only_queries_return_nothing() {
+        let graph = docs_graph(&[("a.md", "# The plan\nWhat we do and why.\n")]);
+        let response =
+            run_knowledge_query(&graph, "search", None, None, Some("what is the and of"), 1);
+        assert!(response.nodes.is_empty(), "{:?}", response.nodes);
+    }
+
+    #[test]
+    fn exact_path_queries_still_rank_the_file_first() {
+        let graph = docs_graph(&[
+            ("docs/sample.md", "# Repository QA Guide\nsample sample sample sample.\n"),
+            ("src/sample.md", "# Other\nNothing.\n"),
+        ]);
+        let response = run_knowledge_query(&graph, "search", None, None, Some("src/sample.md"), 1);
+        assert_eq!(response.nodes.first().map(|node| node.id.as_str()), Some("file:src/sample.md"));
+    }
+
+    #[test]
+    fn text_terms_split_snake_case_drop_stopwords_and_stem() {
+        let terms = text_terms("What is default_transaction_read_only and the failures?");
+        assert!(terms.contains(&"default_transaction_read_only".to_string()));
+        assert!(terms.contains(&"transaction".to_string()));
+        assert!(terms.contains(&"failure".to_string()));
+        assert!(!terms.contains(&"what".to_string()));
+        assert!(!terms.contains(&"the".to_string()));
     }
 }
