@@ -24,6 +24,10 @@ pub struct SessionRow {
     pub external_session_id: String,
     pub status: String,
     pub branch: Option<String>,
+    /// Memories were derived for the current run of this session (set by the
+    /// inline `session/end`; cleared when `session/start` reactivates it).
+    #[sqlx(default)]
+    pub derived: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -422,6 +426,17 @@ pub async fn upsert_ingested_project(
     Ok(())
 }
 
+/// RFC 3339 timestamp from a request's metadata (imports send the
+/// transcript's first/last event time as `startedAt` / `endedAt`, so a
+/// backfill keeps real dates instead of the import time). Unparseable or
+/// future values are ignored.
+pub fn metadata_timestamp(metadata: &Value, key: &str) -> Option<time::OffsetDateTime> {
+    let raw = metadata.get(key)?.as_str()?;
+    let parsed =
+        time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).ok()?;
+    (parsed <= time::OffsetDateTime::now_utc() + time::Duration::minutes(5)).then_some(parsed)
+}
+
 pub async fn upsert_session(
     tx: &mut Transaction<'_, Postgres>,
     context: &RepositoryContext,
@@ -445,14 +460,26 @@ pub async fn upsert_session(
           external_session_id,
           branch,
           status,
-          metadata
+          metadata,
+          started_at
         )
-        values ($1, $2, $3, $4, $5, $6, $7, 'active'::public.session_status, $8)
+        values ($1, $2, $3, $4, $5, $6, $7, 'active'::public.session_status, $8, coalesce($9, now()))
         on conflict (project_id, provider, external_session_id)
         do update set
-          status = 'active'::public.session_status,
-          branch = excluded.branch,
-          metadata = excluded.metadata
+          -- A completed session stays completed: start used to reactivate it,
+          -- so a start with no matching end (quarantine release, partial
+          -- replay) left it active forever and its events were never derived.
+          -- Events appended to a completed session schedule a derivation
+          -- instead (see the API's append path), and every session/end
+          -- derives again. Metadata is merged so `derivedAt` and the summary
+          -- survive.
+          status = case
+            when public.sessions.status = 'completed'::public.session_status
+              then public.sessions.status
+            else 'active'::public.session_status
+          end,
+          branch = coalesce(excluded.branch, public.sessions.branch),
+          metadata = coalesce(public.sessions.metadata, '{}'::jsonb) || excluded.metadata
         returning id, organization_id, team_id, project_id, status::text as status
         "#,
     )
@@ -464,6 +491,7 @@ pub async fn upsert_session(
     .bind(&input.external_session_id)
     .bind(input.repo.branch.as_deref())
     .bind(Value::Object(metadata))
+    .bind(metadata_timestamp(&input.metadata, "startedAt"))
     .fetch_one(&mut **tx)
     .await?;
 
@@ -526,7 +554,8 @@ pub async fn resolve_session(
           project_id,
           external_session_id,
           status::text as status,
-          branch
+          branch,
+          coalesce(metadata ? 'derivedAt', false) as derived
         from public.sessions
         where id = $1
           and organization_id = $2
@@ -1051,9 +1080,19 @@ pub async fn insert_memory(
         r#"
         insert into public.memories (
           organization_id, team_id, project_id, session_id, episode_id, type, title, content,
-          summary, importance_score, confidence_score, metadata, created_by
+          summary, importance_score, confidence_score, metadata, created_by, created_at
         )
-        values ($1, $2, $3, $4, $5, $6::public.memory_type, $7, $8, $9, $10, $11, $12, $13)
+        values (
+          $1, $2, $3, $4, $5, $6::public.memory_type, $7, $8, $9, $10, $11, $12, $13,
+          -- Backfilled sessions end in the past (the importer sends the
+          -- transcript's last event time); date their memories then, not at
+          -- import time, so recency ranks real history correctly.
+          coalesce(
+            (select s.ended_at from public.sessions s
+             where s.id = $4 and s.ended_at < now() - interval '1 hour'),
+            now()
+          )
+        )
         returning id
         "#,
     )
@@ -1166,17 +1205,26 @@ pub async fn append_memory_provenance_preview(
     Ok(())
 }
 
+/// `ended_at`: an explicit end time (imports pass the transcript's last event
+/// time); otherwise, with `keep_existing_end` (the worker's derivation
+/// callback), a completed session keeps its end time; otherwise it ends now.
 pub async fn mark_session_completed(
     tx: &mut Transaction<'_, Postgres>,
     session_id: Uuid,
     metadata_patch: &Value,
+    ended_at: Option<time::OffsetDateTime>,
+    keep_existing_end: bool,
 ) -> Result<SessionEndResult, DbError> {
     sqlx::query_as::<_, SessionEndResult>(
         r#"
         update public.sessions
         set
+          ended_at = coalesce(
+            $3,
+            case when $4 and status = 'completed'::public.session_status then ended_at end,
+            now()
+          ),
           status = 'completed'::public.session_status,
-          ended_at = now(),
           metadata = coalesce(metadata, '{}'::jsonb) || $2
         where id = $1
         returning id, project_id, status::text as status
@@ -1184,6 +1232,8 @@ pub async fn mark_session_completed(
     )
     .bind(session_id)
     .bind(metadata_patch)
+    .bind(ended_at)
+    .bind(keep_existing_end)
     .fetch_one(&mut **tx)
     .await
     .map_err(DbError::from)
@@ -1698,6 +1748,63 @@ pub async fn claim_next_worker_job(
     .map_err(DbError::from)
 }
 
+/// Outcome of [`requeue_running_worker_jobs`].
+#[derive(Debug, Default, Clone)]
+pub struct RequeueOutcome {
+    pub requeued: Vec<Uuid>,
+    pub poisoned: Vec<Uuid>,
+}
+
+/// Put every `running` job of this tenant back to `pending` (or `poisoned` when
+/// its claim attempts are exhausted). Called once at worker start: the queue has
+/// no lease expiry or heartbeat, so a job that was in flight when the previous
+/// worker process died stayed `running` forever (FINDINGS F35). The deployment
+/// runs a single worker container (`WORKER_CONCURRENCY=1`, one `worker`
+/// service), so nothing else can legitimately own a running job at start-up.
+pub async fn requeue_running_worker_jobs(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &RepositoryContext,
+    reason: &str,
+) -> Result<RequeueOutcome, DbError> {
+    let rows = sqlx::query(
+        r#"
+        update public.worker_jobs
+        set
+          status = case
+            when attempts >= max_attempts then 'poisoned'::public.worker_job_status
+            else 'pending'::public.worker_job_status
+          end,
+          worker_id = null,
+          claimed_at = null,
+          completed_at = case when attempts >= max_attempts then now() else null end,
+          available_at = now(),
+          updated_at = now(),
+          last_error = $3
+        where organization_id = $1
+          and team_id = $2
+          and status = 'running'::public.worker_job_status
+        returning id, status::text as status
+        "#,
+    )
+    .bind(context.organization_id)
+    .bind(context.team_id)
+    .bind(reason)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut outcome = RequeueOutcome::default();
+    for row in rows {
+        let id: Uuid = row.get("id");
+        let status: String = row.get("status");
+        if status == "poisoned" {
+            outcome.poisoned.push(id);
+        } else {
+            outcome.requeued.push(id);
+        }
+    }
+    Ok(outcome)
+}
+
 pub async fn complete_worker_job(
     tx: &mut Transaction<'_, Postgres>,
     job: &WorkerJobRecord,
@@ -1738,6 +1845,50 @@ pub async fn complete_worker_job(
     .await?;
 
     Ok(())
+}
+
+/// Keep only the newest `keep` snapshots of one type per project (the current
+/// head is always among them). Every graph build and every repository sync
+/// inserts a full JSON copy of the graph and nothing deleted the old ones:
+/// the local review store held 163 snapshots = 1.0 GB in a 3.8 GB database.
+/// `knowledge_snapshot_heads` and `knowledge_snapshot_artifacts` reference
+/// snapshots with ON DELETE CASCADE, and the head row is never older than the
+/// newest snapshot, so deleting older rows is safe.
+pub async fn prune_knowledge_snapshots(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &RepositoryContext,
+    project_id: Uuid,
+    snapshot_type: &str,
+    keep: i64,
+) -> Result<u64, DbError> {
+    let result = sqlx::query(
+        r#"
+        delete from public.knowledge_snapshots s
+        using (
+          select id
+          from public.knowledge_snapshots
+          where organization_id = $1
+            and team_id = $2
+            and project_id = $3
+            and snapshot_type = $4
+          order by created_at desc, id desc
+          offset $5
+        ) stale
+        where s.id = stale.id
+          and s.id not in (
+            select snapshot_id from public.knowledge_snapshot_heads
+            where organization_id = $1 and team_id = $2 and project_id = $3
+          )
+        "#,
+    )
+    .bind(context.organization_id)
+    .bind(context.team_id)
+    .bind(project_id)
+    .bind(snapshot_type)
+    .bind(keep.max(1))
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 pub async fn fail_worker_job(

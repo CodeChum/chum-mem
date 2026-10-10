@@ -354,12 +354,22 @@ fn derive_atomic_claim_memories(
     episodes: &[SessionEpisodeDraft],
 ) -> Vec<DerivedMemoryDraft> {
     let mut memories = Vec::new();
+    let final_answers = final_answer_event_ids(events);
 
     for event in events {
         let episode = episodes
             .iter()
             .find(|episode| episode.provenance_event_ids.contains(&event.id));
         let text = event_text(event);
+        if final_answers.contains(&event.id) {
+            memories.extend(extract_assistant_answer_claims(
+                session_id,
+                episode,
+                event,
+                &text,
+            ));
+            continue;
+        }
         memories.extend(extract_claims_from_text(
             session_id,
             episode,
@@ -410,7 +420,8 @@ fn extract_claims_from_text(
     }
 
     let mut claims = Vec::new();
-    for segment in claim_segments(text) {
+    let cleaned = strip_template_noise(text);
+    for segment in claim_segments(&cleaned) {
         let Some(memory_type) = classify_claim_type(event, &segment) else {
             continue;
         };
@@ -488,17 +499,31 @@ fn classify_claim_type(event: Option<&SessionEventRecord>, segment: &str) -> Opt
         || lower.contains("error")
         || lower.contains("exception")
         || lower.contains("bug:");
-    if lower.contains("open question:")
-        || lower.contains("question:")
-        || lower.contains('?')
-        || lower.contains("unknown whether")
-    {
+    // Open questions need an explicit marker. A bare "?" used to be enough, which
+    // turned every user prompt into an `open_question` memory and made a
+    // question's own echo the top recall hit (FINDINGS F36). The hook-side
+    // title filter hides the echo; this stops storing it in the first place.
+    if has_explicit_question_marker(&lower) {
         return Some(MemoryType::OpenQuestion);
     }
+    // Conversational decision wordings count only when the user wrote them
+    // (prompt/annotation). Tool output and model replies keep needing the
+    // literal "decision:" family so a grep hit on "going with" cannot mint a
+    // decision (FINDINGS F38/F40).
+    // A question-shaped sentence ("are you going with the default?") is never a
+    // conversational decision or announcement.
+    let user_authored = !lower.trim_end().ends_with('?')
+        && event.is_some_and(|evt| {
+            matches!(
+                evt.event_type,
+                CanonicalEventType::Prompt | CanonicalEventType::Annotation
+            )
+        });
     if lower.contains("decision:")
         || lower.contains("decision update")
         || lower.contains("we decided")
         || lower.contains("policy:")
+        || (user_authored && has_conversational_decision_marker(&lower))
     {
         return Some(MemoryType::Decision);
     }
@@ -521,6 +546,10 @@ fn classify_claim_type(event: Option<&SessionEventRecord>, segment: &str) -> Opt
         return Some(MemoryType::Task);
     }
     if lower.contains("fix:")
+        || lower.contains("the fix was")
+        || lower.contains("the fix is")
+        || lower.contains("root cause")
+        || lower.contains("workaround:")
         || lower.contains("fixed")
         || lower.contains("resolved")
         || lower.contains("verified fix")
@@ -531,7 +560,10 @@ fn classify_claim_type(event: Option<&SessionEventRecord>, segment: &str) -> Opt
     if is_errorish {
         return Some(MemoryType::Bug);
     }
-    if lower.contains("verified") || lower.contains("confirmed") || lower.contains("current truth")
+    if lower.contains("verified")
+        || lower.contains("confirmed")
+        || lower.contains("current truth")
+        || (user_authored && has_announcement_marker(&lower))
     {
         return Some(MemoryType::Fact);
     }
@@ -547,6 +579,251 @@ fn classify_claim_type(event: Option<&SessionEventRecord>, segment: &str) -> Opt
         return Some(MemoryType::ImplementationDetail);
     }
     None
+}
+
+/// Explicit open-question markers. `lower` is the lowercased segment.
+fn has_explicit_question_marker(lower: &str) -> bool {
+    [
+        "open question:",
+        "question:",
+        "unknown whether",
+        "unclear whether",
+        "unclear if",
+        "not sure whether",
+        "not sure if",
+        "still unclear",
+        "undecided",
+        "haven't decided",
+        "have not decided",
+        "still need to decide",
+        "does anyone know",
+        "do we know whether",
+        "do we know if",
+        "tbd:",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Conversational ways engineers record a choice in a prompt ("I'm going with
+/// X", "we settled on X", "went with X"). Only applied to user-authored text.
+fn has_conversational_decision_marker(lower: &str) -> bool {
+    [
+        "decided:",
+        "decided to ",
+        "we decided",
+        "decided on ",
+        "we settled on",
+        "settled on ",
+        "i'm going with",
+        "i am going with",
+        "we're going with",
+        "we are going with",
+        "going with ",
+        "we went with",
+        "went with ",
+        "we agreed",
+        "agreed on ",
+        "agreed to ",
+        "let's go with",
+        "lets go with",
+        "for the record:",
+        "for the record,",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// "Heads up, X is now Y" / "FYI: X" — a user telling the team a fact. Only
+/// applied to user-authored text, and only after the more specific types.
+fn has_announcement_marker(lower: &str) -> bool {
+    ["heads up", "heads-up", "fyi:", "fyi,", "note that ", "note:"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Assistant `response` events that close a turn: no later `response` before
+/// the next user `prompt`. With the hooks every Stop event is one of these;
+/// imported transcripts carry several replies per turn and only the last
+/// counts.
+fn final_answer_event_ids(events: &[SessionEventRecord]) -> HashSet<Uuid> {
+    let mut finals = HashSet::new();
+    let mut last_response: Option<Uuid> = None;
+    for event in events {
+        match event.event_type {
+            CanonicalEventType::Response => last_response = Some(event.id),
+            CanonicalEventType::Prompt => {
+                if let Some(id) = last_response.take() {
+                    finals.insert(id);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(id) = last_response {
+        finals.insert(id);
+    }
+    finals
+}
+
+/// Max claims taken from one assistant answer.
+const MAX_ASSISTANT_ANSWER_CLAIMS: usize = 4;
+
+/// Claims from the assistant's final answer of a turn (recall review: the
+/// facts engineers ask about live in answers, which were never a source).
+/// Conservative: only decision / fix / fact segments with an explicit marker,
+/// 30–400 chars, at most four per answer; stored as `model_derived` +
+/// `inferred` with lower importance and confidence than user-confirmed text,
+/// so a user's own statement always outranks and is never superseded by it
+/// (reconcile only lets an equal-or-stronger claim supersede).
+fn extract_assistant_answer_claims(
+    session_id: Uuid,
+    episode: Option<&SessionEpisodeDraft>,
+    event: &SessionEventRecord,
+    text: &str,
+) -> Vec<DerivedMemoryDraft> {
+    let cleaned = strip_template_noise(text);
+    let mut claims = Vec::new();
+    for segment in claim_segments(&cleaned) {
+        if claims.len() >= MAX_ASSISTANT_ANSWER_CLAIMS {
+            break;
+        }
+        let length = segment.chars().count();
+        if !(30..=400).contains(&length) {
+            continue;
+        }
+        let lower = segment.to_lowercase();
+        if lower.trim_end().ends_with('?')
+            || lower.contains("hypothesis")
+            || lower.contains("guess")
+            || lower.contains("might be")
+            || lower.contains("maybe")
+            || lower.contains("probably")
+        {
+            continue;
+        }
+        let memory_type = if ["decision:", "decided:", "we decided", "policy:"]
+            .iter()
+            .any(|marker| lower.contains(marker))
+        {
+            MemoryType::Decision
+        } else if ["fix:", "the fix was", "the fix is", "root cause", "fixed by"]
+            .iter()
+            .any(|marker| lower.contains(marker))
+        {
+            MemoryType::Fix
+        } else if ["verified", "confirmed", "current truth"]
+            .iter()
+            .any(|marker| lower.contains(marker))
+        {
+            MemoryType::Fact
+        } else {
+            continue;
+        };
+        let claim_key = claim_key(memory_type, &segment, Some(event));
+        claims.push(DerivedMemoryDraft {
+            memory_type,
+            title: claim_title(memory_type, &segment),
+            content: truncate(segment.clone(), 3000),
+            summary: truncate(segment.clone(), 300),
+            importance_score: (claim_importance(memory_type, "inferred") - 0.08).max(0.2),
+            confidence_score: 0.5,
+            provenance_event_ids: vec![event.id],
+            metadata: json!({
+                "derivation": "assistant_answer_claim_v1",
+                "sessionId": session_id,
+                "episodeOrdinal": episode.map(|value| value.episode_ordinal),
+                "episodeType": episode.map(|value| value.episode_type.clone()),
+                "claimKey": claim_key,
+                "claimPolarity": if is_negative_claim(&lower) { "negative" } else { "positive" },
+                "claimSource": "assistant_final_answer",
+                "proofType": "session_event",
+                "authorityClass": "model_derived",
+                "verificationStatus": "inferred",
+                "sourceClass": source_class_for_memory_type(memory_type),
+                "rankingRole": ranking_role_for_memory_type(memory_type),
+                "belief": { "admit": true },
+                "answerCritical": true,
+            }),
+        });
+    }
+    claims
+}
+
+/// Drop template- and shell-shaped text before claim extraction (recall
+/// review: `<summary>`/`<event>` blocks, `[structured-output-enforce]`
+/// headers, the injected "## Context (established facts" block, `Bash |`
+/// tool lines, `VAR=/path` assignments, bare shell commands and file-path
+/// lists made up most of the stored "memories").
+pub fn strip_template_noise(text: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static TAG_BLOCKS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+        ["summary", "event", "system-reminder", "command-output", "local-command-stdout"]
+            .iter()
+            .map(|tag| Regex::new(&format!(r"(?is)<{tag}\b[^>]*>.*?(?:</{tag}>|\z)")).unwrap())
+            .collect()
+    });
+    static ENV_ASSIGN: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=\S*/").unwrap());
+    static FILE_TOKEN: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^[\w.~@-]*(?:/[\w.@-]*)+$|^[\w-]+\.[A-Za-z0-9]{1,5}$").unwrap());
+    const SHELL_HEADS: &[&str] = &[
+        "cd", "ls", "grep", "rg", "cat", "sed", "awk", "find", "git", "docker", "curl", "psql",
+        "gcloud", "npm", "pnpm", "npx", "cargo", "python", "python3", "bash", "sh", "zsh",
+        "export", "echo", "jq", "head", "tail", "kubectl", "make", "uv", "node", "gh", "ssh",
+        "scp", "rm", "cp", "mv", "mkdir", "chmod", "sudo", "wc", "sort", "xargs", "tee", "env",
+    ];
+
+    let mut text = text.to_string();
+    for block in TAG_BLOCKS.iter() {
+        text = block.replace_all(&text, "\n").into_owned();
+    }
+    let mut kept = Vec::new();
+    let mut in_context_block = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+        if lower.starts_with("## context (established facts") {
+            in_context_block = true;
+            continue;
+        }
+        if in_context_block {
+            if trimmed.starts_with('#') {
+                in_context_block = false;
+            } else {
+                continue;
+            }
+        }
+        if lower.contains("[structured-output-enforce]")
+            || lower.starts_with("bash |")
+            || lower.starts_with("bash|")
+            || ENV_ASSIGN.is_match(trimmed)
+        {
+            continue;
+        }
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        if let Some(head) = tokens.first() {
+            let head = head.trim_start_matches(['$', '>', '%']).trim();
+            let shellish = tokens.iter().skip(1).any(|token| {
+                token.contains('/')
+                    || (token.starts_with('-') && token.len() > 1)
+                    || matches!(*token, "|" | "&&" | "||" | ">" | ">>" | "2>&1")
+            });
+            if SHELL_HEADS.contains(&head) && shellish {
+                continue;
+            }
+            if tokens.iter().any(|token| token.contains('/'))
+                && tokens.iter().all(|token| {
+                    FILE_TOKEN.is_match(token.trim_matches(|c: char| matches!(c, ',' | ';' | '`' | '"' | '\'')))
+                })
+            {
+                continue;
+            }
+        }
+        kept.push(line);
+    }
+    kept.join("\n")
 }
 
 fn classify_proof_type(event: Option<&SessionEventRecord>, from_summary: bool) -> &'static str {
@@ -628,9 +905,7 @@ fn should_admit_claim(
     let explicit_task_marker = ["task:", "todo:", "next:", "follow up", "continue "]
         .iter()
         .any(|marker| lower.contains(marker));
-    let explicit_question_marker = ["open question:", "question:", "unknown whether", "?"]
-        .iter()
-        .any(|marker| lower.contains(marker));
+    let explicit_question_marker = has_explicit_question_marker(lower);
     match memory_type {
         MemoryType::Decision | MemoryType::Constraint => {
             matches!(verification_status, "user_confirmed" | "verified")
@@ -1365,5 +1640,287 @@ mod tests {
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
         }));
+    }
+
+    // ── Review 2026-10-09: classifier wordings (F38/F40) and prompt echoes (F36) ──
+
+    fn single_event(event_type: CanonicalEventType, message: &str) -> Vec<SessionEventRecord> {
+        vec![SessionEventRecord {
+            id: Uuid::from_u128(99),
+            event_type,
+            payload: SessionEventPayload {
+                message: Some(message.to_string()),
+                ..SessionEventPayload::default()
+            },
+            created_at: "2026-10-09T00:00:00Z".to_string(),
+        }]
+    }
+
+    fn admitted_types(events: &[SessionEventRecord]) -> Vec<MemoryType> {
+        let session_id = Uuid::nil();
+        derive_memories_from_session(session_id, "claude", &end_request_default(session_id), events, None)
+            .into_iter()
+            .filter(|memory| {
+                memory
+                    .metadata
+                    .get("belief")
+                    .and_then(|value| value.get("admit"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .map(|memory| memory.memory_type)
+            .collect()
+    }
+
+    #[test]
+    fn conversational_decision_wordings_in_prompts_derive_decisions() {
+        for wording in [
+            "I'm going with Cloud Tasks for the class-record import retries.",
+            "We settled on 25 students per /process-answers request.",
+            "Decided: the DepEd answer sheet is A4.",
+            "We went with a 60 second rubrics timeout after looking at the p99.",
+            "For the record: hotfixes branch from production-patch only.",
+        ] {
+            let events = single_event(CanonicalEventType::Prompt, wording);
+            let types = admitted_types(&events);
+            assert!(
+                types.contains(&MemoryType::Decision),
+                "expected a decision for {wording:?}, got {types:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn conversational_decision_wordings_in_tool_output_do_not_derive_decisions() {
+        let events = single_event(
+            CanonicalEventType::ToolResult,
+            "README: going with the default settings is recommended for most users.",
+        );
+        let types = admitted_types(&events);
+        assert!(
+            !types.contains(&MemoryType::Decision),
+            "tool output must not mint a decision, got {types:?}"
+        );
+    }
+
+    #[test]
+    fn question_shaped_prompt_with_decision_phrase_is_not_a_decision() {
+        let events = single_event(
+            CanonicalEventType::Prompt,
+            "Are we going with Celery or Cloud Tasks for the retries?",
+        );
+        let types = admitted_types(&events);
+        assert!(types.is_empty(), "expected no claim, got {types:?}");
+    }
+
+    #[test]
+    fn heads_up_announcement_in_prompt_derives_a_fact() {
+        let events = single_event(
+            CanonicalEventType::Prompt,
+            "Heads up, the rubrics request timeout is now 60 seconds in ai_utils.",
+        );
+        let types = admitted_types(&events);
+        assert!(
+            types.contains(&MemoryType::Fact),
+            "expected a fact, got {types:?}"
+        );
+    }
+
+    #[test]
+    fn heads_up_with_constraint_wording_keeps_the_more_specific_type() {
+        let events = single_event(
+            CanonicalEventType::Prompt,
+            "Heads up: do not deploy gradechum-api on Fridays.",
+        );
+        let types = admitted_types(&events);
+        assert!(
+            types.contains(&MemoryType::Constraint) && !types.contains(&MemoryType::Fact),
+            "expected a constraint only, got {types:?}"
+        );
+    }
+
+    #[test]
+    fn bare_question_prompt_is_not_stored_as_open_question() {
+        let events = single_event(
+            CanonicalEventType::Prompt,
+            "Where are we running the DepEd answer-sheet export pilot, and who decided?",
+        );
+        let types = admitted_types(&events);
+        assert!(
+            !types.contains(&MemoryType::OpenQuestion),
+            "a bare question must not become an open_question echo, got {types:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_open_question_marker_in_prompt_is_still_stored() {
+        let events = single_event(
+            CanonicalEventType::Prompt,
+            "Open question: should the extractor move off Vertex global?",
+        );
+        let types = admitted_types(&events);
+        assert!(
+            types.contains(&MemoryType::OpenQuestion),
+            "expected an open question, got {types:?}"
+        );
+    }
+
+    #[test]
+    fn question_mark_inside_tool_output_is_not_an_open_question() {
+        let events = single_event(
+            CanonicalEventType::ToolResult,
+            "GET /v1/tasks/?ordering=-datetime_created returned 200 in 81 ms.",
+        );
+        let types = admitted_types(&events);
+        assert!(
+            !types.contains(&MemoryType::OpenQuestion),
+            "a query string must not become an open question, got {types:?}"
+        );
+    }
+
+    fn event_at(id: u128, event_type: CanonicalEventType, message: &str) -> SessionEventRecord {
+        SessionEventRecord {
+            id: Uuid::from_u128(id),
+            event_type,
+            payload: SessionEventPayload {
+                message: Some(message.to_string()),
+                ..SessionEventPayload::default()
+            },
+            created_at: format!("2026-10-09T00:00:{:02}Z", id % 60),
+        }
+    }
+
+    fn admitted(events: &[SessionEventRecord]) -> Vec<DerivedMemoryDraft> {
+        let session_id = Uuid::nil();
+        derive_memories_from_session(session_id, "claude", &end_request_default(session_id), events, None)
+            .into_iter()
+            .filter(|memory| {
+                memory
+                    .metadata
+                    .get("belief")
+                    .and_then(|value| value.get("admit"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn status_chit_chat_is_not_an_open_question_but_real_unknowns_are() {
+        let chit_chat = single_event(CanonicalEventType::Prompt, "what's the status now?");
+        assert!(admitted_types(&chit_chat).is_empty());
+        let unknown = single_event(
+            CanonicalEventType::Prompt,
+            "Does anyone know whether the extractor still runs on Vertex global?",
+        );
+        assert!(admitted_types(&unknown).contains(&MemoryType::OpenQuestion));
+        let undecided = single_event(
+            CanonicalEventType::Prompt,
+            "We are still undecided on the DepEd export host for the pilot.",
+        );
+        assert!(admitted_types(&undecided).contains(&MemoryType::OpenQuestion));
+    }
+
+    #[test]
+    fn template_and_shell_shaped_text_is_dropped() {
+        let text = "<summary>Fixed the build. We decided to ship.</summary>\n\
+[structured-output-enforce] Decision: must reply in JSON\n\
+## Context (established facts\n\
+- Decision: customers get refunds within 3 days\n\
+## Next\n\
+Bash | grep -rn fixed src/\n\
+TURBOVEC_PATH=/data/turbovec\n\
+cd /private/tmp/x && cargo test --release 2>&1 | tail\n\
+src/a.rs src/b.rs docs/c.md\n\
+Decision: hotfixes branch from production-patch only.";
+        let cleaned = strip_template_noise(text);
+        assert_eq!(cleaned.trim(), "## Next\nDecision: hotfixes branch from production-patch only.");
+        let events = single_event(CanonicalEventType::Prompt, text);
+        let drafts = admitted(&events);
+        assert_eq!(drafts.len(), 1, "got {:?}", drafts.iter().map(|d| &d.title).collect::<Vec<_>>());
+        assert_eq!(drafts[0].memory_type, MemoryType::Decision);
+    }
+
+    #[test]
+    fn prose_mentioning_git_is_kept() {
+        let cleaned = strip_template_noise("git push is denied in these repos; use the gh API instead.");
+        assert!(cleaned.contains("git push is denied"));
+    }
+
+    #[test]
+    fn fix_markers_in_prompts() {
+        for wording in [
+            "The fix was raising the express.json body limit to 25mb in server.js.",
+            "Root cause: Puppeteer's 30 second timeout on 40+ page exams.",
+        ] {
+            let events = single_event(CanonicalEventType::Prompt, wording);
+            assert!(
+                admitted_types(&events).contains(&MemoryType::Fix),
+                "expected a fix for {wording:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn final_assistant_answer_is_a_lower_authority_claim_source() {
+        let events = vec![
+            event_at(1, CanonicalEventType::Prompt, "Why did the Android upload fail with 413?"),
+            event_at(
+                2,
+                CanonicalEventType::Response,
+                "Looking at server.js now. The fix was raising the body limit.",
+            ),
+            event_at(
+                3,
+                CanonicalEventType::Response,
+                "Root cause: express.json defaults to a 1mb body limit in gradechum-mobile-file-upload. Maybe we should also log sizes.",
+            ),
+        ];
+        let drafts = admitted(&events);
+        let from_answer: Vec<_> = drafts
+            .iter()
+            .filter(|d| d.metadata.get("claimSource").and_then(Value::as_str) == Some("assistant_final_answer"))
+            .collect();
+        assert_eq!(from_answer.len(), 1, "only the final reply counts: {:?}",
+            drafts.iter().map(|d| &d.title).collect::<Vec<_>>());
+        let claim = from_answer[0];
+        assert_eq!(claim.memory_type, MemoryType::Fix);
+        assert!(claim.content.contains("express.json"));
+        assert_eq!(claim.metadata["authorityClass"], "model_derived");
+        assert_eq!(claim.metadata["verificationStatus"], "inferred");
+        assert!(claim.confidence_score < 0.86 && claim.importance_score < 0.92);
+        // The intermediate reply contributes nothing.
+        assert!(!drafts.iter().any(|d| d.provenance_event_ids == vec![Uuid::from_u128(2)]));
+    }
+
+    #[test]
+    fn assistant_answer_without_marker_or_with_hedge_derives_nothing() {
+        let events = vec![
+            event_at(1, CanonicalEventType::Prompt, "Which rubric model should we use?"),
+            event_at(
+                2,
+                CanonicalEventType::Response,
+                "Gemini 3.5 Flash Lite is about twice as fast as 3.7 Flash on the harness. Decision: probably 3.5 Flash Lite, but it might be thinner on math.",
+            ),
+        ];
+        let drafts = admitted(&events);
+        assert!(
+            !drafts.iter().any(|d| d.metadata.get("claimSource").and_then(Value::as_str) == Some("assistant_final_answer")),
+            "got {:?}", drafts.iter().map(|d| &d.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn final_answer_ids_close_each_turn() {
+        let events = vec![
+            event_at(1, CanonicalEventType::Prompt, "q1 prompt text"),
+            event_at(2, CanonicalEventType::Response, "a1 part one"),
+            event_at(3, CanonicalEventType::ToolResult, "tool output"),
+            event_at(4, CanonicalEventType::Response, "a1 final"),
+            event_at(5, CanonicalEventType::Prompt, "q2 prompt text"),
+            event_at(6, CanonicalEventType::Response, "a2 final"),
+        ];
+        let finals = final_answer_event_ids(&events);
+        assert_eq!(finals, [Uuid::from_u128(4), Uuid::from_u128(6)].into_iter().collect());
     }
 }
