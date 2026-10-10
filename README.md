@@ -126,7 +126,10 @@ The two layers are structurally isolated — repository imports never merge into
 ### Start the stack
 
 ```bash
-docker compose up -d --build
+# The API refuses to start without a team token. Either set tokens in .env
+# (CHUM_MEM_API_TOKENS, CHUM_MEM_ADMIN_TOKENS) or, for a stack only this
+# machine can reach, opt out explicitly:
+CHUM_MEM_ALLOW_NO_AUTH=1 docker compose up -d --build
 
 # Verify
 curl -s http://127.0.0.1:65301/ready
