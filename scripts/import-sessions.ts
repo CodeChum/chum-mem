@@ -783,7 +783,10 @@ async function parseSessionFile(filePath: string, options: ImportOptions): Promi
                   : contentText(parsedLine.content);
              }
 
-             const eventId = stableId(`${parsed.externalSessionId}:${parsed.events.length}:${parsedLine.uuid || lineIndex}`);
+             // A subagent transcript shares the parent's session id and restarts
+             // events.length at 0, so a uuid-less line is keyed by its file too.
+             const lineKey = parsedLine.uuid || (isSubagentTranscript(filePath) ? `${basename(filePath)}#${lineIndex}` : lineIndex);
+             const eventId = stableId(`${parsed.externalSessionId}:${parsed.events.length}:${lineKey}`);
              event = {
                 sessionId: parsed.externalSessionId,
                 eventId,
@@ -1047,6 +1050,66 @@ async function importSession(parsed: ParsedSession, options: ImportOptions): Pro
   return { events: importedEvents, duplicate: false };
 }
 
+// ─── Session grouping (main transcript + its subagent transcripts) ──
+
+/**
+ * Claude Code writes a subagent's transcript next to the session as
+ * `<project>/<session-id>/subagents/agent-<id>.jsonl` (older versions:
+ * `<project>/agent-<id>.jsonl`), and every line carries the PARENT's sessionId.
+ */
+function isSubagentTranscript(filePath: string): boolean {
+  return /[\\/]subagents[\\/]/.test(filePath) || basename(filePath).startsWith('agent-');
+}
+
+/**
+ * Groups parsed transcripts by (provider, externalSessionId) and merges each
+ * group into one session: the main transcript first (it supplies the summary,
+ * metadata and file path), then the subagent transcripts in file-name order,
+ * each event exactly once. The session is then started, filled and ended once.
+ */
+function groupTranscriptsBySession(
+  parsed: Array<{ file: string; session: ParsedSession }>
+): Array<{ file: string; session: ParsedSession }> {
+  const groups = new Map<string, Array<{ file: string; session: ParsedSession }>>();
+  for (const entry of parsed) {
+    const key = `${entry.session.provider}\u0000${entry.session.externalSessionId}`;
+    const list = groups.get(key);
+    if (list) list.push(entry); else groups.set(key, [entry]);
+  }
+  const rank = (entry: { file: string; session: ParsedSession }): number =>
+    isSubagentTranscript(entry.file) ? 2 : basename(entry.file, extname(entry.file)) === entry.session.externalSessionId ? 0 : 1;
+  const merged: Array<{ file: string; session: ParsedSession }> = [];
+  for (const list of groups.values()) {
+    if (list.length === 1) {
+      merged.push(list[0]!);
+      continue;
+    }
+    list.sort((a, b) => rank(a) - rank(b) || a.file.localeCompare(b.file));
+    const main = list[0]!;
+    const seen = new Set<string>();
+    const events: SessionEventPayload[] = [];
+    for (const entry of list) {
+      for (const event of entry.session.events) {
+        if (seen.has(event.eventId)) continue;
+        seen.add(event.eventId);
+        events.push(event);
+      }
+    }
+    const subagentFiles = list.filter((entry) => isSubagentTranscript(entry.file)).length;
+    const startedAt = list.map((entry) => entry.session.startedAt).filter((t): t is string => !!t).sort()[0];
+    merged.push({
+      file: main.file,
+      session: {
+        ...main.session,
+        metadata: { ...main.session.metadata, transcriptFiles: list.length, subagentTranscripts: subagentFiles },
+        ...(startedAt ? { startedAt } : {}),
+        events
+      }
+    });
+  }
+  return merged;
+}
+
 // ─── Concurrency pool ───────────────────────────────────────────────
 
 async function runWithConcurrency<T>(
@@ -1151,7 +1214,18 @@ async function main(): Promise<void> {
   });
 
   const parseMs = Date.now() - parseStart;
-  console.log(`Parsed ${parsedSessions.length} sessions from ${stats.filesProcessed} files in ${parseMs}ms`);
+  console.log(`Parsed ${parsedSessions.length} transcripts from ${stats.filesProcessed} files in ${parseMs}ms`);
+
+  // One import per session, not per file: subagent transcripts carry their
+  // parent's session id, and importing them as separate sessions in parse
+  // order let a small subagent file end the session first, after which the
+  // main transcript was skipped as "already completed" (fresh store: 57k of
+  // 74k events lost).
+  const sessionGroups = groupTranscriptsBySession(parsedSessions);
+  const mergedFiles = parsedSessions.length - sessionGroups.length;
+  if (mergedFiles > 0) {
+    console.log(`Merged ${mergedFiles} subagent transcript(s) into their parent sessions: ${sessionGroups.length} sessions to import`);
+  }
 
   // Reset for import phase
   stats.filesProcessed = 0;
@@ -1162,7 +1236,7 @@ async function main(): Promise<void> {
   // a recreate, and a crash mid-import must still recreate (hence `finally`
   // below; FINDINGS F31).
   let indexesDropped = false;
-  if (!options.dryRun && parsedSessions.length > 0) {
+  if (!options.dryRun && sessionGroups.length > 0) {
     try {
       await postJson(`${options.serverUrl}/v1/ingest/bulk/drop-indexes`, {}, false);
       indexesDropped = true;
@@ -1175,7 +1249,7 @@ async function main(): Promise<void> {
   // Import sessions concurrently
   const importStart = Date.now();
   try {
-  await runWithConcurrency(parsedSessions, options.concurrency, async ({ file, session }, index) => {
+  await runWithConcurrency(sessionGroups, options.concurrency, async ({ file, session }, index) => {
     stats.filesProcessed += 1;
     try {
       const result = await importSession(session, options);
@@ -1190,8 +1264,8 @@ async function main(): Promise<void> {
       stats.elapsedMs = Date.now() - importStart;
 
       // Log progress every 10 sessions
-      if (stats.filesProcessed % 10 === 0 || stats.filesProcessed === parsedSessions.length) {
-        process.stderr.write(`\r${progressLine(stats, parsedSessions.length, file)}`);
+      if (stats.filesProcessed % 10 === 0 || stats.filesProcessed === sessionGroups.length) {
+        process.stderr.write(`\r${progressLine(stats, sessionGroups.length, file)}`);
       }
     } catch (error) {
       stats.sessionsFailed += 1;
