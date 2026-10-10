@@ -28,6 +28,7 @@ fi
 if [[ -n "${CHUM_MEMORY_API_TOKEN:-}" ]]; then AUTH_HEADER="-HX-Chum-Token:${CHUM_MEMORY_API_TOKEN}"; fi
 PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-${CODEX_PROJECT_DIR:-$PWD}}"
 CACHE_DIR="${PROJECT_ROOT}/.chum-cache"
+umask 077   # outbox and quarantine files hold raw prompts and tool output (FINDINGS F37 L)
 PROJECT_ID="${CHUM_MEM_PROJECT_ID:-}"
 if [[ -z "$PROJECT_ID" ]]; then
   echo "session-sync: CHUM_MEM_PROJECT_ID not set, skipping session ingestion" >&2

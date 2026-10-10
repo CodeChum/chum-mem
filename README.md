@@ -138,6 +138,10 @@ The API serves both HTTP REST and MCP (Streamable HTTP) on the same port:
 
 ### Install the agent plugin
 
+> **GradeChum engineers: skip this section.** The monorepo already carries the
+> hooks, the skill and the MCP server; installing the plugin as well stores every
+> event twice. Follow [DEV-SETUP.md](DEV-SETUP.md) instead.
+
 ```bash
 chmod +x ./plugin-install.sh
 
