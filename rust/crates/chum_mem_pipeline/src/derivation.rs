@@ -442,18 +442,48 @@ fn extract_claims_from_text(
         return Vec::new();
     }
 
+    // Tool calls and results (Bash, Grep, MCP tools, ...) carry commands,
+    // file text and program output: nobody stated them, and printing a file
+    // is not verifying it. Before this gate every line was `tool_verified`,
+    // so code comments, heredoc lines and wrapped PR-body fragments became
+    // admitted "constraints", "tasks" and "facts" (pilot review 2026-10-12).
+    // Tool text may now originate only a bug (an error it reports) or a line
+    // that opens with an explicit decision marker (a commit message or PR
+    // body recording a decision).
+    let tool_output = event.is_some_and(is_tool_output_event);
+
     let mut claims = Vec::new();
     let cleaned = strip_template_noise(text);
     for segment in claim_segments(&cleaned) {
-        if looks_like_code_line(&segment) {
+        let segment = segment.replace("**", "");
+        if looks_like_code_line(&segment) || is_non_claim_fragment(&segment) {
             continue;
         }
         let Some(memory_type) = classify_claim_type(event, &segment) else {
             continue;
         };
+        // A hard-wrapped commit or PR body splits sentences across lines; a
+        // line that opens mid-sentence ("way, but the MCP server only ...")
+        // is a fragment. Error output keeps its usual lowercase openers.
+        if tool_output && opens_mid_sentence(&segment) {
+            continue;
+        }
+        if tool_output
+            && !(memory_type == MemoryType::Bug
+                || (memory_type == MemoryType::Decision && opens_with_decision_marker(&segment)))
+        {
+            continue;
+        }
         let lower = segment.to_lowercase();
         let proof_type = classify_proof_type(event, from_summary);
-        let authority_class = classify_authority_class(event, proof_type, from_summary);
+        // A decision line found in tool text (a commit message or PR body
+        // the assistant wrote) is session text, not tool verification: it
+        // must rank below the engineer's own words, never supersede them.
+        let authority_class = if tool_output && memory_type == MemoryType::Decision {
+            "session_derived"
+        } else {
+            classify_authority_class(event, proof_type, from_summary)
+        };
         let verification_status = classify_verification_status(&lower, event, from_summary);
         let admit = should_admit_claim(memory_type, authority_class, verification_status, &lower);
         let claim_key = claim_key(memory_type, &segment, event);
@@ -550,14 +580,30 @@ fn classify_claim_type(event: Option<&SessionEventRecord>, segment: &str) -> Opt
     {
         return Some(MemoryType::Decision);
     }
-    if lower.contains("constraint:")
-        || lower.contains("must ")
-        || lower.contains("do not ")
-        || lower.contains("should not ")
-        || lower.contains("required")
-        || lower.contains("fallback only")
-    {
+    let typed_by_user = event.is_some_and(|evt| {
+        matches!(
+            evt.event_type,
+            CanonicalEventType::Prompt | CanonicalEventType::Annotation
+        )
+    });
+    // In a prompt, "do not read any files" or "must be short" is an
+    // instruction to the assistant, not a team rule: only explicit team-rule
+    // wording makes a constraint there. A question is never one.
+    let constraint_wording = if typed_by_user {
+        !is_question_shaped(&lower) && has_team_rule_marker(&lower)
+    } else {
+        lower.contains("constraint:")
+            || lower.contains("must ")
+            || lower.contains("do not ")
+            || lower.contains("should not ")
+            || lower.contains("required")
+            || lower.contains("fallback only")
+    };
+    if constraint_wording {
         return Some(MemoryType::Constraint);
+    }
+    if typed_by_user && is_question_shaped(&lower) {
+        return None;
     }
     if lower.contains("task:")
         || lower.contains("todo:")
@@ -568,18 +614,7 @@ fn classify_claim_type(event: Option<&SessionEventRecord>, segment: &str) -> Opt
     {
         return Some(MemoryType::Task);
     }
-    let explicit_fix_marker = [
-        "fix:",
-        "the fix was",
-        "the fix is",
-        "root cause",
-        "workaround:",
-        "verified fix",
-        "confirmed fix",
-        "fixed by",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker));
+    let explicit_fix_marker = has_fix_marker(&lower);
     // A bare "fixed" / "resolved" is a fix only when the segment also names the
     // defect or the cause; "Page 6 is fixed and verified" is a status line,
     // not a fix (D5).
@@ -591,12 +626,6 @@ fn classify_claim_type(event: Option<&SessionEventRecord>, segment: &str) -> Opt
     // now") carries no subject or decision; it is not a fact, bug or detail.
     // Only for text the engineer did not type: a user's own short statement
     // keeps its old typing.
-    let typed_by_user = event.is_some_and(|evt| {
-        matches!(
-            evt.event_type,
-            CanonicalEventType::Prompt | CanonicalEventType::Annotation
-        )
-    });
     if !typed_by_user && !is_errorish && is_status_only(&lower) {
         return None;
     }
@@ -747,11 +776,15 @@ fn extract_model_text_claims(
     let cleaned = strip_template_noise(text);
     let mut claims = Vec::new();
     for segment in claim_segments(&cleaned) {
+        let segment = segment.replace("**", "");
         if claims.len() >= MAX_ASSISTANT_ANSWER_CLAIMS {
             break;
         }
         let length = segment.chars().count();
-        if !(30..=400).contains(&length) || looks_like_code_line(&segment) {
+        if !(30..=400).contains(&length)
+            || looks_like_code_line(&segment)
+            || is_non_claim_fragment(&segment)
+        {
             continue;
         }
         let lower = segment.to_lowercase();
@@ -772,14 +805,12 @@ fn extract_model_text_claims(
             MemoryType::Decision
         } else if source == ModelTextSource::CompactionSummary {
             continue;
-        } else if ["fix:", "the fix was", "the fix is", "root cause", "fixed by"]
-            .iter()
-            .any(|marker| lower.contains(marker))
-        {
+        } else if has_fix_marker(&lower) {
             MemoryType::Fix
         } else if ["verified", "confirmed", "current truth"]
             .iter()
             .any(|marker| lower.contains(marker))
+            && !denies_verification(&lower)
         {
             MemoryType::Fact
         } else {
@@ -814,6 +845,178 @@ fn extract_model_text_claims(
         });
     }
     claims
+}
+
+/// Tool calls and results of any tool, and shell commands: their text is a
+/// command, file content or program output.
+fn is_tool_output_event(event: &SessionEventRecord) -> bool {
+    matches!(
+        event.event_type,
+        CanonicalEventType::ToolCall
+            | CanonicalEventType::ToolResult
+            | CanonicalEventType::Command
+            | CanonicalEventType::FileChange
+    )
+}
+
+/// A lowercase word followed by a comma or a conjunction, as in a wrapped
+/// line ("way, but ...", "and the api ..."), and not an error-output opener.
+fn opens_mid_sentence(segment: &str) -> bool {
+    let trimmed = segment.trim();
+    let Some(first) = trimmed.split_whitespace().next() else {
+        return false;
+    };
+    if !first.starts_with(|ch: char| ch.is_ascii_lowercase()) {
+        return false;
+    }
+    let word = first.trim_end_matches([',', ';', ':']);
+    if ["error", "fatal", "panic", "failed", "failure", "warning", "thread", "caused"]
+        .iter()
+        .any(|opener| word.starts_with(opener))
+    {
+        return false;
+    }
+    first.ends_with(',')
+        || ["and", "but", "or", "so", "which", "that", "then", "because", "while", "when"]
+            .contains(&word)
+}
+
+/// "Decision: ...", "Product decision: ...", "Decision update: ..." at the
+/// start of the segment (markdown emphasis ignored).
+fn opens_with_decision_marker(segment: &str) -> bool {
+    let lower = segment.replace("**", "").trim().to_lowercase();
+    ["decision:", "product decision:", "decision update:", "we decided"]
+        .iter()
+        .any(|marker| lower.starts_with(marker))
+}
+
+/// Segments that are never a claim whatever their wording: markdown headings
+/// and code comments ("## Root cause", "# sites that must stay hidden"),
+/// lead-ins that only introduce what follows ("Still open, not part of this
+/// hotfix:"), quoted text ("> ..."), and fragments cut mid-string (an odd
+/// number of double quotes in a short segment).
+fn is_non_claim_fragment(segment: &str) -> bool {
+    let trimmed = segment.trim().replace("**", "");
+    let trimmed = trimmed.trim();
+    // "#3840 merged" is a PR reference; "# note" and "## Heading" are not prose.
+    if trimmed.starts_with("# ") || trimmed.starts_with("##") || trimmed.starts_with('>') {
+        return true;
+    }
+    if trimmed.ends_with(':') {
+        return true;
+    }
+    trimmed.chars().count() < 80 && trimmed.matches('"').count() % 2 == 1
+}
+
+/// Fix markers. "fix:" must start a word ("hotfix:" is not one), and a root
+/// cause counts only when it is stated ("root cause: ...", "the root cause
+/// was ..."), not when it is merely mentioned ("no entry mentions a root
+/// cause").
+fn has_fix_marker(lower: &str) -> bool {
+    let word_fix = lower.match_indices("fix:").any(|(at, _)| {
+        lower[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_alphanumeric())
+    });
+    word_fix
+        || [
+            "the fix was",
+            "the fix is",
+            "root cause:",
+            "root cause was",
+            "root cause is",
+            "root cause turned out",
+            "workaround:",
+            "verified fix",
+            "confirmed fix",
+            "fixed by",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// "not verified", "hasn't confirmed", "unverified": a statement that
+/// something was NOT checked is not a verified fact.
+fn denies_verification(lower: &str) -> bool {
+    [
+        "not verified",
+        "n't verified",
+        "unverified",
+        "not confirmed",
+        "n't confirmed",
+        "unconfirmed",
+        "not a confirmed",
+        "not yet verified",
+        "without verifying",
+        "verify it beyond",
+        "verified it beyond",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// A question, with or without its "?": "wait, so do we need to update X",
+/// "should we keep Y".
+fn is_question_shaped(lower: &str) -> bool {
+    let mut rest = lower.trim();
+    if rest.ends_with('?') {
+        return true;
+    }
+    loop {
+        let before = rest;
+        for lead in ["wait", "so", "ok", "okay", "hmm", "but", "and", "also", "then"] {
+            if let Some(after) = rest.strip_prefix(lead) {
+                if after.starts_with([',', ' ']) {
+                    rest = after.trim_start_matches([',', ' ']);
+                }
+            }
+        }
+        if rest == before {
+            break;
+        }
+    }
+    const QUESTION_WORDS: &[&str] = &[
+        "what", "how", "why", "when", "where", "who", "which", "is", "are", "do", "does", "did",
+        "can", "could", "would", "will", "should", "shall", "isn't", "aren't", "don't", "doesn't",
+    ];
+    // The question may follow a lead clause: "for every update, do the team
+    // need to update". "If it fails, do not deploy" is an instruction.
+    rest.split(',').any(|clause| {
+        let mut words = clause.split_whitespace();
+        let first = words.next().unwrap_or("");
+        let second = words.next().unwrap_or("");
+        QUESTION_WORDS.contains(&first) && second != "not"
+    })
+}
+
+/// Wording that states a rule for the team rather than an instruction to the
+/// assistant. Applied to user-authored text only.
+fn has_team_rule_marker(lower: &str) -> bool {
+    [
+        "constraint:",
+        "rule:",
+        "team rule",
+        "we must",
+        "we should never",
+        "we never",
+        "we always",
+        "must always",
+        "must never",
+        "is required for",
+        "are required for",
+        "nobody should",
+        "no one should",
+        "everyone must",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        // "Heads up: do not deploy on Fridays" tells the team a rule; a heads
+        // up without rule wording stays a fact.
+        || (has_announcement_marker(lower)
+            && ["must ", "do not ", "don't ", "never ", "should not ", "required"]
+                .iter()
+                .any(|marker| lower.contains(marker)))
 }
 
 /// Tools whose captured text is file content (an edit/write input or a read
@@ -861,7 +1064,21 @@ pub fn looks_like_code_line(line: &str) -> bool {
             r"|(?:fn|def|class|struct|enum|impl|mod|interface|type)\s+\w+\s*[(<:{=]",
             r"|(?:pub(?:\(crate\))?|async|export)\s+(?:fn|struct|enum|mod|use|const|crate|default|function|class|type|interface|async)\b",
             r"|use\s+[\w:]+::|(?:import|from)\s+[\w.]+(?:\s+import\b|\s*;|$)",
-            r"|return\b.*;$|(?:if|for|while|match|switch)\s*\(|assert\w*!?\s*\(|\.\w+\s*\(|@\w+\s*\()",
+            r"|return\b.*;$|(?:if|for|while|match|switch)\s*\(|assert\w*!?\s*\(|\.\w+\s*\(|@\w+\s*\(",
+            // Python / shell (pilot review 2026-10-12): block headers ending
+            // in ':', raise/print, `name = value` assignments, string
+            // prefixes and triple quotes, psql meta-commands, a bare
+            // identifier or `key: value,` line from an object literal, a
+            // quoted list item, and common CLI invocations.
+            r"|(?:if|elif|while|for|with|try|except|else|finally|def|class)\b[^.]*:$",
+            r"|raise\s+\w|print\(|[A-Za-z_][\w.]*(?:\[[^\]]*\])?\s*=\s*\S",
+            r#"|[frb]?""""#,
+            r"|[frb]?'''|f'|\\[a-z]+\b|[A-Za-z_][\w.]*,$|'[\w./-]+',$",
+            r#"|f"|[a-z_][\w.]*:\s*[\w{\['".].*,$"#,
+            // A CLI word starts prose too ("docker compose restarts the api"),
+            // so it needs a flag, quote, variable or pipe after it.
+            r"|(?:\$\s+)?(?:echo|printf|sudo|gcloud|gh|curl|docker|cargo|jq|sed|awk|chmod)\s.*(?:\s--?[a-z]|[\x22'$|>])",
+            r")",
         ))
         .unwrap()
     });
@@ -892,6 +1109,7 @@ pub fn looks_like_code_line(line: &str) -> bool {
     // shell heredocs, interpolation, SQL pattern matching.
     const DEFINITE: &[&str] = &[
         "\\n", "\\\"", "{\"", "</", "<<'", "<<\"", "<<eof", "${", " ilike ", " like '%",
+        "\"\"\"", "'''",
     ];
     // Code-typical, but a quoting sentence can contain them.
     const LIKELY: &[&str] = &[
@@ -1036,6 +1254,10 @@ fn strip_negated_defects(lower: &str) -> String {
             r"\b(?:no|0|zero|without|never any)\s+(?:new\s+|more\s+|other\s+|remaining\s+)?(?:errors?|exceptions?|failures?|failed(?:\s+tests?)?|bugs?)\b",
             r"\b(?:errors?|failures?|failed|exceptions?)\s*[:=]\s*0\b",
             r"\berror[- ]free\b",
+            // Status lines: "the 5 pre-existing errors are in unrelated
+            // files", "tsc error count unchanged".
+            r"\bpre-?existing\s+(?:\w+\s+)?(?:errors?|failures?)\b",
+            r"\b(?:errors?|failures?)\s+(?:count\s+)?unchanged\b",
         ]
         .iter()
         .map(|pattern| Regex::new(pattern).unwrap())
@@ -2864,5 +3086,217 @@ PY"#;
         ] {
             assert!(!looks_like_code_line(prose), "{prose:?} should be prose");
         }
+    }
+}
+
+/// Pilot review 2026-10-12: every case below is a memory the live store held.
+#[cfg(test)]
+mod extraction_quality_tests {
+    use super::*;
+    use chum_mem_contracts::{CanonicalEventType, EndSessionRequest, SessionEventPayload};
+
+    fn event(id: u128, event_type: CanonicalEventType, payload: SessionEventPayload) -> SessionEventRecord {
+        SessionEventRecord {
+            id: Uuid::from_u128(id),
+            event_type,
+            payload,
+            created_at: format!("2026-10-12T00:00:{:02}Z", id % 60),
+        }
+    }
+    fn prompt(id: u128, text: &str) -> SessionEventRecord {
+        event(id, CanonicalEventType::Prompt, SessionEventPayload {
+            message: Some(text.to_string()),
+            ..SessionEventPayload::default()
+        })
+    }
+    fn answer(id: u128, text: &str) -> SessionEventRecord {
+        event(id, CanonicalEventType::Response, SessionEventPayload {
+            message: Some(text.to_string()),
+            ..SessionEventPayload::default()
+        })
+    }
+    fn bash(id: u128, command: &str, exit_code: Option<i32>) -> SessionEventRecord {
+        event(id, CanonicalEventType::ToolResult, SessionEventPayload {
+            message: Some("Bash".to_string()),
+            tool_name: Some("Bash".to_string()),
+            command: Some(command.to_string()),
+            exit_code,
+            ..SessionEventPayload::default()
+        })
+    }
+    fn derive(events: &[SessionEventRecord]) -> Vec<DerivedMemoryDraft> {
+        let end_request = EndSessionRequest {
+            session_id: Uuid::nil(),
+            summary: None,
+            metadata: json!({}),
+            defer: None,
+        };
+        derive_memories_from_session(Uuid::nil(), "claude", &end_request, events, None)
+    }
+    fn claims(events: &[SessionEventRecord]) -> Vec<(MemoryType, String)> {
+        derive(events)
+            .into_iter()
+            .filter(|memory| {
+                !matches!(memory.memory_type, MemoryType::Summary | MemoryType::ChangeLog)
+                    && memory.metadata.get("claimKey").is_some()
+            })
+            .map(|memory| (memory.memory_type, memory.content))
+            .collect()
+    }
+
+    #[test]
+    fn a_shell_command_yields_only_explicit_decisions() {
+        // A PR body and a heredoc in commands the assistant ran became
+        // "tool_verified" constraints, tasks and code-line "bugs".
+        let command = "gh pr create --title x --body \"\n\
+            Product decision: an EDIT share on a class gives full edit access to the linked activity.\n\
+            # sites that must stay hidden for partial sharers: combine partial\n\
+            Backend companion (required for the writes to succeed): CodeChum/gradechum-api.\n\
+            Task: give EDIT sharers full edit access.\n\
+            Verified locally against a seeded database: without the flag the endpoint\"\n\
+            python3 - <<'EOF'\nraise ValueError(\"entries must contain between 2 and 5 items.\")\n\
+            if field_name not in required:\nexcept Exception as e:\nEOF";
+        let got = claims(&[bash(1, command, None)]);
+        assert_eq!(
+            got,
+            vec![(
+                MemoryType::Decision,
+                "Product decision: an EDIT share on a class gives full edit access to the linked activity.".to_string()
+            )],
+        );
+    }
+
+    #[test]
+    fn a_decision_in_tool_text_ranks_below_the_engineers_own_words() {
+        let memories = derive(&[bash(1, "git commit -F - <<'EOF'\nDecision: widget exports retry through Cloud Tasks.\nEOF", None)]);
+        let decision = memories
+            .iter()
+            .find(|memory| memory.memory_type == MemoryType::Decision)
+            .expect("decision kept");
+        assert_eq!(decision.metadata["authorityClass"], "session_derived");
+        assert_eq!(decision.metadata["belief"]["admit"], true);
+    }
+
+    #[test]
+    fn tool_output_still_reports_errors_as_bugs() {
+        let got = claims(&[bash(1, "cargo build --release\nerror: the build failed because migration 0042 is missing", Some(1))]);
+        assert!(!got.is_empty() && got.iter().all(|(kind, _)| *kind == MemoryType::Bug), "{got:?}");
+    }
+
+    #[test]
+    fn code_lines_are_not_claims() {
+        for line in [
+            "raise ValueError(\"entries must contain between 2 and 5 items.\")",
+            "if field_name not in required:",
+            "except Exception as e:",
+            "for line in open(p,errors=\"replace\"):",
+            "with self.assertRaises(ai_utils.GradingPersonalizationError):",
+            "end = s.index(\"it('should not call ResultService.view when already viewed'\", start)",
+            "rule='''# Engineers must be able to tell team memory from Claude's own reasoning, so",
+            "add = \"\"\"Product decision 2026-10-12 (user): EDIT sharers must also be able to download",
+            "f\"A strictness level must have between {min_entries} and \"",
+            "\"\"\"A Langfuse schema still capped at 5 tiers must be relaxed to",
+            "\\set ON_ERROR_STOP on",
+            "echo \"--- staging api errors around 07:48-07:50:\";",
+            "isQuestionnaireFilesError,",
+            "task: { ...partialSharedFields, is_partially_shared: true } as any,",
+            "'data-view-only',",
+        ] {
+            assert!(looks_like_code_line(line) || is_non_claim_fragment(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn prose_stays_prose() {
+        for line in [
+            "Product decision: an EDIT share on a class gives full edit access to the linked activity.",
+            "Decision: we decided to keep per-engineer tokens in Secret Manager.",
+            "#3840 merged with the ChumFlow check red.",
+            "If the build fails on Node 26, use pnpm 9 with --ignore-scripts.",
+            "We must never run SET through the PgBouncer pooler.",
+        ] {
+            assert!(!looks_like_code_line(line) && !is_non_claim_fragment(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn headings_lead_ins_quotes_and_fragments_are_not_claims() {
+        for line in [
+            "## Root cause",
+            "# sites that must stay hidden for partial sharers",
+            "Still open, not part of this hotfix:",
+            "> None of these entries mentions a root cause or a fix.",
+            "Must contain between \"",
+        ] {
+            assert!(is_non_claim_fragment(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn instructions_to_the_assistant_are_not_team_constraints() {
+        let got = claims(&[
+            prompt(1, "Answer in two lines, say who recorded it, and do not read any files."),
+            prompt(2, "wait, so for every update in chum-mem, do the team need to update"),
+        ]);
+        assert!(
+            got.iter().all(|(kind, _)| !matches!(kind, MemoryType::Constraint | MemoryType::Task)),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_team_rule_in_a_prompt_is_still_a_constraint() {
+        let got = claims(&[prompt(1, "Team rule: we must never run SET through the PgBouncer pooler.")]);
+        assert!(got.iter().any(|(kind, _)| *kind == MemoryType::Constraint), "{got:?}");
+    }
+
+    #[test]
+    fn a_decision_in_a_prompt_is_still_a_decision() {
+        let got = claims(&[prompt(1, "Decision: we decided to keep per-engineer tokens in Secret Manager.")]);
+        assert!(got.iter().any(|(kind, _)| *kind == MemoryType::Decision), "{got:?}");
+    }
+
+    #[test]
+    fn answer_text_about_missing_verification_or_causes_is_not_a_fact_or_fix() {
+        let got = claims(&[
+            prompt(1, "Is the ChumFlow failure known?"),
+            answer(2, "None of these entries mentions a root cause or a fix. \
+                It has failed before, but treat it as a lead and not a confirmed cause. \
+                Claude separates what memory says from what it hasn't verified."),
+        ]);
+        assert_eq!(got, vec![], "{got:?}");
+    }
+
+    #[test]
+    fn a_stated_fix_in_an_answer_is_kept() {
+        let got = claims(&[
+            prompt(1, "why did the import fail?"),
+            answer(2, "The root cause was a missing index on results.section_id; the fix was migration 0042."),
+        ]);
+        assert!(got.iter().any(|(kind, _)| *kind == MemoryType::Fix), "{got:?}");
+    }
+
+    #[test]
+    fn status_lines_and_wrapped_fragments_in_tool_text_are_not_bugs() {
+        let command = "gh pr comment 1 --body-file - <<'EOF'\n\
+            `tsc` has no errors in the touched files (the 5 pre-existing errors are in unrelated test files).\n\
+            `tsc` error count unchanged (pre-existing errors only, none in touched files).\n\
+            way, but the MCP server only sees the env var and shows `failed` in `/mcp`\nEOF";
+        assert_eq!(claims(&[bash(1, command, None)]), vec![]);
+    }
+
+    #[test]
+    fn markdown_emphasis_is_not_stored() {
+        let got = claims(&[
+            prompt(1, "what was the fix?"),
+            answer(2, "**The fix:** a request already in flight for a result now blocks a second one until it settles."),
+        ]);
+        assert!(got.iter().all(|(_, content)| !content.contains("**")), "{got:?}");
+    }
+
+    #[test]
+    fn hotfix_is_not_a_fix_marker() {
+        assert!(!has_fix_marker("still open, not part of this hotfix: the frontend half"));
+        assert!(has_fix_marker("fix: release the connection after auth"));
     }
 }

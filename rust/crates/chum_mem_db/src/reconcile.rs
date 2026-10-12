@@ -7,8 +7,8 @@
 //! `RECONCILE_CHUNK_SIZE` claims per sub-transaction.
 
 use chum_mem_pipeline::reconcile::{
-    claim_strength, current_supersedes_prior, parse_authority_class, parse_memory_type,
-    parse_verification_status,
+    claim_strength, current_supersedes_prior, near_duplicate_claims, near_duplicate_supersedes,
+    parse_authority_class, parse_memory_type, parse_verification_status,
 };
 use serde_json::json;
 use sqlx::{Postgres, Row, Transaction};
@@ -339,5 +339,120 @@ async fn reconcile_single_claim(
         }
     }
 
+    outcome.supersedes_edges +=
+        supersede_near_duplicates(tx, context, project_id, current).await?;
+
     Ok(outcome)
+}
+
+/// Most recent same-type claims compared for near-duplicates, per new claim.
+const NEAR_DUPLICATE_CANDIDATES: i64 = 100;
+
+/// The same decision recorded in several sessions gets a different
+/// `claim_key` for every wording, so the exact-key pass above leaves each copy
+/// active and recall shows it four times (pilot review 2026-10-12). Retire
+/// older active claims of the same type and polarity whose text is a
+/// near-duplicate of the current one, when the current one is at least as
+/// strong.
+async fn supersede_near_duplicates(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &RepositoryContext,
+    project_id: Uuid,
+    current: &ClaimSnapshot,
+) -> Result<usize, DbError> {
+    let current_content: Option<String> = sqlx::query_scalar(
+        "select content from public.memories where id = $1 and project_id = $2",
+    )
+    .bind(current.memory_id)
+    .bind(project_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(current_content) = current_content else {
+        return Ok(0);
+    };
+    let rows = sqlx::query(
+        r#"
+        select c.id as claim_id, c.memory_id, c.authority_class, c.verification_status, m.content
+        from public.claims c
+        join public.memories m on m.id = c.memory_id
+        where c.organization_id = $1
+          and c.team_id = $2
+          and c.project_id = $3
+          and c.id <> $4
+          and c.claim_type::text = $5
+          and c.claim_polarity = $6
+          and c.admitted = true
+          and c.superseded_by is null
+          and m.superseded_at is null
+        order by c.created_at desc, c.id desc
+        limit $7
+        "#,
+    )
+    .bind(context.organization_id)
+    .bind(context.team_id)
+    .bind(project_id)
+    .bind(current.claim_id)
+    .bind(&current.claim_type)
+    .bind(current.claim_polarity.as_deref().unwrap_or("positive"))
+    .bind(NEAR_DUPLICATE_CANDIDATES)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let current_authority = current
+        .authority_class
+        .as_deref()
+        .and_then(parse_authority_class);
+    let current_verification = current
+        .verification_status
+        .as_deref()
+        .and_then(parse_verification_status);
+    let mut superseded = 0;
+    for row in rows {
+        let content: String = row.try_get("content")?;
+        if !near_duplicate_claims(&current_content, &content) {
+            continue;
+        }
+        let prior_authority: Option<String> = row.try_get("authority_class")?;
+        let prior_verification: Option<String> = row.try_get("verification_status")?;
+        if !near_duplicate_supersedes(
+            current_authority,
+            current_verification,
+            prior_authority.as_deref().and_then(parse_authority_class),
+            prior_verification
+                .as_deref()
+                .and_then(parse_verification_status),
+        ) {
+            continue;
+        }
+        let prior_claim_id: Uuid = row.try_get("claim_id")?;
+        let prior_memory_id: Uuid = row.try_get("memory_id")?;
+        mark_memory_superseded(tx, context, project_id, prior_memory_id).await?;
+        mark_claim_superseded(tx, context, project_id, prior_claim_id, current.claim_id).await?;
+        let metadata = json!({ "claimKey": current.claim_key, "reason": "near_duplicate" });
+        upsert_memory_edge(
+            tx,
+            context,
+            project_id,
+            current.memory_id,
+            prior_memory_id,
+            "supersedes",
+            "inferred",
+            0.9,
+            &metadata,
+        )
+        .await?;
+        upsert_claim_edge(
+            tx,
+            context,
+            project_id,
+            current.claim_id,
+            prior_claim_id,
+            "supersedes",
+            0.9,
+            &metadata,
+        )
+        .await?;
+        superseded += 1;
+    }
+    Ok(superseded)
 }
