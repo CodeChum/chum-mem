@@ -4558,6 +4558,7 @@ async fn semantic_search(
           m.created_at,
           s.branch,
           s.metadata->>'userEmail' as author_email,
+          s.metadata->>'userName' as author_name,
           null::float8 as lexical_score,
           d.semantic_score,
           c.id as claim_id,
@@ -4677,6 +4678,7 @@ async fn semantic_search(
                 "sessionId": row.session_id,
                 "branch": row.branch,
                 "authorEmail": row.author_email,
+                "authorName": row.author_name,
                 "importanceScore": row.importance_score,
                 "confidenceScore": row.confidence_score,
                 "supersededAt": row.superseded_at.map(format_time),
@@ -4732,6 +4734,7 @@ fn map_ranked_memory(row: &MemorySearchRow, lexical: bool) -> RankedMemory {
         provenance: Vec::new(),
         proof_handles: Vec::new(),
         author_email: row.author_email.clone(),
+        author_name: row.author_name.clone(),
         lexical_score: if lexical { row.lexical_score } else { None },
         semantic_score: if lexical { None } else { row.semantic_score },
         exact_session_match: None,
@@ -4786,6 +4789,7 @@ fn map_memory_detail_to_ranked_memory(row: &chum_mem_db::MemoryDetailRow) -> Ran
         provenance: Vec::new(),
         proof_handles: Vec::new(),
         author_email: row.author_email.clone(),
+        author_name: row.author_name.clone(),
         lexical_score: None,
         semantic_score: None,
         exact_session_match: None,
@@ -7096,6 +7100,7 @@ mod review_2026_10_09_tests {
             session_id: Some(session_id),
             branch: Some("main".to_string()),
             author_email: Some("dev@example.com".to_string()),
+            author_name: Some("Dev Example".to_string()),
             claim_id: None,
             claim_type: None,
             claim_key: None,
@@ -7113,6 +7118,7 @@ mod review_2026_10_09_tests {
         };
         let hit = map_memory_detail_to_ranked_memory(&row);
         assert_eq!(hit.author_email.as_deref(), Some("dev@example.com"));
+        assert_eq!(hit.author_name.as_deref(), Some("Dev Example"));
         assert_eq!(hit.session_ids, vec![session_id]);
         assert_eq!(hit.branch.as_deref(), Some("main"));
 

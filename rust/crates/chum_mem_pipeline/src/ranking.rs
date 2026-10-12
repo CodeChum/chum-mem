@@ -54,6 +54,9 @@ pub struct RankedMemory {
     /// Git email of the session that produced this memory (team attribution).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author_email: Option<String>,
+    /// Display name of that session's engineer (git user.name), for citing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded_at: Option<String>,
     #[serde(default)]
@@ -200,6 +203,7 @@ pub fn merge_hybrid_results(
                 provenance: Vec::new(),
                 proof_handles: Vec::new(),
                 author_email: metadata_string(&metadata, "authorEmail"),
+                author_name: metadata_string(&metadata, "authorName"),
                 lexical_score: None,
                 semantic_score: Some(semantic_score),
                 exact_session_match: None,
@@ -917,6 +921,7 @@ mod tests {
             provenance: Vec::new(),
             proof_handles: Vec::new(),
             author_email: None,
+            author_name: None,
             lexical_score: Some(0.5),
             semantic_score: Some(0.5),
             exact_session_match: None,
