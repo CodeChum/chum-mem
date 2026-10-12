@@ -271,7 +271,7 @@ test_docs_only_default() {
   check "default: docs block attached" '[[ "$ctx" == *"--- Team docs"*"docs/bonus-toggle.md"* ]]'
   check "default: no session-memory block" '[[ "$ctx" != *"Team memory"* && "$ctx" != *"bonus toggle lives in section settings"* ]]'
   check "default: session memory is not even queried" '! grep -q "^POST /api/search" "$FAKE_STATE/requests.log"'
-  check "default: prompt preamble points to mem_search" '[[ "$ctx" == *"not attached automatically; search it with the chum-memory MCP tool mem_search"* ]]'
+  check "default: prompt preamble points to mem_search" '[[ "$ctx" == *"not attached automatically; for a question about past decisions"*"call the chum-memory MCP tool mem_search before answering"* ]]'
   ctx=$(hook "$r" "$FAKE_URL" "$p" CHUM_AUTO_RECALL_SESSIONS=1 | jq -r '.hookSpecificOutput.additionalContext // ""')
   check "CHUM_AUTO_RECALL_SESSIONS=1: memory and docs blocks" '[[ "$ctx" == *"--- Team memory"*"bonus toggle lives in section settings"*"--- Team docs"* ]]'
   jq '. + {autoRecallSessions: true}' "$r/.chum-mem" > "$r/.chum-mem.new" && mv "$r/.chum-mem.new" "$r/.chum-mem"

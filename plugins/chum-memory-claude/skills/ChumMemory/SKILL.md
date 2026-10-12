@@ -22,6 +22,7 @@ From chum-mem:
 
 - Session memory: `[n] <author name> (<author email>), session <first 8 characters of the session id>, <date>`. Name and email come from `authorName` / `authorEmail`, the session from `sessionIds`, the date from `createdAt`. Leave out a part you do not have rather than guessing it.
 - A repository doc found through chum-mem: `[n] repo doc <path>`.
+- One number per source: points from the same session (or doc) reuse its number.
 
 Never present chum-mem content as your own finding, never footnote something you worked out from the code yourself, and leave the footer out when nothing came from chum-mem. If you checked a recalled claim against the code, say both: what chum-mem said (footnoted) and what the code shows.
 
