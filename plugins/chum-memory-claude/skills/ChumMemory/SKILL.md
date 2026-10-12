@@ -7,6 +7,15 @@ description: "Always-on knowledge graph and memory retrieval for code work. USE 
 
 The plugin hook runs `sync.sh` on every `UserPromptSubmit`, so the repository graph is **already fresh** when your turn starts. Your job is to **query the graph instead of grepping**, then read the files the graph points to — and when you recall memory, **read proof, not prose**.
 
+## Always say it came from chum-mem
+
+Engineers need to tell team memory apart from your own reasoning. Whenever an answer uses anything from chum-mem (a `mem_search` / `memory_get` result, a knowledge report, or an attached team memory or team docs block), tag each such point in the answer:
+
+- session memory: `(chum-mem: <author email>, <date>)`, e.g. `(chum-mem: ana@codechum.com, 2026-10-12)`
+- a repository doc found through chum-mem: `(chum-mem: repo doc <path>)`
+
+Never present chum-mem content as your own finding, and never put the tag on something you worked out from the code yourself. If you checked a recalled claim against the code, say both: what chum-mem said and what the code shows.
+
 ## The one rule
 
 > **On every turn that touches code, call `knowledge_report(layer:"unified")` first, then a repository-layer `knowledge_query`, then `mem_search`, and only then Read / Grep / Glob / Edit.**
