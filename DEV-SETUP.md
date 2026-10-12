@@ -87,25 +87,49 @@ all code and rewrites the shared repository snapshot for everyone.
 
 ## 3. Each engineer (one-time, about 3 minutes)
 
-**One command (macOS).** Copy the team token to the clipboard (from the admin;
-never paste it into the Claude prompt, prompts are captured), then in a Claude
-Code session in the monorepo type:
+**Admin, once per engineer** (from a chum-mem checkout, as a project admin):
+
+```bash
+deploy/gcp/deploy-vm.sh add-user juan@codechum.com      # re-run to rotate their token
+deploy/gcp/deploy-vm.sh remove-user juan@codechum.com   # revoke: token, secret, IAM grants
+deploy/gcp/deploy-vm.sh users                           # who has a token
+```
+
+`add-user` generates the engineer's own token, stores it only in the Secret
+Manager secret `chum-mem-token-<email-slug>` (readable by that engineer alone),
+gives the VM its SHA-256 (`CHUM_MEM_USER_TOKENS`), restarts the API (a few
+seconds; hooks spool meanwhile), and grants what the tunnel needs: IAP-secured
+Tunnel User limited to port 63001 and Compute Viewer on this one instance (the
+GA `start-iap-tunnel` looks the instance up before connecting). Company
+accounts only (`CHUM_USER_DOMAINS`, default `codechum.com gradechum.com`).
+Nobody sends tokens around, and revoking one engineer does not touch anyone
+else. Needs the Secret Manager API enabled on the project.
+
+**Engineer, one command (macOS).** In a Claude Code session in the monorepo:
 
 ```
 ! bash .claude/chum-mem/scripts/setup-engineer.sh
 ```
 
 It installs jq and the Google Cloud SDK if missing, runs `gcloud auth login`
-(browser), installs the launchd tunnel agent, checks the token against the
-server, saves it (0600) and clears the clipboard, adds the MCP export to
-`~/.zshenv`, and checks `git user.email`. Each step is skipped when already
-done, so it is safe to re-run. Then restart Claude Code. The manual steps
-below do the same thing.
+(browser), installs the launchd tunnel agent, reads your token from your
+Secret Manager secret, checks it against the server, saves it (0600) and adds
+the MCP export to `~/.zshenv`. Each step is skipped when already done, so it is
+safe to re-run (and re-running is how you pick up a rotated token). Then
+restart Claude Code. The token is never printed and never goes through the
+Claude prompt.
+
+**Attribution.** The server credits every session started with a personal
+token to the token's owner (`userEmail`), not to the client's git email (kept
+as `gitEmail`), and a personal token cannot write to another engineer's
+session (403). The shared team token in `CHUM_MEM_API_TOKENS` still works for
+the worker, the dashboard and laptops not yet migrated; sessions it starts
+fall back to the git email.
 
 The hooks, the retrieval skill and the MCP server are **committed in the
 monorepo** (`.claude/settings.json`, `.claude/chum-mem/`, `.claude/skills/chum-memory/`,
-`.mcp.json`, `.chum-mem`), so there is no plugin to install. The only thing a
-laptop needs is the tunnel to the VM:
+`.mcp.json`, `.chum-mem`), so there is no plugin to install. The manual steps
+below are the same thing without the script (Linux, or debugging):
 
 On the laptop you need the Google Cloud SDK (`brew install --cask google-cloud-sdk`),
 the GitHub CLI logged in (`brew install gh && gh auth login`; `CodeChum/chum-mem`
@@ -116,12 +140,11 @@ with macOS 15+, otherwise `brew install jq`; every hook uses it). Then:
 gcloud auth login                                   # once; your @codechum.com account
 gh repo clone CodeChum/chum-mem ~/chum-mem           # needs gh auth login first
 ~/chum-mem/deploy/gcp/install-tunnel-agent.sh install   # launchd agent, auto-restarts, survives reboots
-~/chum-mem/deploy/gcp/install-tunnel-agent.sh token     # paste the team API token (not echoed)
+~/chum-mem/deploy/gcp/install-tunnel-agent.sh token     # paste your token (not echoed):
+# gcloud secrets versions access latest --secret=chum-mem-token-<you>-at-codechum-com --project gradechum
 ```
 
-Prerequisites from an admin: **IAP-secured Tunnel User** + **Compute Viewer** on
-project `gradechum`, and the **API token** (the server rejects requests without
-it since 2026-10-09). The token step stores it in `~/.config/chum-mem/token`
+Prerequisite: an admin has run `add-user` for you. The token step stores it in `~/.config/chum-mem/token`
 (0600) for the hooks and exports it from `~/.zshenv` for the MCP server; open a
 new terminal afterwards. If your login shell is bash, add the same `export`
 line to `~/.bash_profile` (the hooks read the file, so capture works either
@@ -269,10 +292,11 @@ commands and paths from recent sessions rather than decisions; it is only
 useful when someone recorded a decision or fix in words ("Decision: …",
 "Fixed: …"). That is why it is off by default.
 
-Token auth is **on** (`CHUM_MEM_API_TOKENS` in the VM's `.env`, generated on
-first boot; one shared team token for the pilot, comma-separated list for
-more). Rotate by editing `.env` and `docker compose up -d`, then re-run the
-`token` step on every laptop.
+Token auth is **on**. Engineers use personal tokens (`CHUM_MEM_USER_TOKENS`,
+managed by `deploy-vm.sh add-user`/`remove-user`, section 3). The shared
+`CHUM_MEM_API_TOKENS` (generated on first boot) stays for the worker and the
+dashboard; once every laptop has a personal token, rotate it (edit `.env`,
+`docker compose up -d`) so former holders lose access.
 
 Admin token (`CHUM_MEM_ADMIN_TOKENS`, comma-separated, keep it off laptops):
 when set, `/api/admin/*`, `/v1/ingest/bulk/*`, claim governance

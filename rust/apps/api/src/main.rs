@@ -16,7 +16,7 @@ use chum_mem_app::{
     ErrorBody, HealthResponse, ReadyResponse, ServiceMetadata, build_health_response, init_tracing,
     shutdown_signal,
 };
-use chum_mem_config::{AppConfig, ServiceKind, VectorStoreBackend};
+use chum_mem_config::{AppConfig, ServiceKind, UserToken, VectorStoreBackend};
 use chum_mem_contracts::{
     AppendSessionEventRequest, AppendSessionEventResponse, AuthorityClass,
     BatchAppendSessionEventsRequest, BatchAppendSessionEventsResponse, BulkIndexResponse,
@@ -435,6 +435,148 @@ fn token_matches(known: &str, presented: &str) -> bool {
     diff == 0
 }
 
+/// The engineer a per-engineer token (CHUM_MEM_USER_TOKENS) belongs to.
+/// Inserted by `require_api_token`; absent for shared, admin and no-auth calls.
+#[derive(Debug, Clone)]
+struct TokenOwner(String);
+
+fn sha256_hex(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Owner of the presented token, if it is a per-engineer token. Every entry is
+/// compared so the timing does not reveal which one matched.
+fn user_token_owner<'a>(user_tokens: &'a [UserToken], presented: &str) -> Option<&'a str> {
+    let digest = sha256_hex(presented);
+    let mut owner = None;
+    for entry in user_tokens {
+        if token_matches(&entry.sha256_hex, &digest) && owner.is_none() {
+            owner = Some(entry.email.as_str());
+        }
+    }
+    owner
+}
+
+/// Who a session is attributed to: the per-engineer token that started it
+/// (`tokenOwner`, set only by the server). Sessions started before personal
+/// tokens, or with the shared token, have none.
+#[derive(Debug, Clone, Default, PartialEq, Eq, sqlx::FromRow)]
+struct SessionAttribution {
+    token_owner: Option<String>,
+}
+
+impl SessionAttribution {
+    /// A session belongs to someone else only when another engineer's token
+    /// started it. A session with no token owner (started before personal
+    /// tokens, typically under the engineer's git email, which need not match
+    /// their Google account) can be continued and is claimed by the next
+    /// personal-token session/start.
+    fn belongs_to_other(&self, owner: &str) -> bool {
+        self.token_owner
+            .as_deref()
+            .is_some_and(|existing| !existing.eq_ignore_ascii_case(owner))
+    }
+}
+
+const OTHER_ENGINEERS_SESSION: &str =
+    "this session belongs to another engineer's token; start a new session";
+
+/// Applies token attribution to a session/start's client metadata. The client
+/// cannot set `tokenOwner`. With a per-engineer token the token owner becomes
+/// `userEmail` (the client's git email is kept as `gitEmail`), and another
+/// engineer's session is refused. With a shared token, a session already owned
+/// by a per-engineer token keeps its author.
+fn attribute_session_start(
+    metadata: &mut Value,
+    existing: Option<&SessionAttribution>,
+    owner: Option<&str>,
+) -> Result<(), ApiError> {
+    if !metadata.is_object() {
+        *metadata = json!({});
+    }
+    let Some(fields) = metadata.as_object_mut() else {
+        return Ok(());
+    };
+    fields.remove("tokenOwner");
+    match owner {
+        Some(owner) => {
+            if existing.is_some_and(|session| session.belongs_to_other(owner)) {
+                return Err(ApiError::forbidden(OTHER_ENGINEERS_SESSION));
+            }
+            if let Some(Value::String(git_email)) = fields.remove("userEmail")
+                && !git_email.trim().is_empty()
+                && !git_email.trim().eq_ignore_ascii_case(owner)
+            {
+                fields.insert("gitEmail".to_string(), json!(git_email));
+            }
+            fields.insert("userEmail".to_string(), json!(owner));
+            fields.insert("tokenOwner".to_string(), json!(owner));
+        }
+        None => {
+            if existing.is_some_and(|session| session.token_owner.is_some()) {
+                fields.remove("userEmail");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn owner_email(owner: &Option<axum::Extension<TokenOwner>>) -> Option<&str> {
+    owner.as_ref().map(|axum::Extension(TokenOwner(email))| email.as_str())
+}
+
+const SESSION_ATTRIBUTION_COLUMNS: &str =
+    "metadata->>'tokenOwner' as token_owner";
+
+/// session/start: applies `attribute_session_start` against the stored session
+/// with the same (project, provider, external id) key, if any.
+async fn authorize_session_start(
+    state: &ApiState,
+    input: &mut StartSessionRequest,
+    owner: Option<&str>,
+) -> Result<(), ApiError> {
+    let provider = normalize_provider_id(&input.provider).map_err(map_domain_error)?;
+    let existing = sqlx::query_as::<_, SessionAttribution>(&format!(
+        "select {SESSION_ATTRIBUTION_COLUMNS} from public.sessions \
+         where project_id = $1 and provider = $2 and external_session_id = $3"
+    ))
+    .bind(input.project_id)
+    .bind(provider)
+    .bind(&input.external_session_id)
+    .fetch_optional(state.db.pool())
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+    attribute_session_start(&mut input.metadata, existing.as_ref(), owner)
+}
+
+/// Events and session/end: a per-engineer token may only write to its own
+/// sessions. Shared tokens (hooks not yet migrated, the worker's derivation
+/// callbacks) are not restricted.
+async fn authorize_session_write(
+    state: &ApiState,
+    session_id: Uuid,
+    owner: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    let existing = sqlx::query_as::<_, SessionAttribution>(&format!(
+        "select {SESSION_ATTRIBUTION_COLUMNS} from public.sessions where id = $1"
+    ))
+    .bind(session_id)
+    .fetch_optional(state.db.pool())
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+    if existing.is_some_and(|session| session.belongs_to_other(owner)) {
+        return Err(ApiError::forbidden(OTHER_ENGINEERS_SESSION));
+    }
+    Ok(())
+}
+
 async fn require_api_token(
     State(state): State<ApiState>,
     mut request: Request,
@@ -442,7 +584,8 @@ async fn require_api_token(
 ) -> Response {
     let tokens = &state.config.api_tokens;
     let admin_tokens = &state.config.admin_tokens;
-    if tokens.is_empty() && admin_tokens.is_empty() {
+    let user_tokens = &state.config.user_tokens;
+    if tokens.is_empty() && user_tokens.is_empty() && admin_tokens.is_empty() {
         request.extensions_mut().insert(AdminAuth(true));
         return next.run(request).await;
     }
@@ -468,7 +611,7 @@ async fn require_api_token(
     // Team auth off but admin tokens on: ordinary routes stay open (as with
     // no tokens at all); only the admin routes and full repository replaces
     // need the admin token.
-    let open_team_routes = tokens.is_empty();
+    let open_team_routes = tokens.is_empty() && user_tokens.is_empty();
     let Some(token) = presented else {
         if open_team_routes && !is_admin_route(&path) {
             request.extensions_mut().insert(AdminAuth(false));
@@ -490,7 +633,8 @@ async fn require_api_token(
     let is_admin = admin_tokens
         .iter()
         .any(|known| token_matches(known, &token));
-    let is_team = tokens.iter().any(|known| token_matches(known, &token));
+    let owner = user_token_owner(user_tokens, &token).map(str::to_string);
+    let is_team = tokens.iter().any(|known| token_matches(known, &token)) || owner.is_some();
     if !is_admin && !is_team && !open_team_routes {
         return (
             StatusCode::UNAUTHORIZED,
@@ -509,16 +653,21 @@ async fn require_api_token(
             .into_response();
     }
     request.extensions_mut().insert(AdminAuth(admin));
+    if let Some(owner) = owner {
+        request.extensions_mut().insert(TokenOwner(owner));
+    }
     next.run(request).await
 }
 
 async fn session_start(
     State(state): State<ApiState>,
-    Json(input): Json<StartSessionRequest>,
+    owner: Option<axum::Extension<TokenOwner>>,
+    Json(mut input): Json<StartSessionRequest>,
 ) -> Result<Response, ApiError> {
     input
         .validate()
         .map_err(|error| ApiError::validation(error.to_string()))?;
+    authorize_session_start(&state, &mut input, owner_email(&owner)).await?;
 
     let response = perform_session_start(&state, input)
         .await
@@ -528,11 +677,13 @@ async fn session_start(
 
 async fn session_event(
     State(state): State<ApiState>,
+    owner: Option<axum::Extension<TokenOwner>>,
     Json(input): Json<AppendSessionEventRequest>,
 ) -> Result<Response, ApiError> {
     input
         .validate()
         .map_err(|error| ApiError::validation(error.to_string()))?;
+    authorize_session_write(&state, input.session_id, owner_email(&owner)).await?;
 
     let response = perform_session_event(&state, input)
         .await
@@ -542,11 +693,13 @@ async fn session_event(
 
 async fn session_events_batch(
     State(state): State<ApiState>,
+    owner: Option<axum::Extension<TokenOwner>>,
     Json(input): Json<BatchAppendSessionEventsRequest>,
 ) -> Result<Response, ApiError> {
     input
         .validate()
         .map_err(|error| ApiError::validation(error.to_string()))?;
+    authorize_session_write(&state, input.session_id, owner_email(&owner)).await?;
     let response = perform_session_events_batch(&state, input)
         .await
         .map_err(map_domain_error)?;
@@ -558,11 +711,13 @@ async fn session_events_batch(
 /// COPY path with deferred constraint checking.
 async fn session_events_bulk(
     State(state): State<ApiState>,
+    owner: Option<axum::Extension<TokenOwner>>,
     Json(input): Json<BatchAppendSessionEventsRequest>,
 ) -> Result<Response, ApiError> {
     input
         .validate()
         .map_err(|error| ApiError::validation(error.to_string()))?;
+    authorize_session_write(&state, input.session_id, owner_email(&owner)).await?;
 
     let response = perform_session_events_bulk(&state, input)
         .await
@@ -586,11 +741,13 @@ async fn bulk_create_indexes(State(state): State<ApiState>) -> Result<Response, 
 
 async fn session_end(
     State(state): State<ApiState>,
+    owner: Option<axum::Extension<TokenOwner>>,
     Json(input): Json<EndSessionRequest>,
 ) -> Result<Response, ApiError> {
     input
         .validate()
         .map_err(|error| ApiError::validation(error.to_string()))?;
+    authorize_session_write(&state, input.session_id, owner_email(&owner)).await?;
     let response = perform_session_end(&state, input)
         .await
         .map_err(map_domain_error)?;
@@ -892,6 +1049,7 @@ async fn handle_mcp_call(
     params: &Value,
     default_project_id: Option<Uuid>,
     is_admin: bool,
+    owner: Option<&str>,
 ) -> Result<Value, String> {
     let raw_args = if let Some(a) = params.get("arguments") {
         a.clone()
@@ -931,8 +1089,11 @@ async fn handle_mcp_call(
             )
         }
         "session_start" => {
-            let input: StartSessionRequest =
+            let mut input: StartSessionRequest =
                 serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
+            authorize_session_start(state, &mut input, owner)
+                .await
+                .map_err(|e| e.body.error)?;
             let result = perform_session_start(state, input)
                 .await
                 .map_err(|e| format!("{e:?}"))?;
@@ -943,6 +1104,9 @@ async fn handle_mcp_call(
         "session_event_append" => {
             let input: AppendSessionEventRequest =
                 serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
+            authorize_session_write(state, input.session_id, owner)
+                .await
+                .map_err(|e| e.body.error)?;
             let result = perform_session_event(state, input)
                 .await
                 .map_err(|e| format!("{e:?}"))?;
@@ -953,6 +1117,9 @@ async fn handle_mcp_call(
         "session_end" => {
             let input: EndSessionRequest =
                 serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
+            authorize_session_write(state, input.session_id, owner)
+                .await
+                .map_err(|e| e.body.error)?;
             let result = perform_session_end(state, input)
                 .await
                 .map_err(|e| format!("{e:?}"))?;
@@ -1148,6 +1315,10 @@ async fn mcp_post(State(state): State<ApiState>, request: Request) -> Result<Res
         .extensions()
         .get::<AdminAuth>()
         .is_some_and(|AdminAuth(flag)| *flag);
+    let owner = request
+        .extensions()
+        .get::<TokenOwner>()
+        .map(|TokenOwner(email)| email.clone());
 
     let body_bytes = axum::body::to_bytes(request.into_body(), 8 * 1024 * 1024)
         .await
@@ -1236,7 +1407,7 @@ async fn mcp_post(State(state): State<ApiState>, request: Request) -> Result<Res
                 }
             }
 
-            let result = match handle_mcp_call(&state, method, &params, default_project_id, is_admin).await {
+            let result = match handle_mcp_call(&state, method, &params, default_project_id, is_admin, owner.as_deref()).await {
                 Ok(content) => jsonrpc_ok(&id, content),
                 Err(err) => jsonrpc_error(&id, -32000, &err),
             };
@@ -1439,12 +1610,16 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding API listener on {address}"))?;
 
-    if config.api_tokens.is_empty() {
+    if config.api_tokens.is_empty() && config.user_tokens.is_empty() {
         tracing::warn!(
             "CHUM_MEM_API_TOKENS is not set and CHUM_MEM_ALLOW_NO_AUTH=1: the API accepts unauthenticated requests"
         );
     } else {
-        info!(tokens = config.api_tokens.len(), "API token authentication enabled");
+        info!(
+            tokens = config.api_tokens.len(),
+            user_tokens = config.user_tokens.len(),
+            "API token authentication enabled"
+        );
     }
     if config.admin_tokens.is_empty() {
         tracing::warn!(
@@ -6204,7 +6379,7 @@ mod tests {
     use tower::ServiceExt;
     use uuid::Uuid;
 
-    fn test_state() -> ApiState {
+    pub(super) fn test_state() -> ApiState {
         let values = std::collections::HashMap::from([
             (
                 "DATABASE_URL".to_string(),
@@ -7018,5 +7193,159 @@ mod review_2026_10_09_tests {
         assert!(!is_admin_route("/api/claims/a/b/govern"));
         assert!(!is_admin_route("/api/claims/x/governance"));
         assert!(!is_admin_route("/api/memory/x"));
+    }
+}
+
+/// Per-engineer tokens (CHUM_MEM_USER_TOKENS) and session attribution.
+#[cfg(test)]
+mod user_token_tests {
+    use super::*;
+    use axum::http::{HeaderValue, Request};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn state_with_tokens(extra: &[(&str, String)]) -> ApiState {
+        let mut state = super::tests::test_state();
+        let mut values = std::collections::HashMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgres://chum_mem:chum_mem@postgres:65432/chum_mem".to_string(),
+            ),
+            (
+                "CHUM_MEM_ORGANIZATION_ID".to_string(),
+                "00000000-0000-0000-0000-000000000001".to_string(),
+            ),
+            (
+                "CHUM_MEM_TEAM_ID".to_string(),
+                "00000000-0000-0000-0000-000000000002".to_string(),
+            ),
+        ]);
+        for (key, value) in extra {
+            values.insert((*key).to_string(), value.clone());
+        }
+        state.config = Arc::new(AppConfig::from_map(&values).expect("test config should parse"));
+        state
+    }
+
+    async fn status_with_token(state: ApiState, uri: &str, token: Option<&str>) -> StatusCode {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", HeaderValue::from_static("application/json"));
+        if let Some(token) = token {
+            request = request.header("x-chum-token", token);
+        }
+        router(state)
+            .oneshot(request.body(axum::body::Body::from(r#"{"query":"   "}"#)).unwrap())
+            .await
+            .expect("request should complete")
+            .status()
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn user_token_owner_finds_the_matching_engineer() {
+        let tokens = vec![
+            UserToken { email: "juan@codechum.com".into(), sha256_hex: sha256_hex("tok-juan") },
+            UserToken { email: "ana@codechum.com".into(), sha256_hex: sha256_hex("tok-ana") },
+        ];
+        assert_eq!(user_token_owner(&tokens, "tok-ana"), Some("ana@codechum.com"));
+        assert_eq!(user_token_owner(&tokens, "tok-juan"), Some("juan@codechum.com"));
+        assert_eq!(user_token_owner(&tokens, "tok-other"), None);
+        // The configured hash is not itself a token.
+        assert_eq!(user_token_owner(&tokens, &sha256_hex("tok-ana")), None);
+    }
+
+    #[tokio::test]
+    async fn user_tokens_authenticate_team_routes_but_not_admin_routes() {
+        let users = format!("juan@codechum.com:{}", sha256_hex("tok-juan"));
+        let state = || {
+            state_with_tokens(&[
+                ("CHUM_MEM_USER_TOKENS", users.clone()),
+                ("CHUM_MEM_ADMIN_TOKENS", "admin-x".to_string()),
+            ])
+        };
+        // Past auth: the blank query is rejected by the handler (400), not 401.
+        assert_eq!(status_with_token(state(), "/api/search", Some("tok-juan")).await, StatusCode::BAD_REQUEST);
+        assert_eq!(status_with_token(state(), "/api/search", Some("tok-nope")).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status_with_token(state(), "/api/search", None).await, StatusCode::UNAUTHORIZED);
+        // User tokens alone (no shared tokens) still close the team routes.
+        assert_eq!(
+            status_with_token(state(), "/api/admin/reembed", Some("tok-juan")).await,
+            StatusCode::FORBIDDEN
+        );
+        // Shared tokens keep working next to user tokens.
+        let both = state_with_tokens(&[
+            ("CHUM_MEM_API_TOKENS", "team-shared".to_string()),
+            ("CHUM_MEM_USER_TOKENS", users.clone()),
+        ]);
+        assert_eq!(status_with_token(both, "/api/search", Some("team-shared")).await, StatusCode::BAD_REQUEST);
+    }
+
+    fn attribution(owner: Option<&str>) -> SessionAttribution {
+        SessionAttribution {
+            token_owner: owner.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn user_token_session_start_is_attributed_to_the_token_owner() {
+        let mut metadata = json!({"userEmail": "juan.personal@gmail.com", "userName": "Juan", "tokenOwner": "forged@x.com"});
+        attribute_session_start(&mut metadata, None, Some("juan@codechum.com")).expect("new session");
+        assert_eq!(metadata["userEmail"], "juan@codechum.com");
+        assert_eq!(metadata["tokenOwner"], "juan@codechum.com");
+        assert_eq!(metadata["gitEmail"], "juan.personal@gmail.com");
+        assert_eq!(metadata["userName"], "Juan");
+
+        // Same git email as the token: no gitEmail noise.
+        let mut metadata = json!({"userEmail": "JUAN@codechum.com"});
+        attribute_session_start(&mut metadata, None, Some("juan@codechum.com")).unwrap();
+        assert!(metadata.get("gitEmail").is_none());
+
+        // Non-object metadata from a client still gets attributed.
+        let mut metadata = Value::Null;
+        attribute_session_start(&mut metadata, None, Some("juan@codechum.com")).unwrap();
+        assert_eq!(metadata["userEmail"], "juan@codechum.com");
+    }
+
+    #[test]
+    fn user_token_cannot_take_over_another_engineers_session() {
+        let juan = Some("juan@codechum.com");
+        // Owned by another token.
+        let error = attribute_session_start(&mut json!({}), Some(&attribution(Some("ana@codechum.com"))), juan)
+            .expect_err("another token's session");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        // Own token's session (any case) resumes.
+        attribute_session_start(&mut json!({}), Some(&attribution(Some("Juan@CodeChum.com"))), juan).unwrap();
+        // A session with no token owner (pre-migration, git email may differ
+        // from the Google account) is claimed rather than refused.
+        let mut metadata = json!({"userEmail": "juan.personal@gmail.com"});
+        attribute_session_start(&mut metadata, Some(&attribution(None)), juan).unwrap();
+        assert_eq!(metadata["tokenOwner"], "juan@codechum.com");
+        assert_eq!(metadata["userEmail"], "juan@codechum.com");
+    }
+
+    #[test]
+    fn shared_token_cannot_forge_or_reassign_attribution() {
+        // A shared token cannot set tokenOwner.
+        let mut metadata = json!({"userEmail": "dev@codechum.com", "tokenOwner": "ana@codechum.com"});
+        attribute_session_start(&mut metadata, None, None).unwrap();
+        assert!(metadata.get("tokenOwner").is_none());
+        assert_eq!(metadata["userEmail"], "dev@codechum.com");
+        // Nor overwrite the author of a token-owned session.
+        let mut metadata = json!({"userEmail": "mallory@codechum.com"});
+        attribute_session_start(&mut metadata, Some(&attribution(Some("ana@codechum.com"))), None).unwrap();
+        assert!(metadata.get("userEmail").is_none());
+        // Legacy shared-token sessions behave as before.
+        let mut metadata = json!({"userEmail": "dev@codechum.com"});
+        attribute_session_start(&mut metadata, Some(&attribution(None)), None).unwrap();
+        assert_eq!(metadata["userEmail"], "dev@codechum.com");
     }
 }

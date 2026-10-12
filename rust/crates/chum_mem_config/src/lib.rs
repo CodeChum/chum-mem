@@ -76,6 +76,13 @@ pub struct AppConfig {
     /// repository sync with `mergeWithExisting=false`) require one of these
     /// instead of a plain API token. Empty = those endpoints accept any API token.
     pub admin_tokens: Vec<String>,
+    /// Per-engineer tokens (CHUM_MEM_USER_TOKENS, comma-separated
+    /// `email:sha256hex` entries). Only the SHA-256 of each token is configured;
+    /// the token itself lives in the engineer's Secret Manager secret. A
+    /// request with one of these tokens has team access and is bound to that
+    /// email: the server stamps it as the session author (`userEmail`) instead
+    /// of trusting the client's git email.
+    pub user_tokens: Vec<UserToken>,
     /// Browser origins allowed by CORS (CHUM_MEM_CORS_ORIGINS, comma-separated).
     /// Empty = no cross-origin access (the dashboard proxies server-side and the
     /// hooks/MCP client are not browsers, so nothing needs it by default).
@@ -150,6 +157,7 @@ impl AppConfig {
             team_role: parse_or_default(values, "CHUM_MEM_TEAM_ROLE", TeamRole::Admin)?,
             api_tokens: csv_list(values, "CHUM_MEM_API_TOKENS"),
             admin_tokens: csv_list(values, "CHUM_MEM_ADMIN_TOKENS"),
+            user_tokens: parse_user_tokens(values)?,
             allow_no_auth: optional(values, "CHUM_MEM_ALLOW_NO_AUTH").is_some_and(|value| {
                 matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
             }),
@@ -174,7 +182,7 @@ impl AppConfig {
     /// (Admin tokens alone leave every ordinary route open, so they do not
     /// count.)
     pub fn api_auth_problem(&self) -> Option<String> {
-        if self.api_tokens.is_empty() && !self.allow_no_auth {
+        if self.api_tokens.is_empty() && self.user_tokens.is_empty() && !self.allow_no_auth {
             Some(
                 "CHUM_MEM_API_TOKENS is empty: refusing to start an unauthenticated API. \
                  Set CHUM_MEM_API_TOKENS (and CHUM_MEM_ADMIN_TOKENS), or set \
@@ -236,6 +244,41 @@ fn required(values: &HashMap<String, String>, key: &'static str) -> Result<Strin
         .cloned()
         .filter(|value| !value.trim().is_empty())
         .ok_or(ConfigError::Missing(key))
+}
+
+/// An engineer's token as configured: the owner's email (lowercased) and the
+/// lowercase hex SHA-256 of the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserToken {
+    pub email: String,
+    pub sha256_hex: String,
+}
+
+/// CHUM_MEM_USER_TOKENS → `email:sha256hex` entries. A malformed entry is a
+/// startup error rather than a silently missing engineer.
+fn parse_user_tokens(values: &HashMap<String, String>) -> Result<Vec<UserToken>, ConfigError> {
+    csv_list(values, "CHUM_MEM_USER_TOKENS")
+        .into_iter()
+        .map(|entry| {
+            let invalid = || ConfigError::Invalid {
+                key: "CHUM_MEM_USER_TOKENS",
+                // Never echo the entry: it is a hash, but keep secrets-shaped
+                // values out of logs anyway.
+                value: "expected comma-separated email:sha256hex entries".to_string(),
+            };
+            let (email, hash) = entry.rsplit_once(':').ok_or_else(invalid)?;
+            let email = email.trim().to_ascii_lowercase();
+            let hash = hash.trim().to_ascii_lowercase();
+            let email_ok = email.split_once('@').is_some_and(|(local, domain)| {
+                !local.is_empty() && domain.contains('.')
+            });
+            let hash_ok = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+            if !email_ok || !hash_ok {
+                return Err(invalid());
+            }
+            Ok(UserToken { email, sha256_hex: hash })
+        })
+        .collect()
 }
 
 /// Comma-separated list env var → trimmed, non-empty entries (missing = empty).
@@ -338,6 +381,43 @@ mod tests {
             values.insert("CHUM_MEM_ALLOW_NO_AUTH".to_string(), value.to_string());
             let config = AppConfig::from_map(&values).expect("config should parse");
             assert!(config.api_auth_problem().is_some(), "{value:?} must not opt out");
+        }
+    }
+
+    #[test]
+    fn user_tokens_parse_and_count_as_auth() {
+        let hash = "A".repeat(64);
+        let mut values = fixture();
+        values.insert(
+            "CHUM_MEM_USER_TOKENS".to_string(),
+            format!(" Juan@CodeChum.com:{hash} , ana@gradechum.com:{} ", "0".repeat(64)),
+        );
+        let config = AppConfig::from_map(&values).expect("config should parse");
+        assert_eq!(
+            config.user_tokens,
+            vec![
+                UserToken { email: "juan@codechum.com".into(), sha256_hex: "a".repeat(64) },
+                UserToken { email: "ana@gradechum.com".into(), sha256_hex: "0".repeat(64) },
+            ]
+        );
+        // Per-engineer tokens alone turn auth on: no startup error.
+        assert!(config.api_tokens.is_empty());
+        assert!(config.api_auth_problem().is_none());
+    }
+
+    #[test]
+    fn malformed_user_tokens_are_a_startup_error() {
+        for bad in [
+            "juan@codechum.com".to_string(),
+            format!("juan:{}", "a".repeat(64)),
+            format!("juan@codechum.com:{}", "a".repeat(63)),
+            format!("juan@codechum.com:{}", "g".repeat(64)),
+            format!("@codechum.com:{}", "a".repeat(64)),
+        ] {
+            let mut values = fixture();
+            values.insert("CHUM_MEM_USER_TOKENS".to_string(), bad.clone());
+            let error = AppConfig::from_map(&values).expect_err(&bad);
+            assert!(!error.to_string().contains(&"a".repeat(63)), "error must not echo the entry");
         }
     }
 

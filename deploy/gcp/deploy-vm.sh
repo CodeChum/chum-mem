@@ -2,7 +2,7 @@
 # deploy-vm.sh — create the chum-mem VM on GCP. No public ingress: SSH and the API
 # are reached through IAP TCP forwarding only (Google IAM is the access control).
 #
-# Usage: deploy-vm.sh [create|deploy <ref>|status|tunnel|ssh|logs|delete]
+# Usage: deploy-vm.sh [create|deploy <ref>|status|tunnel|ssh|logs|add-user <email>|remove-user <email>|users|delete]
 #
 # The VM runs exactly the commit it was created or last deployed with: its
 # startup script clones once (at metadata `chum-mem-ref`) and never pulls on a
@@ -26,6 +26,49 @@ resolve_ref() {  # branch/tag -> commit SHA (a SHA passes through)
   sha=$(git ls-remote "$REPO_URL" "refs/heads/$ref" "refs/tags/$ref^{}" "refs/tags/$ref" | awk 'NR==1 {print $1}')
   [[ -n "$sha" ]] || { echo "cannot resolve $ref on $REPO_URL" >&2; exit 1; }
   printf '%s' "$sha"
+}
+# Engineers: company Google accounts only (CHUM_USER_DOMAINS, space-separated).
+user_email() {
+  local email domain
+  email="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+  [[ "$email" =~ ^[a-z0-9._%+-]+@([a-z0-9.-]+\.[a-z]+)$ ]] || { echo "usage: $0 add-user|remove-user <email>" >&2; exit 2; }
+  domain="${BASH_REMATCH[1]}"
+  [[ " ${CHUM_USER_DOMAINS:-codechum.com gradechum.com} " == *" $domain "* ]] || { echo "$email is not a company account (CHUM_USER_DOMAINS)" >&2; exit 2; }
+  printf '%s' "$email"
+}
+# Same naming as setup-engineer.sh: juan.dc@codechum.com -> chum-mem-token-juan-dc-at-codechum-com
+secret_name() { printf 'chum-mem-token-%s' "$(printf '%s' "$1" | sed -e 's/@/-at-/' -e 's/[^a-z0-9-]/-/g')"; }
+# IAP-secured Tunnel User on THIS instance only (what the Console's "IAP > SSH
+# and TCP resources" does). gcloud has no command for instance-level tunnel IAM,
+# so this is read-modify-write on the IAP API with the policy etag. Binding at
+# the instance keeps the project policy untouched: no conditional binding there
+# (which would make other non-interactive `projects add-iam-policy-binding`
+# calls fail), and revoking never touches grants for other VMs.
+iap_tunnel_binding() {  # $1 add|remove, $2 email
+  local num url at policy new
+  num="$($G projects describe "$PROJECT" --format='value(projectNumber)')"
+  url="https://iap.googleapis.com/v1/projects/$num/iap_tunnel/zones/$ZONE/instances/$NAME"
+  at="$(gcloud auth print-access-token)"
+  policy="$(curl -sf -X POST "$url:getIamPolicy" -H @/dev/fd/9 -H 'Content-Type: application/json' -d '{}' 9<<<"Authorization: Bearer $at")" \
+    || { echo "could not read the IAP tunnel policy of $NAME" >&2; return 1; }
+  new="$(printf '%s' "$policy" | jq -c --arg m "user:$2" --arg op "$1" '
+    .bindings = ((.bindings // []) as $b
+      | if $op == "add" then
+          (if any($b[]; .role == "roles/iap.tunnelResourceAccessor") then $b
+           else $b + [{role: "roles/iap.tunnelResourceAccessor", members: []}] end)
+          | map(if .role == "roles/iap.tunnelResourceAccessor" then .members = ((.members + [$m]) | unique) else . end)
+        else
+          $b | map(if .role == "roles/iap.tunnelResourceAccessor" then .members -= [$m] else . end)
+             | map(select((.members | length) > 0))
+        end)
+    | {policy: .}')"
+  curl -sf -o /dev/null -X POST "$url:setIamPolicy" -H @/dev/fd/9 -H 'Content-Type: application/json' -d "$new" 9<<<"Authorization: Bearer $at" \
+    || { echo "could not update the IAP tunnel policy of $NAME" >&2; return 1; }
+  unset at
+}
+require_secret_manager() {
+  $G services list --enabled --filter=config.name=secretmanager.googleapis.com --format='value(config.name)' | grep -q . \
+    || { echo "Secret Manager API is not enabled on $PROJECT: gcloud services enable secretmanager.googleapis.com --project $PROJECT" >&2; exit 1; }
 }
 
 case "${1:-create}" in
@@ -77,8 +120,56 @@ case "${1:-create}" in
     echo "Forwarding localhost:63001 -> $NAME:63001 through IAP (Ctrl-C to stop)"
     $G compute start-iap-tunnel "$NAME" 63001 --local-host-port=localhost:63001 --zone="$ZONE"
     ;;
+  add-user)
+    # One token per engineer. The token is generated here, stored only in the
+    # engineer's own Secret Manager secret (readable by them alone), and never
+    # printed; the VM gets its SHA-256. Also grants what the tunnel needs:
+    # IAP-secured Tunnel User and read access on this
+    # one instance (GA `start-iap-tunnel` looks the instance up first).
+    # Re-running for the same email rotates their token.
+    EMAIL="$(user_email "${2:-}")"
+    SECRET="$(secret_name "$EMAIL")"
+    require_secret_manager
+    if $G secrets describe "$SECRET" >/dev/null 2>&1; then
+      echo "rotating the token of $EMAIL ($SECRET)"
+    else
+      $G secrets create "$SECRET" --replication-policy=automatic \
+        --labels=app=chum-mem --quiet >/dev/null
+    fi
+    TOKEN="$(openssl rand -hex 32)"
+    printf '%s' "$TOKEN" | $G secrets versions add "$SECRET" --data-file=- --quiet >/dev/null
+    HASH="$(printf '%s' "$TOKEN" | shasum -a 256 | cut -c1-64)"
+    unset TOKEN
+    # Older versions of a rotated secret must stop working: disable them.
+    for v in $($G secrets versions list "$SECRET" --filter='state=ENABLED' --sort-by='~createTime' --format='value(name.basename())' | tail -n +2); do
+      $G secrets versions disable "$v" --secret="$SECRET" --quiet >/dev/null
+    done
+    $G secrets add-iam-policy-binding "$SECRET" --member="user:$EMAIL" \
+      --role=roles/secretmanager.secretAccessor --quiet >/dev/null
+    iap_tunnel_binding add "$EMAIL"
+    $G compute instances add-iam-policy-binding "$NAME" --zone="$ZONE" --member="user:$EMAIL" \
+      --role=roles/compute.viewer --quiet >/dev/null
+    $G compute ssh "$NAME" --zone="$ZONE" --tunnel-through-iap -- "sudo bash -s -- add $EMAIL $HASH" < "$HERE/vm-users.sh"
+    echo "added $EMAIL. They run, in Claude Code at the monorepo root:"
+    echo "  ! bash .claude/chum-mem/scripts/setup-engineer.sh"
+    ;;
+  remove-user)
+    # Revokes one engineer: token entry on the VM, their secret, and the IAM
+    # grants add-user made. Nobody else is affected.
+    EMAIL="$(user_email "${2:-}")"
+    SECRET="$(secret_name "$EMAIL")"
+    $G compute ssh "$NAME" --zone="$ZONE" --tunnel-through-iap -- "sudo bash -s -- remove $EMAIL" < "$HERE/vm-users.sh"
+    $G secrets delete "$SECRET" --quiet >/dev/null 2>&1 && echo "deleted $SECRET" || echo "no secret $SECRET"
+    iap_tunnel_binding remove "$EMAIL" || true
+    $G compute instances remove-iam-policy-binding "$NAME" --zone="$ZONE" --member="user:$EMAIL" \
+      --role=roles/compute.viewer --quiet >/dev/null 2>&1 || true
+    echo "removed $EMAIL"
+    ;;
+  users)
+    $G compute ssh "$NAME" --zone="$ZONE" --tunnel-through-iap -- "sudo bash -s -- list" < "$HERE/vm-users.sh"
+    ;;
   delete)
     $G compute instances delete "$NAME" --zone="$ZONE"
     ;;
-  *) echo "usage: $0 [create|deploy <ref>|status|logs|ssh|tunnel|delete]"; exit 2 ;;
+  *) echo "usage: $0 [create|deploy <ref>|status|logs|ssh|tunnel|add-user <email>|remove-user <email>|users|delete]"; exit 2 ;;
 esac
