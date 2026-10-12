@@ -286,7 +286,7 @@ if [[ -x "${SCRIPTS_DIR}/session-sync.sh" ]]; then
     # token step was skipped or the token rotated; anything else is the server.
     if __notice_due syncerr; then
       SYNC_ERR_LINE=$(printf '%s' "$SESSION_STDERR" | grep -m1 -E 'ERROR|aborted' || printf '%s' "$SESSION_STDERR" | head -n 1)
-      __add_notice "chum-mem: this session is NOT being captured - ${SYNC_ERR_LINE:0:200}. HTTP 401 = run ~/chum-mem/deploy/gcp/install-tunnel-agent.sh token; otherwise check the server/tunnel (install-tunnel-agent.sh status)."
+      __add_notice "chum-mem: this session is NOT being captured - ${SYNC_ERR_LINE:0:200}. HTTP 401 = re-run: bash .claude/chum-mem/scripts/setup-engineer.sh (your token was rotated or removed); HTTP 403 = this session belongs to another engineer's token; otherwise check the tunnel (re-run the same script)."
     fi
   }
 fi

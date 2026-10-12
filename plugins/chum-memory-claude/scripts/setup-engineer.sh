@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
 # setup-engineer.sh — one-command chum-mem setup for a GradeChum engineer (macOS).
 #
-# Run it from a Claude Code session in the monorepo, with the team token copied
-# to the clipboard (from the password manager or the admin's DM):
+# Run it from a Claude Code session in the monorepo, after an admin has added
+# you (`deploy/gcp/deploy-vm.sh add-user you@codechum.com` in the chum-mem repo):
 #
 #   ! bash .claude/chum-mem/scripts/setup-engineer.sh
 #
-# The token is read from the clipboard, checked against the server, saved to
-# ~/.config/chum-mem/token (0600) and then cleared from the clipboard. It is
-# never printed and never typed into the Claude prompt (prompts are captured).
+# Your personal token is read from your own Secret Manager secret (only your
+# Google account can read it), checked against the server and saved to
+# ~/.config/chum-mem/token (0600). It is never printed and never typed into
+# the Claude prompt (prompts are captured). The server credits your memories
+# to the token's owner, your Google account.
 #
 # Steps, each skipped when already done: jq + Google Cloud SDK (Homebrew),
 # `gcloud auth login` (browser), the launchd IAP tunnel agent on
-# localhost:63001, the token, the MCP env var in ~/.zshenv, git user.email.
-# Safe to re-run. Prerequisite from an admin: the IAP-secured Tunnel User role
-# on project gradechum.
+# localhost:63001, the token, the MCP env var in ~/.zshenv. Safe to re-run;
+# re-run after an admin rotates your token.
 #
-# Env: CHUM_TOKEN_FILE=<path>  read the token from a file instead of the clipboard
+# Env: CHUM_TOKEN_FILE=<path>  read the token from a file instead of Secret Manager
 #      CHUM_SETUP_LABEL / CHUM_LOCAL_PORT  launchd label / local port (tests)
 set -uo pipefail
 PROJECT="${CHUM_GCP_PROJECT:-gradechum}"
@@ -98,28 +99,35 @@ EOF
     ok "connected (starts at login, restarts itself)"
   else
     tail -3 "$LOG" 2>/dev/null | sed 's/^/        /'
-    fail "tunnel not up. Most likely you lack the IAP-secured Tunnel User role on project $PROJECT: ask an admin, then re-run."
+    fail "tunnel not up. Most likely an admin has not added you yet: ask them to run deploy-vm.sh add-user $("$GCLOUD" config get-value account 2>/dev/null), then re-run."
   fi
 fi
 
-step "4/6 team token"
+step "4/6 your token"
 check_token() { # $1 token -> HTTP code of an authenticated call
   curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H @/dev/fd/9 9<<<"X-Chum-Token: $1" "$API/api/dashboard/summary"
 }
-if [[ -s "$TOKEN_FILE" && "$(check_token "$(tr -d '[:space:]' < "$TOKEN_FILE")")" == "200" ]]; then
-  ok "saved token works"
-else
-  if [[ -n "${CHUM_TOKEN_FILE:-}" ]]; then T="$(tr -d '[:space:]' < "$CHUM_TOKEN_FILE" 2>/dev/null || true)"; SRC="$CHUM_TOKEN_FILE"
-  else T="$(pbpaste 2>/dev/null | tr -d '[:space:]')"; SRC="the clipboard"; fi
-  [[ -n "$T" ]] || fail "no token in $SRC. Copy the team token (ask an admin), then re-run. Do not paste it into the Claude prompt."
-  [[ "${#T}" -ge 20 && "${#T}" -le 200 && "$T" =~ ^[A-Za-z0-9._~+/=-]+$ ]] || fail "$SRC does not hold a token (wrong length or characters). Copy the team token and re-run."
-  code="$(check_token "$T")"
-  [[ "$code" == "200" ]] || { unset T; fail "the server rejected the token from $SRC (HTTP $code). Check you copied the whole team token."; }
-  ( umask 077; mkdir -p "$TOKEN_DIR"; printf '%s' "$T" > "$TOKEN_FILE" )
+save_token() { # $1 token, already accepted by the server
+  ( umask 077; mkdir -p "$TOKEN_DIR"; printf '%s' "$1" > "$TOKEN_FILE" )
   chmod 700 "$TOKEN_DIR"; chmod 600 "$TOKEN_FILE"
-  unset T
-  if [[ -z "${CHUM_TOKEN_FILE:-}" ]]; then printf '' | pbcopy; ok "token accepted and saved to ~/.config/chum-mem/token (0600); clipboard cleared"
-  else ok "token accepted and saved to ~/.config/chum-mem/token (0600)"; fi
+}
+ACCOUNT="$("$GCLOUD" config get-value account 2>/dev/null | tr 'A-Z' 'a-z')"
+# Same naming as deploy-vm.sh add-user: juan.dc@codechum.com -> chum-mem-token-juan-dc-at-codechum-com
+SECRET="chum-mem-token-$(printf '%s' "$ACCOUNT" | sed -e 's/@/-at-/' -e 's/[^a-z0-9-]/-/g')"
+if [[ -n "${CHUM_TOKEN_FILE:-}" ]]; then
+  T="$(tr -d '[:space:]' < "$CHUM_TOKEN_FILE" 2>/dev/null || true)"; SRC="$CHUM_TOKEN_FILE"
+else
+  T="$("$GCLOUD" secrets versions access latest --secret="$SECRET" --project="$PROJECT" 2>/dev/null | tr -d '[:space:]')"; SRC="Secret Manager ($SECRET)"
+fi
+if [[ -n "$T" ]]; then
+  code="$(check_token "$T")"
+  [[ "$code" == "200" ]] || { unset T; fail "the server rejected your token from $SRC (HTTP $code). Ask an admin to re-run: deploy-vm.sh add-user $ACCOUNT"; }
+  save_token "$T"; unset T
+  ok "your token for $ACCOUNT, from $SRC, saved to ~/.config/chum-mem/token (0600)"
+elif [[ -s "$TOKEN_FILE" && "$(check_token "$(tr -d '[:space:]' < "$TOKEN_FILE")")" == "200" ]]; then
+  ok "saved token works, but no personal token for $ACCOUNT yet: ask an admin to run deploy-vm.sh add-user $ACCOUNT, then re-run"
+else
+  fail "no token for $ACCOUNT. Ask an admin to run: deploy-vm.sh add-user $ACCOUNT  (then re-run this script)"
 fi
 LINE='export CHUM_MEMORY_API_TOKEN="$(cat "$HOME/.config/chum-mem/token" 2>/dev/null)"'
 for rc in "$HOME/.zshenv" "$HOME/.bash_profile"; do
@@ -129,9 +137,8 @@ done
 ok "MCP token export in ~/.zshenv"
 
 step "5/6 identity"
-EMAIL="$(git -C "$ROOT" config user.email || true)"
-if [[ "$EMAIL" == *@codechum.com || "$EMAIL" == *@gradechum.com ]]; then ok "memories are attributed to $EMAIL"
-else echo "  WARN  git user.email is '${EMAIL:-unset}'; memories are attributed to it. Set it: git config --global user.email you@codechum.com"; fi
+if [[ "$ACCOUNT" == *@codechum.com || "$ACCOUNT" == *@gradechum.com ]]; then ok "memories are credited to $ACCOUNT"
+else echo "  WARN  gcloud is logged in as '${ACCOUNT:-nobody}', not a company account: log in with your @codechum.com account (gcloud auth login) and re-run"; fi
 
 step "6/6 check"
 [[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$API/api/search" -X POST -H 'Content-Type: application/json' -d '{}')" == "401" ]] \

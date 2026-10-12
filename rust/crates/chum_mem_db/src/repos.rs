@@ -493,7 +493,16 @@ pub async fn upsert_session(
             else 'active'::public.session_status
           end,
           branch = coalesce(excluded.branch, public.sessions.branch),
-          metadata = coalesce(public.sessions.metadata, '{}'::jsonb) || excluded.metadata
+          -- A session started with a per-engineer token keeps its author: a
+          -- start from anyone else (shared token, or a racing start that the
+          -- API's pre-check could not see yet) cannot overwrite userEmail,
+          -- tokenOwner or gitEmail.
+          metadata = case
+            when (public.sessions.metadata->>'tokenOwner') is not null
+              and (excluded.metadata->>'tokenOwner') is distinct from (public.sessions.metadata->>'tokenOwner')
+              then public.sessions.metadata || (excluded.metadata - 'userEmail' - 'tokenOwner' - 'gitEmail')
+            else coalesce(public.sessions.metadata, '{}'::jsonb) || excluded.metadata
+          end
         returning id, organization_id, team_id, project_id, status::text as status
         "#,
     )
