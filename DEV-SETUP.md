@@ -87,6 +87,21 @@ all code and rewrites the shared repository snapshot for everyone.
 
 ## 3. Each engineer (one-time, about 3 minutes)
 
+**One command (macOS).** Copy the team token to the clipboard (from the admin;
+never paste it into the Claude prompt, prompts are captured), then in a Claude
+Code session in the monorepo type:
+
+```
+! bash .claude/chum-mem/scripts/setup-engineer.sh
+```
+
+It installs jq and the Google Cloud SDK if missing, runs `gcloud auth login`
+(browser), installs the launchd tunnel agent, checks the token against the
+server, saves it (0600) and clears the clipboard, adds the MCP export to
+`~/.zshenv`, and checks `git user.email`. Each step is skipped when already
+done, so it is safe to re-run. Then restart Claude Code. The manual steps
+below do the same thing.
+
 The hooks, the retrieval skill and the MCP server are **committed in the
 monorepo** (`.claude/settings.json`, `.claude/chum-mem/`, `.claude/skills/chum-memory/`,
 `.mcp.json`, `.chum-mem`), so there is no plugin to install. The only thing a
