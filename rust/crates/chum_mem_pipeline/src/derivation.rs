@@ -450,7 +450,15 @@ fn extract_claims_from_text(
     // Tool text may now originate only a bug (an error it reports) or a line
     // that opens with an explicit decision marker (a commit message or PR
     // body recording a decision).
+    //
+    // When the event carries a command, its text is what the assistant typed
+    // (Claude's Bash hook never sends the output): test fixtures, edit
+    // scripts and comments, not error reports. Such text originates no bug,
+    // and a decision only from a commit message or PR body.
     let tool_output = event.is_some_and(is_tool_output_event);
+    let command_text = tool_output && event.is_some_and(|evt| evt.payload.command.is_some());
+    let failed = event.is_some_and(|evt| evt.payload.exit_code.is_some_and(|code| code != 0));
+    let records_decisions = !command_text || event.is_some_and(records_commit_or_pr);
 
     let mut claims = Vec::new();
     let cleaned = strip_template_noise(text);
@@ -469,8 +477,10 @@ fn extract_claims_from_text(
             continue;
         }
         if tool_output
-            && !(memory_type == MemoryType::Bug
-                || (memory_type == MemoryType::Decision && opens_with_decision_marker(&segment)))
+            && !((memory_type == MemoryType::Bug && (!command_text || failed))
+                || (memory_type == MemoryType::Decision
+                    && records_decisions
+                    && opens_with_decision_marker(&segment)))
         {
             continue;
         }
@@ -857,6 +867,17 @@ fn is_tool_output_event(event: &SessionEventRecord) -> bool {
             | CanonicalEventType::Command
             | CanonicalEventType::FileChange
     )
+}
+
+/// A command that writes a commit message or a PR body, where a "Decision:"
+/// line records a decision rather than test data or an edit script.
+fn records_commit_or_pr(event: &SessionEventRecord) -> bool {
+    let Some(command) = event.payload.command.as_deref() else {
+        return false;
+    };
+    ["git commit", "gh pr create", "gh pr edit"]
+        .iter()
+        .any(|marker| command.contains(marker))
 }
 
 /// A lowercase word followed by a comma or a conjunction, as in a wrapped
@@ -3175,6 +3196,18 @@ mod extraction_quality_tests {
             .expect("decision kept");
         assert_eq!(decision.metadata["authorityClass"], "session_derived");
         assert_eq!(decision.metadata["belief"]["admit"], true);
+    }
+
+    #[test]
+    fn decisions_and_bugs_in_other_commands_are_test_data_or_edits() {
+        // Seen live: an e2e script's fixtures and an edit script's comments.
+        let command = "cat > e2e.sh <<'XEOF'\n\
+            S1=$(session s1 \\\n\
+            \"prompt|message|Decision: VIEW sharers only read the linked activity and never see unmatched papers.\")\n\
+            Decision: we decided an EDIT share on a class gives full edit access.\n\
+            It has failed before, but treat it as a lead and not a confirmed cause.\n\
+            tool output: only a failed command may originate a claim, and only a bug.\nXEOF";
+        assert_eq!(claims(&[bash(1, command, None)]), vec![]);
     }
 
     #[test]
