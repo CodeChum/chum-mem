@@ -114,6 +114,7 @@ pub struct MemorySearchRow {
     pub created_at: time::OffsetDateTime,
     pub branch: Option<String>,
     pub author_email: Option<String>,
+    pub author_name: Option<String>,
     pub lexical_score: Option<f64>,
     pub semantic_score: Option<f64>,
     pub claim_id: Option<Uuid>,
@@ -157,6 +158,7 @@ pub struct MemoryDetailRow {
     pub session_id: Option<Uuid>,
     pub branch: Option<String>,
     pub author_email: Option<String>,
+    pub author_name: Option<String>,
     pub claim_id: Option<Uuid>,
     pub claim_type: Option<String>,
     pub claim_key: Option<String>,
@@ -2295,6 +2297,7 @@ pub async fn load_memory_search_rows(
           m.created_at,
           s.branch,
           s.metadata->>'userEmail' as author_email,
+          s.metadata->>'userName' as author_name,
           -- Full-query rank first (phrase/AND matches), plus half credit for the
           -- OR'd lexemes so a partial match scores by how much of the question it
           -- covers instead of 0.0 — otherwise every partial match ties at zero and
@@ -2513,6 +2516,7 @@ pub async fn load_memory(
           m.session_id,
           s.branch,
           s.metadata->>'userEmail' as author_email,
+          s.metadata->>'userName' as author_name,
           c.id as claim_id,
           c.claim_type::text as claim_type,
           c.claim_key,
@@ -2582,6 +2586,7 @@ pub async fn load_memories_batch(
           m.session_id,
           s.branch,
           s.metadata->>'userEmail' as author_email,
+          s.metadata->>'userName' as author_name,
           c.id as claim_id,
           c.claim_type::text as claim_type,
           c.claim_key,
@@ -2735,6 +2740,7 @@ pub async fn load_memories_for_chroma_scoped(
           m.created_at,
           s.branch,
           s.metadata->>'userEmail' as author_email,
+          s.metadata->>'userName' as author_name,
           null::float8 as lexical_score,
           null::float8 as semantic_score,
           null::uuid as claim_id,

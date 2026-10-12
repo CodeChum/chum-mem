@@ -94,7 +94,9 @@ session_start_payload() {
   # back to the OS user. Sent as session metadata until the API maps it to
   # app_users.
   user_email=$(git -C "$PROJECT_ROOT" config user.email 2>/dev/null || echo "")
-  user_name="${USER:-$(id -un 2>/dev/null || echo "")}"
+  # Display name for citations: git user.name, else the OS user.
+  user_name=$(git -C "$PROJECT_ROOT" config user.name 2>/dev/null || true)
+  [[ -n "$user_name" ]] || user_name="${USER:-$(id -un 2>/dev/null || echo "")}"
   jq -c -n \
     --arg projectId "$PROJECT_ID" \
     --arg externalSessionId "$AGENT_SESSION_ID" \

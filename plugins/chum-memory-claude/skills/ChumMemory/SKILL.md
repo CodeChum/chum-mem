@@ -7,14 +7,23 @@ description: "Always-on knowledge graph and memory retrieval for code work. USE 
 
 The plugin hook runs `sync.sh` on every `UserPromptSubmit`, so the repository graph is **already fresh** when your turn starts. Your job is to **query the graph instead of grepping**, then read the files the graph points to — and when you recall memory, **read proof, not prose**.
 
-## Always say it came from chum-mem
+## Always footnote what came from chum-mem
 
-Engineers need to tell team memory apart from your own reasoning. Whenever an answer uses anything from chum-mem (a `mem_search` / `memory_get` result, a knowledge report, or an attached team memory or team docs block), tag each such point in the answer:
+Engineers need to tell team memory apart from your own reasoning, and see whose session it came from. Whenever an answer uses anything from chum-mem (a `mem_search` / `memory_get` result, a knowledge report, or an attached team memory or team docs block), put a footnote marker after each such point and end the answer with a footer:
 
-- session memory: `(chum-mem: <author email>, <date>)`, e.g. `(chum-mem: ana@codechum.com, 2026-10-12)`
-- a repository doc found through chum-mem: `(chum-mem: repo doc <path>)`
+```
+EDIT sharers get full edit access to the linked activity, except delete [1].
+The roster wall shipped as a separate frontend hotfix [2].
 
-Never present chum-mem content as your own finding, and never put the tag on something you worked out from the code yourself. If you checked a recalled claim against the code, say both: what chum-mem said and what the code shows.
+From chum-mem:
+[1] Ana Cruz (ana@codechum.com), session 2f3a91c0, 2026-10-12
+[2] repo doc .claude/workspaces/CODECHUM-23552.md
+```
+
+- Session memory: `[n] <author name> (<author email>), session <first 8 characters of the session id>, <date>`. Name and email come from `authorName` / `authorEmail`, the session from `sessionIds`, the date from `createdAt`. Leave out a part you do not have rather than guessing it.
+- A repository doc found through chum-mem: `[n] repo doc <path>`.
+
+Never present chum-mem content as your own finding, never footnote something you worked out from the code yourself, and leave the footer out when nothing came from chum-mem. If you checked a recalled claim against the code, say both: what chum-mem said (footnoted) and what the code shows.
 
 ## The one rule
 
