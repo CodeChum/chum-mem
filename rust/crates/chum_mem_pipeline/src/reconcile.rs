@@ -100,3 +100,83 @@ pub fn parse_memory_type(value: &str) -> MemoryType {
         _ => MemoryType::Fact,
     }
 }
+
+/// Content words of a claim: lowercase alphanumeric tokens of 3+ chars, minus
+/// claim prefixes and filler words.
+fn claim_words(text: &str) -> std::collections::HashSet<String> {
+    const FILLER: &[&str] = &[
+        "the", "and", "for", "with", "that", "this", "from", "into", "are", "was", "were", "has",
+        "have", "its", "their", "they", "them", "but", "not", "all", "any", "can", "per",
+        "decision", "product", "constraint", "fix", "fact", "bug", "task", "next",
+    ];
+    text.to_lowercase()
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| word.chars().count() >= 3 && !FILLER.contains(word))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// True when two claims of the same type say the same thing in near-identical
+/// words: the same decision recorded in several sessions, or a copy cut off
+/// mid-sentence. Word-set overlap (Jaccard) of at least 0.7, or a truncated
+/// copy: the shorter claim (6+ content words) has 80% of its words in a longer
+/// one that runs on for at least 3 more words. "Use Cloud Tasks for retries"
+/// vs "Use Celery for retries" differ in one word and stay separate.
+pub fn near_duplicate_claims(a: &str, b: &str) -> bool {
+    let (a, b) = (claim_words(a), claim_words(b));
+    let (small, large) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
+    if small.len() < 4 {
+        return false;
+    }
+    let shared = small.intersection(large).count();
+    let union = small.len() + large.len() - shared;
+    let jaccard = shared as f64 / union as f64;
+    let containment = shared as f64 / small.len() as f64;
+    jaccard >= 0.7 || (small.len() >= 6 && large.len() >= small.len() + 3 && containment >= 0.8)
+}
+
+/// A near-duplicate of the same type is replaced by the newer copy when the
+/// newer one is at least as strong (never let a model-written copy retire an
+/// engineer's own statement).
+pub fn near_duplicate_supersedes(
+    current_authority: Option<AuthorityClass>,
+    current_verification: Option<VerificationStatus>,
+    prior_authority: Option<AuthorityClass>,
+    prior_verification: Option<VerificationStatus>,
+) -> bool {
+    claim_strength(current_authority, current_verification)
+        >= claim_strength(prior_authority, prior_verification)
+}
+
+#[cfg(test)]
+mod near_duplicate_tests {
+    use super::near_duplicate_claims;
+
+    #[test]
+    fn same_decision_in_other_words_is_a_duplicate() {
+        assert!(near_duplicate_claims(
+            "Product decision: an EDIT share on a class gives full edit access to the linked activity.",
+            "Decision: Product decision: an EDIT share on the viewed class gives full edit access to the linked activity.",
+        ));
+    }
+
+    #[test]
+    fn copy_cut_mid_sentence_is_a_duplicate() {
+        assert!(near_duplicate_claims(
+            "Product decision: an EDIT share on a class gives full edit access to the linked activity, except delete.",
+            "Product decision: an EDIT share on a class means full edit access to the",
+        ));
+    }
+
+    #[test]
+    fn different_claims_on_the_same_topic_are_not() {
+        assert!(!near_duplicate_claims(
+            "EDIT sharers must be able to download the answer sheet and questionnaire of a linked activity.",
+            "VIEW sharers only read the linked activity and never see unmatched papers.",
+        ));
+        assert!(!near_duplicate_claims(
+            "Use Cloud Tasks for class-record import retries.",
+            "Use Celery for class-record import retries.",
+        ));
+    }
+}

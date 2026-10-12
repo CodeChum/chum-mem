@@ -2356,6 +2356,14 @@ async fn perform_search(
 
     let mut ranked = rank_hybrid_results(&merged, &ranking_context);
 
+    // The SQL paths drop superseded claims unless `includeHistorical`, but a
+    // vector-store hit is loaded straight from `memories`, so a replaced copy
+    // of a decision still came back next to its replacement (pilot review
+    // 2026-10-12). Apply the same rule to every path.
+    if !input.include_historical.unwrap_or(false) {
+        ranked.retain(|hit| hit.superseded_at.is_none() && hit.superseded_by.is_none());
+    }
+
     // Type filtering: soft preference via type_fit_boost in ranking, hard filter
     // only when enough matching results exist to fill the limit.
     if !input.types.is_empty() {
