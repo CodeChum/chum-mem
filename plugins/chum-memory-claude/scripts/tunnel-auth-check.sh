@@ -9,6 +9,8 @@
 #     Workspace Cloud session control expires it every 24 h; the tunnel loads
 #     credentials per connection, so it recovers without a restart.
 #   VM or firewall down (IAP 4003)                      -> told; only the admin can fix it
+#   CHUM_DIALOG_REASON=update (from the hook: the pulled setup-engineer.sh is a
+#   newer SETUP_VERSION than this Mac ran)              -> [Update]: same as Set up
 #   anything else: not set up, tunnel agent missing,
 #   token missing or rejected, unexplained failure      -> [Set up]: Terminal runs
 #     setup-engineer.sh, which repairs whatever step is missing
@@ -16,7 +18,7 @@
 # One dialog at a time across the launchd job and every session's hook.
 #
 # Env: CHUM_REPO (monorepo root, for Set up), CHUM_LOCAL_PORT, CHUM_TUNNEL_LOG,
-#      CHUM_TUNNEL_LABEL, CHUM_GCLOUD, CHUM_ONLINE_URL (tests)
+#      CHUM_TUNNEL_LABEL, CHUM_GCLOUD, CHUM_DIALOG_REASON, CHUM_ONLINE_URL (tests)
 set -u
 PORT="${CHUM_LOCAL_PORT:-63001}"
 API="http://localhost:$PORT"
@@ -54,7 +56,9 @@ token_rejected() {
 CFG="${CLOUDSDK_CONFIG:-$HOME/.config/gcloud}"
 ACCOUNT="$(sed -n 's/^account *= *//p' "$CFG/configurations/config_$(cat "$CFG/active_config" 2>/dev/null || echo default)" 2>/dev/null | head -1)"
 
-if curl -sf --max-time 10 "$API/health" >/dev/null 2>&1; then
+if [[ "${CHUM_DIALOG_REASON:-}" == "update" ]]; then
+  CAUSE=update
+elif curl -sf --max-time 10 "$API/health" >/dev/null 2>&1; then
   token_rejected || { rm -f "$SNOOZE"; exit 0; }
   CAUSE=setup
 elif [[ -z "$GCLOUD" || ! -f "$HOME/Library/LaunchAgents/$TUNNEL_LABEL.plist" ]]; then
@@ -118,7 +122,7 @@ Sign in again as ${ACCOUNT:-your @codechum.com account}? A browser window opens.
 This cannot be fixed from your Mac: tell the chum-mem admin. Your sessions are queued and sync once it is back." "OK" >/dev/null
     snooze
     ;;
-  setup)
+  setup|update)
     SETUP="$REPO/.claude/chum-mem/scripts/setup-engineer.sh"
     if [[ -z "$REPO" || ! -f "$SETUP" ]]; then
       ask "Team memory (chum-mem) is not connected.
@@ -127,9 +131,16 @@ To fix it, run this in Claude Code at the gradechum monorepo root:
 ! bash .claude/chum-mem/scripts/setup-engineer.sh" "OK" >/dev/null
       snooze; exit 0
     fi
-    [[ "$(ask "Team memory (chum-mem) is not connected on this Mac.
+    if [[ "$CAUSE" == "update" ]]; then
+      BTN="Update"; MSG="A chum-mem update is available for this Mac.
 
-Run the chum-mem setup now? A Terminal window opens; it repairs whatever is missing and may open a browser to sign in." "Set up")" == "Set up" ]] || { snooze; exit 0; }
+Install it now? A Terminal window opens and re-runs the chum-mem setup; it keeps what already works and only changes what is new."
+    else
+      BTN="Set up"; MSG="Team memory (chum-mem) is not connected on this Mac.
+
+Run the chum-mem setup now? A Terminal window opens; it repairs whatever is missing and may open a browser to sign in."
+    fi
+    [[ "$(ask "$MSG" "$BTN")" == "$BTN" ]] || { snooze; exit 0; }
     printf '#!/bin/bash\ncd %q && bash .claude/chum-mem/scripts/setup-engineer.sh\necho; read -r -p "Press Return to close. " _\n' "$REPO" > "$CONF/setup.command"
     chmod 700 "$CONF/setup.command"
     open "$CONF/setup.command"

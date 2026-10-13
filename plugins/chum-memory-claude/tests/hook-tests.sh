@@ -472,6 +472,78 @@ test_hook_fix_dialog() {
   rm -f "$TMP/home/.config/chum-mem/.dialog-snooze"
 }
 
+# ── a newer SETUP_VERSION in the pulled scripts offers [Update] once setup has run ──
+test_setup_update() {
+  echo "setup_update"
+  local r bin="$TMP/upd-bin" conf="$TMP/home/.config/chum-mem" want
+  r=$(mkrepo upd)
+  start_fake upd || { bad "fake api"; return; }
+  mkdir -p "$bin" "$conf"
+  printf '#!/bin/bash\ncat >/dev/null; printf "%%s\\n" "$*" >> "%s/upd-osascript.log"; echo "$ANSWER"\n' "$TMP" > "$bin/osascript"
+  printf '#!/bin/bash\necho "$*" >> "%s/upd-open.log"\n' "$TMP" > "$bin/open"
+  chmod +x "$bin/osascript" "$bin/open"
+  want=$(sed -n 's/^SETUP_VERSION=\([0-9][0-9]*\).*/\1/p' "$SCRIPTS/setup-engineer.sh")
+  up() {  # $1 event -> runs the hook, waits for a detached dialog
+    : > "$TMP/upd-osascript.log"; : > "$TMP/upd-open.log"; rm -f "$conf/.dialog-snooze"
+    hook "$r" "$FAKE_URL" "$(payload "$1" upd "$r" '{"prompt":"where is the bonus toggle?"}')" \
+      PATH="$bin:$PATH" CHUM_FIX_DIALOG=1 ANSWER=Update >/dev/null
+    for _ in 1 2 3 4 5 6; do [[ -s "$TMP/upd-osascript.log" ]] && break; sleep 0.5; done
+  }
+  shown() { grep -q "update is available" "$TMP/upd-osascript.log"; }
+  up UserPromptSubmit
+  check "never set up (no token) -> no update dialog" '! shown'
+  echo tok > "$conf/token"
+  up UserPromptSubmit
+  check "set up before versions existed -> Update dialog" 'shown'
+  for _ in 1 2 3 4 5 6; do [[ -s "$TMP/upd-open.log" ]] && break; sleep 0.5; done
+  check "Update -> Terminal re-runs setup in this checkout" \
+    '[[ -s "$TMP/upd-open.log" ]] && grep -q "$r" "$conf/setup.command"'
+  echo "$want" > "$conf/setup-version"
+  up UserPromptSubmit
+  check "already on SETUP_VERSION $want -> no dialog" '! shown'
+  echo "$((want - 1))" > "$conf/setup-version"
+  up Stop
+  check "older version but a Stop event -> no dialog" '! shown'
+  up SessionStart
+  check "older version on SessionStart -> Update dialog" 'shown'
+  echo "$((want + 1))" > "$conf/setup-version"
+  up UserPromptSubmit
+  check "newer than this checkout (old branch) -> no dialog" '! shown'
+  rm -f "$conf/token" "$conf/setup-version" "$conf/setup.command" "$conf/.dialog-snooze"
+}
+
+# ── an open dialog never holds the hook (it is not the hook's job, so no `wait` sees it) ──
+test_dialog_detached() {
+  echo "dialog_detached"
+  local r bin="$TMP/det-bin" conf="$TMP/home/.config/chum-mem" b bashes="$BASH_BIN" hb
+  # Claude Code runs the hook with the `bash` on PATH (Homebrew bash 5 on most
+  # Macs), which treats a leftover background job differently from /bin/bash 3.2.
+  hb=$(command -v bash); [[ "$hb" != "$BASH_BIN" ]] && bashes="$bashes $hb"
+  r=$(mkrepo det)
+  start_fake det || { bad "fake api"; return; }
+  mkdir -p "$bin" "$conf"
+  printf '#!/bin/bash\ncat >/dev/null; sleep 8; echo Later\n' > "$bin/osascript"; chmod +x "$bin/osascript"  # nobody answers for 8 s
+  timed() {  # $1 bash -> seconds the prompt hook took (gives up at 10)
+    local t0 hp; t0=$(date +%s)
+    BASH_BIN="$1" hook "$r" "$FAKE_URL" "$(payload UserPromptSubmit det "$r" '{"prompt":"where is the bonus toggle?"}')" \
+      PATH="$bin:$PATH" CHUM_FIX_DIALOG=1 >/dev/null &
+    hp=$!
+    for _ in $(seq 1 20); do kill -0 "$hp" 2>/dev/null || break; sleep 0.5; done
+    kill -0 "$hp" 2>/dev/null && { pkill -f "$r/.claude/chum-mem/scripts/hook-dispatch.sh"; kill "$hp"; } 2>/dev/null
+    echo $(( $(date +%s) - t0 ))
+  }
+  for b in $bashes; do
+    echo tok > "$conf/token"; rm -f "$conf/setup-version" "$conf/.dialog-snooze" "$FAKE_STATE/token-401"
+    local s; s=$(timed "$b")
+    check "$b: update dialog open -> prompt hook returns within 5 s ($s s)" '[[ $s -lt 5 ]]'
+    sleep 8; echo 99 > "$conf/setup-version"; rm -f "$conf/.dialog-snooze"; : > "$FAKE_STATE/token-401"
+    s=$(timed "$b")
+    check "$b: token-rejected dialog open -> prompt hook returns within 5 s ($s s)" '[[ $s -lt 5 ]]'
+    sleep 8
+  done
+  rm -f "$FAKE_STATE/token-401" "$conf/token" "$conf/setup-version" "$conf/.dialog-snooze"
+}
+
 # ── `chum-quarantine.sh send` appends under the outbox lock ──
 test_quarantine_send_locked() {
   echo "quarantine_send_locked"
@@ -570,7 +642,7 @@ test_docs_sync_default_branch() {
   check "snapshot unchanged by the stale checkout" '[[ "$(export_files "$p")" == "docs/a.md " ]]'
 }
 
-ALL="concurrent_append fence_forgery tokenizer docs_relevance_gate deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked token_not_in_argv tunnel_cause auth_check hook_fix_dialog docs_sync_default_branch"
+ALL="concurrent_append fence_forgery tokenizer docs_relevance_gate deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked token_not_in_argv tunnel_cause auth_check hook_fix_dialog setup_update dialog_detached docs_sync_default_branch"
 for t in ${*:-$ALL}; do "test_$t"; done
 echo "passed $PASS, failed $FAIL, skipped $SKIP  (scratch: $TMP)"
 [[ "$FAIL" -eq 0 ]]
