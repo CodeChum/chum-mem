@@ -79,6 +79,16 @@ __notice_due() {  # $1 kind -> 0 when a notice of this kind may be shown now
   if [[ -e "$m" && -z "$(find "$m" -mmin +10 2>/dev/null)" ]]; then return 1; fi
   : > "$m"
 }
+# The macOS dialog that offers the fix (sign in / set up), started detached so
+# the hook never waits on it. The hook is the only path that reaches an engineer
+# who never ran setup-engineer.sh (no launchd check yet). tunnel-auth-check.sh
+# keeps it to one dialog at a time and honours "Later". CHUM_FIX_DIALOG=0 disables.
+__fix_dialog() {
+  [[ "${CHUM_FIX_DIALOG:-1}" == "1" && "$(uname -s)" == "Darwin" ]] || return 0
+  case "$HOOK_EVENT" in SessionStart|UserPromptSubmit) ;; *) return 0 ;; esac
+  [[ -f "${SCRIPTS_DIR}/tunnel-auth-check.sh" ]] || return 0
+  CHUM_REPO="$PROJECT_DIR" nohup /bin/bash "${SCRIPTS_DIR}/tunnel-auth-check.sh" </dev/null >/dev/null 2>&1 &
+}
 __add_notice() {  # $1 text -> appended to SYSTEM_MSG, JSON-escaped (no surrounding quotes)
   local esc; esc=$(printf '%s' "$1" | jq -Rs '.' 2>/dev/null | sed 's/^"//;s/"$//')
   [[ -n "$esc" ]] || return 0
@@ -192,6 +202,7 @@ __gcloud_account() {  # active gcloud account, read from its config file (no gcl
 if [[ "$API_HEALTHY" -eq 0 ]]; then
   UNAVAIL_MSG="ChumMemory API unreachable at ${API_URL} — memory retrieval unavailable this turn; session events are being spooled locally and will sync later."
   TUNNEL_CAUSE="$(__tunnel_cause)"
+  __fix_dialog
   if [[ "$TUNNEL_CAUSE" == "auth" ]]; then
     LOGIN_CMD="gcloud auth login $(__gcloud_account)"; LOGIN_CMD="${LOGIN_CMD% }"
     UNAVAIL_MSG="ChumMemory is unreachable because the user's gcloud login has expired (IAP tunnel error 4033), so memory retrieval is unavailable. Tell the user to run \`! ${LOGIN_CMD}\` to sign in again; session events are spooled locally and sync once they do."
@@ -314,6 +325,7 @@ if [[ -x "${SCRIPTS_DIR}/session-sync.sh" ]]; then
   SESSION_STDERR=$(printf '%s' "$HOOK_PAYLOAD" | bash "${SCRIPTS_DIR}/session-sync.sh" 2>&1 >/dev/null) || {
     echo "chum-memory session-sync error: ${SESSION_STDERR}" >&2
     __health_cache_drop
+    __fix_dialog
     # The event was not stored. Tell the user (rate-limited): a 401 means the
     # token step was skipped or the token rotated; anything else is the server.
     if __notice_due syncerr; then
