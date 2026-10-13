@@ -1,62 +1,139 @@
 #!/bin/bash
-# tunnel-auth-check.sh — run every 5 minutes by launchd (setup-engineer.sh copies
-# it to ~/.config/chum-mem/ and installs com.codechum.chum-mem-auth-check).
+# tunnel-auth-check.sh — when chum-mem is not connected, tell the engineer in a
+# macOS dialog and offer the fix. Runs every 5 minutes under launchd (setup-
+# engineer.sh copies it to ~/.config/chum-mem/ and installs
+# com.codechum.chum-mem-auth-check), and in the background from the hook whenever
+# chum-mem is unreachable, so an engineer who never ran setup is asked too.
 #
-# Workspace Cloud session control expires every engineer's gcloud login every
-# 24 h. The tunnel agent keeps running but IAP refuses each connection (4033 in
-# its log), so team memory silently stops. This asks the engineer to sign in
-# again and, on "Sign in", runs the browser login. The tunnel loads credentials
-# per connection, so it recovers without a restart. A 4003 (firewall or VM down)
-# is not the engineer's to fix and is left to the hook notice.
+#   gcloud not signed in, or login expired (IAP 4033)  -> [Sign in]: browser login.
+#     Workspace Cloud session control expires it every 24 h; the tunnel loads
+#     credentials per connection, so it recovers without a restart.
+#   VM or firewall down (IAP 4003)                      -> told; only the admin can fix it
+#   anything else: not set up, tunnel agent missing,
+#   token missing or rejected, unexplained failure      -> [Set up]: Terminal runs
+#     setup-engineer.sh, which repairs whatever step is missing
+# No internet: no dialog. "Later", or no answer in 15 minutes, snoozes for an hour.
+# One dialog at a time across the launchd job and every session's hook.
 #
-# Env: CHUM_LOCAL_PORT, CHUM_TUNNEL_LOG, CHUM_GCLOUD (set in the launchd plist)
+# Env: CHUM_REPO (monorepo root, for Set up), CHUM_LOCAL_PORT, CHUM_TUNNEL_LOG,
+#      CHUM_TUNNEL_LABEL, CHUM_GCLOUD, CHUM_ONLINE_URL (tests)
 set -u
 PORT="${CHUM_LOCAL_PORT:-63001}"
-LOG="${CHUM_TUNNEL_LOG:-$HOME/Library/Logs/com.codechum.chum-mem-tunnel.log}"
-GCLOUD="${CHUM_GCLOUD:-gcloud}"
-SNOOZE="$HOME/.config/chum-mem/.auth-snooze"
-
-if curl -sf --max-time 10 "http://localhost:$PORT/health" >/dev/null 2>&1; then
-  rm -f "$SNOOZE"; exit 0
+API="http://localhost:$PORT"
+REPO="${CHUM_REPO:-}"
+TUNNEL_LABEL="${CHUM_TUNNEL_LABEL:-com.codechum.chum-mem-tunnel}"
+CONF="$HOME/.config/chum-mem"
+SNOOZE="$CONF/.dialog-snooze"
+LOCK="$CONF/.dialog-lock"
+GCLOUD="${CHUM_GCLOUD:-$(command -v gcloud || true)}"
+for p in /opt/homebrew/bin/gcloud /usr/local/bin/gcloud "$HOME/google-cloud-sdk/bin/gcloud"; do
+  [[ -z "$GCLOUD" && -x "$p" ]] && GCLOUD="$p"
+done
+LOG="${CHUM_TUNNEL_LOG:-}"
+if [[ -z "$LOG" ]]; then  # setup-engineer.sh and install-tunnel-agent.sh log to different files
+  for f in "$HOME/Library/Logs/com.codechum.chum-mem-tunnel.log" "$HOME/Library/Logs/chum-mem-tunnel.log"; do
+    [[ -f "$f" ]] && { [[ -z "$LOG" || "$f" -nt "$LOG" ]] && LOG="$f"; }
+  done
 fi
-sleep 1  # the failed /health above is what makes the tunnel log the IAP error
-[[ -n "$(find "$LOG" -mmin -10 2>/dev/null)" ]] || exit 0
-case "$(tail -n 60 "$LOG" 2>/dev/null | grep -oE '\[40(03|33):|invalid_grant|[Rr]eauthentication' | tail -1)" in
-  "[4033:"|invalid_grant|[Rr]eauthentication) ;;
-  *) exit 0 ;;
-esac
-[[ -n "$(find "$SNOOZE" -mmin -60 2>/dev/null)" ]] && exit 0
 
+[[ -n "$(find "$SNOOZE" -mmin -60 2>/dev/null)" ]] && exit 0
+mkdir -p "$CONF" 2>/dev/null
+if ! mkdir "$LOCK" 2>/dev/null; then
+  [[ -n "$(find "$LOCK" -maxdepth 0 -mmin +20 2>/dev/null)" ]] || exit 0  # a dialog is open
+  rmdir "$LOCK" 2>/dev/null; mkdir "$LOCK" 2>/dev/null || exit 0         # stale: its run died
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+token_rejected() {
+  local t code
+  t="$(tr -d '[:space:]' 2>/dev/null < "$CONF/token")"
+  [[ -n "$t" ]] || return 0
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H @/dev/fd/9 9<<<"X-Chum-Token: $t" "$API/api/dashboard/summary")"
+  [[ "$code" == "401" ]]
+}
 CFG="${CLOUDSDK_CONFIG:-$HOME/.config/gcloud}"
 ACCOUNT="$(sed -n 's/^account *= *//p' "$CFG/configurations/config_$(cat "$CFG/active_config" 2>/dev/null || echo default)" 2>/dev/null | head -1)"
 
-ANSWER="$(osascript - "$ACCOUNT" <<'EOF' 2>/dev/null
+if curl -sf --max-time 10 "$API/health" >/dev/null 2>&1; then
+  token_rejected || { rm -f "$SNOOZE"; exit 0; }
+  CAUSE=setup
+elif [[ -z "$GCLOUD" || ! -f "$HOME/Library/LaunchAgents/$TUNNEL_LABEL.plist" ]]; then
+  CAUSE=setup
+elif [[ -z "$ACCOUNT" ]]; then
+  CAUSE=signin
+elif ! curl -s -o /dev/null --max-time 5 "${CHUM_ONLINE_URL:-https://www.gstatic.com/generate_204}"; then
+  exit 0  # offline: nothing the engineer can fix
+else
+  sleep 1  # the failed /health above is what makes the tunnel log its IAP error
+  CAUSE=setup
+  if [[ -n "$LOG" && -n "$(find "$LOG" -mmin -10 2>/dev/null)" ]]; then
+    case "$(tail -n 60 "$LOG" 2>/dev/null | grep -oE '\[40(03|33):|invalid_grant|[Rr]eauthentication|active account' | tail -1)" in
+      "[4033:"|invalid_grant|[Rr]eauthentication|"active account") CAUSE=signin ;;
+      "[4003:") CAUSE=server ;;
+    esac
+  fi
+  # An unexplained failure is often a VM redeploy restarting the API: only
+  # ask when it is still failing a little later.
+  if [[ "$CAUSE" == setup ]]; then
+    sleep "${CHUM_RETRY_SECS:-20}"
+    curl -sf --max-time 10 "$API/health" >/dev/null 2>&1 && exit 0
+  fi
+fi
+
+ask() {  # $1 message, $2 action button -> prints the button pressed ("" on timeout)
+  osascript - "$1" "$2" <<'EOF' 2>/dev/null
 on run argv
-  set acct to item 1 of argv
-  if acct is "" then set acct to "your @codechum.com account"
-  display dialog "Your Google Cloud sign-in has expired, so team memory (chum-mem) is disconnected." & return & return & "Sign in again as " & acct & "? A browser window opens." with title "chum-mem" buttons {"Later", "Sign in"} default button "Sign in" with icon caution giving up after 900
+  display dialog (item 1 of argv) with title "chum-mem" buttons {"Later", item 2 of argv} default button 2 with icon caution giving up after 900
   return button returned of result
 end run
 EOF
-)"
-if [[ "$ANSWER" != "Sign in" ]]; then
-  mkdir -p "$(dirname "$SNOOZE")" && : > "$SNOOZE"  # Later, or no answer: ask again in an hour
-  exit 0
-fi
+}
+notify() { osascript - "$1" <<'EOF' >/dev/null 2>&1
+on run argv
+  display notification (item 1 of argv) with title "chum-mem"
+end run
+EOF
+}
+snooze() { : > "$SNOOZE"; }
 
-# gcloud waits for the browser callback forever; give up after 10 minutes so
-# launchd can run this check again.
-"$GCLOUD" auth login ${ACCOUNT:+"$ACCOUNT"} --brief >/dev/null 2>&1 &
-LOGIN_PID=$!
-for _ in $(seq 1 600); do kill -0 "$LOGIN_PID" 2>/dev/null || break; sleep 1; done
-kill "$LOGIN_PID" 2>/dev/null
+case "$CAUSE" in
+  signin)
+    [[ "$(ask "Your Google Cloud sign-in has expired, so team memory (chum-mem) is disconnected.
 
-for _ in 1 2 3 4 5; do
-  curl -sf --max-time 5 "http://localhost:$PORT/health" >/dev/null 2>&1 && {
-    osascript -e 'display notification "Signed in. Team memory is connected again." with title "chum-mem"' 2>/dev/null
-    exit 0
-  }
-  sleep 3
-done
-osascript -e 'display notification "Sign-in did not complete. You will be asked again in 5 minutes." with title "chum-mem"' 2>/dev/null
+Sign in again as ${ACCOUNT:-your @codechum.com account}? A browser window opens." "Sign in")" == "Sign in" ]] || { snooze; exit 0; }
+    # gcloud waits for the browser callback forever; give up after 10 minutes.
+    "$GCLOUD" auth login ${ACCOUNT:+"$ACCOUNT"} --brief >/dev/null 2>&1 &
+    LOGIN_PID=$!
+    for _ in $(seq 1 600); do kill -0 "$LOGIN_PID" 2>/dev/null || break; sleep 1; done
+    kill "$LOGIN_PID" 2>/dev/null
+    for _ in 1 2 3 4 5; do
+      curl -sf --max-time 5 "$API/health" >/dev/null 2>&1 && { notify "Signed in. Team memory is connected again."; exit 0; }
+      sleep 3
+    done
+    notify "Sign-in did not complete. You will be asked again in 5 minutes."
+    ;;
+  server)
+    ask "The chum-mem team server cannot be reached (IAP error 4003: its firewall rule is missing or the VM is down).
+
+This cannot be fixed from your Mac: tell the chum-mem admin. Your sessions are queued and sync once it is back." "OK" >/dev/null
+    snooze
+    ;;
+  setup)
+    SETUP="$REPO/.claude/chum-mem/scripts/setup-engineer.sh"
+    if [[ -z "$REPO" || ! -f "$SETUP" ]]; then
+      ask "Team memory (chum-mem) is not connected.
+
+To fix it, run this in Claude Code at the gradechum monorepo root:
+! bash .claude/chum-mem/scripts/setup-engineer.sh" "OK" >/dev/null
+      snooze; exit 0
+    fi
+    [[ "$(ask "Team memory (chum-mem) is not connected on this Mac.
+
+Run the chum-mem setup now? A Terminal window opens; it repairs whatever is missing and may open a browser to sign in." "Set up")" == "Set up" ]] || { snooze; exit 0; }
+    printf '#!/bin/bash\ncd %q && bash .claude/chum-mem/scripts/setup-engineer.sh\necho; read -r -p "Press Return to close. " _\n' "$REPO" > "$CONF/setup.command"
+    chmod 700 "$CONF/setup.command"
+    open "$CONF/setup.command"
+    touch -t "$(date -v-45M +%Y%m%d%H%M)" "$SNOOZE"  # give setup 15 minutes before asking again
+    ;;
+esac
 exit 0

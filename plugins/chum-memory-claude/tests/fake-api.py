@@ -11,6 +11,7 @@ Behaviour is switched at run time by files in <state-dir>:
   search.json   body returned by POST /api/search      (default {"hits": []})
   docs.json     body returned by POST /mcp             (default: no nodes)
   delay-ms      sleep this many milliseconds before every answer (tunnel latency)
+  token-401     every GET except /health answers 401 (token rejected)
 Anything else is forwarded to [upstream-url] when given, else answered with a
 canned success.
 """
@@ -88,6 +89,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._delay()
         if self.path.startswith("/health"):
             return self._send(503 if flag("health-down") else 200, {"status": "ok"})
+        if flag("token-401"):
+            return self._send(401, {"error": "unauthorized"})
         if UPSTREAM:
             return self._proxy(None)
         self._send(200, {})

@@ -14,8 +14,8 @@
 #
 # Steps, each skipped when already done: jq + Google Cloud SDK (Homebrew),
 # `gcloud auth login` (browser), the launchd IAP tunnel agent on
-# localhost:63001, a launchd sign-in check that asks you to log in again when
-# the gcloud login expires, the token, the MCP env var in ~/.zshenv. Safe to re-run;
+# localhost:63001, a launchd connection check that shows a dialog with the fix
+# (sign in / set up) whenever chum-mem is not connected, the token, the MCP env var in ~/.zshenv. Safe to re-run;
 # re-run after an admin rotates your token.
 #
 # Env: CHUM_TOKEN_FILE=<path>  read the token from a file instead of Secret Manager
@@ -112,9 +112,9 @@ EOF
     fail "tunnel not up. Most likely an admin has not added you yet: ask them to run deploy-vm.sh add-user $("$GCLOUD" config get-value account 2>/dev/null), then re-run."
   fi
 fi
-# Sign-in check: every 5 minutes, asks you to sign in again once Workspace
-# session control expires the gcloud login (24 h). Copied out of the checkout so
-# switching branches cannot remove it.
+# Connection check: every 5 minutes, a dialog with the fix whenever chum-mem is
+# not connected (most often: Workspace session control expired the gcloud login,
+# every 24 h). Copied out of the checkout so switching branches cannot remove it.
 GPY="${GPY:-$("$GCLOUD" info --format='value(basic.python_location)' 2>/dev/null || true)}"
 mkdir -p "$TOKEN_DIR" && chmod 700 "$TOKEN_DIR"
 cp "$(cd "$(dirname "$0")" && pwd)/tunnel-auth-check.sh" "$AUTH_CHECK" || fail "could not copy tunnel-auth-check.sh to $AUTH_CHECK"
@@ -133,12 +133,14 @@ cat > "$AUTH_PLIST" <<EOF
     <key>CHUM_GCLOUD</key><string>$GCLOUD</string>
     <key>CHUM_TUNNEL_LOG</key><string>$LOG</string>
     <key>CHUM_LOCAL_PORT</key><string>$PORT</string>
+    <key>CHUM_TUNNEL_LABEL</key><string>$LABEL</string>
+    <key>CHUM_REPO</key><string>$ROOT</string>
   </dict>
 </dict></plist>
 EOF
 launchctl bootout "gui/$(id -u)" "$AUTH_PLIST" >/dev/null 2>&1 || true
 launchctl bootstrap "gui/$(id -u)" "$AUTH_PLIST" || fail "launchctl could not load $AUTH_PLIST"
-ok "sign-in check installed (asks you to sign in again when the gcloud login expires)"
+ok "connection check installed (a dialog offers the fix whenever chum-mem is not connected)"
 
 step "4/6 your token"
 check_token() { # $1 token -> HTTP code of an authenticated call

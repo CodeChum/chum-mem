@@ -65,7 +65,7 @@ start_fake() {  # $1 name [$2 upstream] -> sets FAKE_URL / FAKE_STATE
 hook() {  # $1 repo, $2 api url, $3 payload json, [$4...] extra VAR=value env
   local repo="$1" api="$2" payload="$3"; shift 3
   printf '%s' "$payload" | env -i PATH="$PATH" HOME="$TMP/home" TMPDIR="$TMP" \
-    CHUM_MEMORY_API_URL="$api" CLAUDE_PROJECT_DIR="$repo" CHUM_NOTICES=0 "$@" \
+    CHUM_MEMORY_API_URL="$api" CLAUDE_PROJECT_DIR="$repo" CHUM_NOTICES=0 CHUM_FIX_DIALOG=0 "$@" \
     "$BASH_BIN" "$repo/.claude/chum-mem/scripts/hook-dispatch.sh"
 }
 
@@ -383,41 +383,93 @@ test_tunnel_cause() {
   rm -rf "$logs" "$TMP/home/.config/gcloud"
 }
 
-# ── tunnel-auth-check.sh: asks to sign in on 4033, runs the login, snoozes on Later ──
+# ── tunnel-auth-check.sh: the right dialog for every way chum-mem can be disconnected ──
 test_auth_check() {
   echo "auth_check"
-  local h="$TMP/authhome" bin="$TMP/auth-bin" port
-  mkdir -p "$h/.config/gcloud/configurations" "$bin"
-  echo default > "$h/.config/gcloud/active_config"; printf 'account = eng@codechum.com\n' > "$h/.config/gcloud/configurations/config_default"
+  local h="$TMP/authhome" bin="$TMP/auth-bin" repo="$TMP/auth-repo" port
+  mkdir -p "$h/.config/gcloud/configurations" "$h/.config/chum-mem" "$h/Library/LaunchAgents" "$bin" "$repo/.claude/chum-mem/scripts"
+  : > "$repo/.claude/chum-mem/scripts/setup-engineer.sh"
+  echo default > "$h/.config/gcloud/active_config"
   start_fake authcheck || { bad "fake api"; return; }
   port="${FAKE_URL##*:}"
-  # osascript stub: the dialog answers $ANSWER; notifications are recorded.
-  printf '#!/bin/bash\ncat >/dev/null; echo "$*" >> "%s/osascript.log"; [[ "$1" == "-" ]] && echo "$ANSWER"; exit 0\n' "$TMP" > "$bin/osascript"
+  # osascript stub: records the dialog text; the dialog answers $ANSWER.
+  printf '#!/bin/bash\nshift; cat >/dev/null; printf "%%s\\n" "$*" >> "%s/osascript.log"; echo "$ANSWER"\n' "$TMP" > "$bin/osascript"
   # gcloud stub: records its args; the login "fixes" the tunnel.
   printf '#!/bin/bash\necho "$*" >> "%s/gcloud.log"; rm -f "%s/health-down"\n' "$TMP" "$FAKE_STATE" > "$bin/gcloud"
-  chmod +x "$bin/osascript" "$bin/gcloud"
-  ac() {  # $1 dialog answer
+  printf '#!/bin/bash\necho "$*" >> "%s/open.log"\n' "$TMP" > "$bin/open"
+  chmod +x "$bin/osascript" "$bin/gcloud" "$bin/open"
+  ac() {  # $1 dialog answer [$2 online url]
     env -i PATH="$bin:$PATH" HOME="$h" ANSWER="$1" CHUM_LOCAL_PORT="$port" CHUM_GCLOUD="$bin/gcloud" \
-      CHUM_TUNNEL_LOG="$h/tunnel.log" "$BASH_BIN" "$SCRIPTS/tunnel-auth-check.sh"
+      CHUM_TUNNEL_LOG="$h/tunnel.log" CHUM_TUNNEL_LABEL=t CHUM_REPO="$repo" CHUM_RETRY_SECS=0 \
+      CHUM_ONLINE_URL="${2:-$FAKE_URL/health-of-the-internet}" "$BASH_BIN" "$SCRIPTS/tunnel-auth-check.sh"
   }
-  : > "$TMP/osascript.log"; : > "$TMP/gcloud.log"
-  ac "Sign in"
-  check "healthy tunnel -> no dialog" '[[ ! -s "$TMP/osascript.log" ]]'
-  : > "$FAKE_STATE/health-down"
-  echo "Error while connecting [4003: 'failed to connect to backend']." > "$h/tunnel.log"
-  ac "Sign in"
-  check "4003 -> no dialog (not the engineer's to fix)" '[[ ! -s "$TMP/osascript.log" ]]'
-  echo "Error while connecting [4033: 'not authorized']." > "$h/tunnel.log"
+  reset() { : > "$TMP/osascript.log"; : > "$TMP/gcloud.log"; : > "$TMP/open.log"; rm -f "$h/.config/chum-mem/.dialog-snooze"; }
+  said() { grep -q "$1" "$TMP/osascript.log"; }
+  reset
+  ac "Set up"
+  check "never set up (no token) -> Set up dialog" 'said "not connected on this Mac"'
+  check "Set up -> Terminal runs setup-engineer.sh in the repo" \
+    '[[ "$(cat "$TMP/open.log")" == "$h/.config/chum-mem/setup.command" ]] && grep -q "setup-engineer.sh" "$h/.config/chum-mem/setup.command"'
+  check "and gives setup 15 minutes (snooze dated 45 min ago)" '[[ -n "$(find "$h/.config/chum-mem/.dialog-snooze" -mmin +44 -mmin -47)" ]]'
+  echo tok > "$h/.config/chum-mem/token"; reset
+  ac "Set up"
+  check "healthy with a good token -> no dialog" '[[ ! -s "$TMP/osascript.log" ]]'
+  : > "$FAKE_STATE/token-401"; reset
   ac "Later"
-  check "4033 -> dialog shown with the account" '[[ "$(head -1 "$TMP/osascript.log")" == "- eng@codechum.com" ]]'
-  check "Later -> no login, snoozed" '[[ ! -s "$TMP/gcloud.log" && -f "$h/.config/chum-mem/.auth-snooze" ]]'
-  : > "$TMP/osascript.log"
-  ac "Sign in"
+  check "token rejected (401) -> Set up dialog" 'said "not connected on this Mac"'
+  check "Later -> nothing opened, snoozed an hour" '[[ ! -s "$TMP/open.log" && -n "$(find "$h/.config/chum-mem/.dialog-snooze" -mmin -1)" ]]'
+  : > "$TMP/osascript.log"; ac "Set up"
   check "inside the snooze hour -> no dialog" '[[ ! -s "$TMP/osascript.log" ]]'
-  rm -f "$h/.config/chum-mem/.auth-snooze"
+  rm -f "$FAKE_STATE/token-401"; : > "$FAKE_STATE/health-down"; reset
+  ac "Set up"
+  check "down with no tunnel agent installed -> Set up dialog" 'said "not connected on this Mac"'
+  : > "$h/Library/LaunchAgents/t.plist"; reset
   ac "Sign in"
+  check "no gcloud account -> Sign in dialog" 'said "sign-in has expired"'
+  check "no account -> plain gcloud auth login" '[[ "$(cat "$TMP/gcloud.log")" == "auth login --brief" ]]'
+  printf 'account = eng@codechum.com\n' > "$h/.config/gcloud/configurations/config_default"
+  : > "$FAKE_STATE/health-down"
+  echo "Error while connecting [4003: 'failed to connect to backend']." > "$h/tunnel.log"; reset
+  ac "Set up" "http://127.0.0.1:1"
+  check "offline -> no dialog" '[[ ! -s "$TMP/osascript.log" ]]'
+  ac "OK"
+  check "4003 -> server dialog, no login, no setup" 'said "cannot be reached" && [[ ! -s "$TMP/gcloud.log" && ! -s "$TMP/open.log" ]]'
+  echo "Error while connecting [4033: 'not authorized']." > "$h/tunnel.log"; reset
+  : > "$FAKE_STATE/health-down"
+  mkdir "$h/.config/chum-mem/.dialog-lock"
+  ac "Sign in"
+  check "a dialog already open -> no second one" '[[ ! -s "$TMP/osascript.log" ]]'
+  rmdir "$h/.config/chum-mem/.dialog-lock"
+  ac "Sign in"
+  check "4033 -> Sign in dialog naming the account" 'said "sign-in has expired" && said "eng@codechum.com"'
   check "Sign in -> gcloud auth login for that account" '[[ "$(cat "$TMP/gcloud.log")" == "auth login eng@codechum.com --brief" ]]'
-  check "reconnected -> success notification" 'grep -q "connected again" "$TMP/osascript.log"'
+  check "reconnected -> success notification" 'said "connected again"'
+  check "the lock is released" '[[ ! -d "$h/.config/chum-mem/.dialog-lock" ]]'
+  : > "$h/tunnel.log"; : > "$FAKE_STATE/health-down"; reset
+  ac "Later"
+  check "down, cause unknown, still down on retry -> Set up dialog" 'said "not connected on this Mac"'
+  rm -f "$FAKE_STATE/health-down"
+}
+
+# ── the hook starts the dialog check when chum-mem is unreachable ──
+test_hook_fix_dialog() {
+  echo "hook_fix_dialog"
+  local r p bin="$TMP/hookdlg-bin"
+  r=$(mkrepo hookdlg)
+  mkdir -p "$bin"
+  printf '#!/bin/bash\ncat >/dev/null; echo "$*" >> "%s/hookdlg-osascript.log"; echo Later\n' "$TMP" > "$bin/osascript"
+  chmod +x "$bin/osascript"; : > "$TMP/hookdlg-osascript.log"
+  p=$(payload UserPromptSubmit hookdlg "$r" '{"prompt":"where is the bonus toggle?"}')
+  hook "$r" "http://127.0.0.1:1" "$p" PATH="$bin:$PATH" CHUM_FIX_DIALOG=1 CHUM_LOCAL_PORT=1 CHUM_RETRY_SECS=0 >/dev/null
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$TMP/hookdlg-osascript.log" ]] && break; sleep 0.5; done
+  check "unreachable -> the hook shows a dialog" '[[ -s "$TMP/hookdlg-osascript.log" ]]'
+  rm -f "$TMP/home/.config/chum-mem/.dialog-snooze"
+  : > "$TMP/hookdlg-osascript.log"
+  p=$(payload Stop hookdlg "$r")
+  hook "$r" "http://127.0.0.1:1" "$p" PATH="$bin:$PATH" CHUM_FIX_DIALOG=1 CHUM_LOCAL_PORT=1 CHUM_RETRY_SECS=0 >/dev/null
+  sleep 2
+  check "not from Stop (only turn-start events)" '[[ ! -s "$TMP/hookdlg-osascript.log" ]]'
+  rm -f "$TMP/home/.config/chum-mem/.dialog-snooze"
 }
 
 # ── `chum-quarantine.sh send` appends under the outbox lock ──
@@ -518,7 +570,7 @@ test_docs_sync_default_branch() {
   check "snapshot unchanged by the stale checkout" '[[ "$(export_files "$p")" == "docs/a.md " ]]'
 }
 
-ALL="concurrent_append fence_forgery tokenizer docs_relevance_gate deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked token_not_in_argv tunnel_cause auth_check docs_sync_default_branch"
+ALL="concurrent_append fence_forgery tokenizer docs_relevance_gate deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked token_not_in_argv tunnel_cause auth_check hook_fix_dialog docs_sync_default_branch"
 for t in ${*:-$ALL}; do "test_$t"; done
 echo "passed $PASS, failed $FAIL, skipped $SKIP  (scratch: $TMP)"
 [[ "$FAIL" -eq 0 ]]
