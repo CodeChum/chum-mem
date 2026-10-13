@@ -52,6 +52,12 @@ if ! command -v docker >/dev/null 2>&1; then
   systemctl enable --now docker
 fi
 
+# Root runs git on a checkout owned by $APP_USER. Without this git refuses
+# ("dubious ownership"), the HEAD check below fails, a reboot is taken for a
+# first boot and the script dies before starting the stack.
+git config --system --get-all safe.directory 2>/dev/null | grep -qxF "$APP_HOME/src" \
+  || git config --system --add safe.directory "$APP_HOME/src"
+
 id -u "$APP_USER" >/dev/null 2>&1 || useradd --system --create-home --home-dir "$APP_HOME" --shell /usr/sbin/nologin "$APP_USER"
 usermod -aG docker "$APP_USER" || true
 mkdir -p "$APP_HOME"
@@ -172,6 +178,65 @@ services:
     ports: !override
       - "127.0.0.1:63000:63000"
 YML
+
+# ── Nightly backup ───────────────────────────────────────────────────────────
+# With instance metadata `chum-mem-backup-bucket` set (deploy-vm.sh
+# enable-backups), a timer dumps Postgres at 18:30 UTC (02:30 PHT) to
+# gs://<bucket>/postgres/. Defined here rather than in the checkout because the
+# checkout only changes on a deploy, while this script is refreshed in metadata.
+# The VM's service account may only create objects in that bucket: no read,
+# overwrite or delete, so a compromised VM cannot destroy earlier backups.
+if [[ -n "$(metadata_attr chum-mem-backup-bucket)" ]]; then
+  cat > /usr/local/sbin/chum-mem-backup <<'SH'
+#!/usr/bin/env bash
+# Dumps to local disk first, so a pg_dump that fails stops the script before
+# anything is uploaded, and an archive pg_restore cannot read is never uploaded.
+set -euo pipefail
+BUCKET="$(curl -sf --max-time 5 -H 'Metadata-Flavor: Google' \
+  http://metadata.google.internal/computeMetadata/v1/instance/attributes/chum-mem-backup-bucket)"
+NAME="chum-mem-$(date -u +%Y%m%dT%H%M%SZ).dump"
+DUMP="$(mktemp /var/tmp/chum-mem-backup.XXXXXX)"
+trap 'rm -f "$DUMP"' EXIT
+cd /opt/chum-mem/src
+docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom' > "$DUMP"
+docker compose exec -T postgres pg_restore --list < "$DUMP" > /dev/null
+# The JSON API, not `gcloud storage cp`: gcloud reads the object first, which
+# a create-only account may not. ifGenerationMatch=0 refuses to overwrite.
+TOKEN="$(curl -sf --max-time 5 -H 'Metadata-Flavor: Google' \
+  http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token | jq -r .access_token)"
+RESP="$(curl -sS --fail-with-body --retry 3 -X POST --data-binary @"$DUMP" \
+  -H 'Content-Type: application/octet-stream' -H @/dev/fd/9 \
+  "https://storage.googleapis.com/upload/storage/v1/b/$BUCKET/o?uploadType=media&ifGenerationMatch=0&name=postgres%2F$NAME" \
+  9<<<"Authorization: Bearer $TOKEN")" || { echo "upload failed: $RESP" >&2; exit 1; }
+unset TOKEN
+echo "uploaded gs://$BUCKET/postgres/$NAME ($(printf '%s' "$RESP" | jq -r .size) bytes)"
+SH
+  chmod 0755 /usr/local/sbin/chum-mem-backup
+  cat > /etc/systemd/system/chum-mem-backup.service <<'UNIT'
+[Unit]
+Description=chum-mem Postgres backup to Cloud Storage
+After=docker.service google-startup-scripts.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/chum-mem-backup
+UNIT
+  cat > /etc/systemd/system/chum-mem-backup.timer <<'UNIT'
+[Unit]
+Description=Nightly chum-mem Postgres backup
+
+[Timer]
+OnCalendar=*-*-* 18:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now chum-mem-backup.timer
+  echo "nightly backup timer enabled ($(metadata_attr chum-mem-backup-bucket))"
+fi
 
 # Build only on first boot or an explicit deploy (Rust, ~20-30 min on 4 vCPU).
 # A plain reboot reuses the images built from the checked-out commit. Then start

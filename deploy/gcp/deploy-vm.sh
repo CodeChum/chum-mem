@@ -2,7 +2,8 @@
 # deploy-vm.sh — create the chum-mem VM on GCP. No public ingress: SSH and the API
 # are reached through IAP TCP forwarding only (Google IAM is the access control).
 #
-# Usage: deploy-vm.sh [create|deploy <ref>|status|tunnel|ssh|logs|add-user <email>|remove-user <email>|users|delete]
+# Usage: deploy-vm.sh [create|deploy <ref>|status|tunnel|ssh|logs|add-user <email>|remove-user <email>|users|
+#                      enable-backups|backup-now|backups|delete]
 #
 # The VM runs exactly the commit it was created or last deployed with: its
 # startup script clones once (at metadata `chum-mem-ref`) and never pulls on a
@@ -18,6 +19,10 @@ DISK_GB="${CHUM_GCP_DISK_GB:-60}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 G="gcloud --project $PROJECT"
 REPO_URL="https://github.com/CodeChum/chum-mem.git"
+BACKUP_BUCKET="${CHUM_BACKUP_BUCKET:-$PROJECT-chum-mem-backups}"
+SNAPSHOT_POLICY="${CHUM_SNAPSHOT_POLICY:-default-schedule-1}"
+VM_SA="chum-mem-vm@$PROJECT.iam.gserviceaccount.com"
+VM_SCOPES="https://www.googleapis.com/auth/devstorage.read_write,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write"
 
 valid_ref() { [[ "$1" =~ ^[A-Za-z0-9._/-]+$ && "$1" != -* && "$1" != *..* ]]; }
 resolve_ref() {  # branch/tag -> commit SHA (a SHA passes through)
@@ -66,6 +71,41 @@ iap_tunnel_binding() {  # $1 add|remove, $2 email
     || { echo "could not update the IAP tunnel policy of $NAME" >&2; return 1; }
   unset at
 }
+# Backups: a nightly pg_dump to $BACKUP_BUCKET (30-day lifecycle) plus a daily
+# snapshot of the boot disk ($SNAPSHOT_POLICY, 14 days). The VM runs as its own
+# service account, which holds only log/metric writing and create-only access
+# to that bucket; the default compute account has project-wide Editor.
+ensure_backup_infra() {
+  local region="${ZONE%-*}" lifecycle
+  if ! $G storage buckets describe "gs://$BACKUP_BUCKET" >/dev/null 2>&1; then
+    $G storage buckets create "gs://$BACKUP_BUCKET" --location="$region" \
+      --uniform-bucket-level-access --public-access-prevention
+  fi
+  lifecycle="$(mktemp)"
+  printf '%s' '{"rule":[{"action":{"type":"Delete"},"condition":{"age":30}}]}' > "$lifecycle"
+  $G storage buckets update "gs://$BACKUP_BUCKET" --lifecycle-file="$lifecycle" \
+    --update-labels=app=chum-mem,env=pilot >/dev/null
+  rm -f "$lifecycle"
+  if ! $G iam service-accounts describe "$VM_SA" >/dev/null 2>&1; then
+    $G iam service-accounts create "${VM_SA%%@*}" --display-name="chum-mem VM" \
+      --description="Runtime identity of $NAME: logs, metrics, and create-only writes to gs://$BACKUP_BUCKET"
+  fi
+  for role in roles/logging.logWriter roles/monitoring.metricWriter; do
+    $G projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:$VM_SA" \
+      --role="$role" --condition=None --quiet >/dev/null
+  done
+  $G storage buckets add-iam-policy-binding "gs://$BACKUP_BUCKET" --member="serviceAccount:$VM_SA" \
+    --role=roles/storage.objectCreator >/dev/null
+  if ! $G compute resource-policies describe "$SNAPSHOT_POLICY" --region="$region" >/dev/null 2>&1; then
+    $G compute resource-policies create snapshot-schedule "$SNAPSHOT_POLICY" --region="$region" \
+      --daily-schedule --start-time=22:00 --max-retention-days=14 \
+      --on-source-disk-delete=keep-auto-snapshots
+  fi
+}
+attach_snapshot_policy() {
+  $G compute disks describe "$NAME" --zone="$ZONE" --format='value(resourcePolicies)' | grep -q "/$SNAPSHOT_POLICY\$" \
+    || $G compute disks add-resource-policies "$NAME" --zone="$ZONE" --resource-policies="$SNAPSHOT_POLICY"
+}
 require_secret_manager() {
   $G services list --enabled --filter=config.name=secretmanager.googleapis.com --format='value(config.name)' | grep -q . \
     || { echo "Secret Manager API is not enabled on $PROJECT: gcloud services enable secretmanager.googleapis.com --project $PROJECT" >&2; exit 1; }
@@ -90,6 +130,7 @@ case "${1:-create}" in
         --source-ranges=35.235.240.0/20 --target-tags=chum-mem \
         --description="IAP SSH to chum-mem, used by deploy-vm.sh deploy/add-user/users"
     fi
+    ensure_backup_infra
     REF="$(resolve_ref "${CHUM_MEM_REF:-main}")"
     echo "Pinning the VM to chum-mem commit $REF"
     $G compute instances create "$NAME" \
@@ -97,10 +138,11 @@ case "${1:-create}" in
       --image-family=debian-12 --image-project=debian-cloud \
       --boot-disk-size="${DISK_GB}GB" --boot-disk-type=pd-balanced \
       --tags=chum-mem \
-      --scopes=https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write \
-      --metadata=enable-oslogin=TRUE,chum-mem-ref="$REF" \
+      --service-account="$VM_SA" --scopes="$VM_SCOPES" \
+      --metadata=enable-oslogin=TRUE,chum-mem-ref="$REF",chum-mem-backup-bucket="$BACKUP_BUCKET" \
       --metadata-from-file=startup-script="$HERE/startup.sh" \
       --labels=app=chum-mem,env=pilot,owner=cymmer
+    attach_snapshot_policy
     echo "Created $NAME. The startup script builds the Rust images (20-30 min). Follow with: $0 logs"
     echo "It generates the team and admin API tokens into /opt/chum-mem/src/.env (mode 600); read them over '$0 ssh'."
     ;;
@@ -178,8 +220,36 @@ case "${1:-create}" in
   users)
     $G compute ssh "$NAME" --zone="$ZONE" --tunnel-through-iap -- "sudo bash -s -- list" < "$HERE/vm-users.sh"
     ;;
+  enable-backups)
+    # For a VM created before backups existed. Switching the service account
+    # needs the VM stopped: chum-mem is down for 1-2 minutes, and the hooks
+    # spool sessions locally meanwhile.
+    ensure_backup_infra
+    attach_snapshot_policy
+    $G compute instances add-metadata "$NAME" --zone="$ZONE" \
+      --metadata=chum-mem-backup-bucket="$BACKUP_BUCKET" --metadata-from-file=startup-script="$HERE/startup.sh"
+    if [[ "$($G compute instances describe "$NAME" --zone="$ZONE" --format='value(serviceAccounts[0].email)')" != "$VM_SA" ]]; then
+      echo "Restarting $NAME to run as $VM_SA (chum-mem is down for 1-2 minutes)"
+      $G compute instances stop "$NAME" --zone="$ZONE"
+      $G compute instances set-service-account "$NAME" --zone="$ZONE" --service-account="$VM_SA" --scopes="$VM_SCOPES"
+      $G compute instances start "$NAME" --zone="$ZONE"
+    else
+      # Already the right identity: install the timer without a restart.
+      $G compute ssh "$NAME" --zone="$ZONE" --tunnel-through-iap -- 'sudo google_metadata_script_runner startup'
+    fi
+    echo "Backups on: nightly dump to gs://$BACKUP_BUCKET/postgres/, daily disk snapshot ($SNAPSHOT_POLICY). Test with: $0 backup-now"
+    ;;
+  backup-now)
+    $G compute ssh "$NAME" --zone="$ZONE" --tunnel-through-iap -- \
+      'sudo systemctl start chum-mem-backup.service; sudo journalctl -u chum-mem-backup.service -n 3 --no-pager -o cat'
+    ;;
+  backups)
+    $G storage ls -l "gs://$BACKUP_BUCKET/postgres/" | tail -n 8
+    $G compute snapshots list --filter="sourceDisk~/$NAME\$" --sort-by=~creationTimestamp --limit=5 \
+      --format='table(name,creationTimestamp,storageBytes)'
+    ;;
   delete)
     $G compute instances delete "$NAME" --zone="$ZONE"
     ;;
-  *) echo "usage: $0 [create|deploy <ref>|status|logs|ssh|tunnel|add-user <email>|remove-user <email>|users|delete]"; exit 2 ;;
+  *) echo "usage: $0 [create|deploy <ref>|status|logs|ssh|tunnel|add-user <email>|remove-user <email>|users|enable-backups|backup-now|backups|delete]"; exit 2 ;;
 esac
