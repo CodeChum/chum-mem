@@ -166,8 +166,40 @@ else
   fi
 fi
 export CHUM_API_HEALTHY="$API_HEALTHY"
+# Why the tunnel failed, from the launchd tunnel agent's log (setup-engineer.sh
+# and install-tunnel-agent.sh log to different files; the newer one wins). IAP
+# 4033 = the engineer's gcloud login was refused: Workspace Cloud session control
+# expires it every 24 h, and the tunnel recovers on its own after
+# `gcloud auth login` because it loads credentials per connection. IAP 4003 = IAP
+# cannot reach the VM (firewall rule or VM down). A log untouched for 10 minutes
+# says nothing about this failure.
+__tunnel_cause() {  # -> "auth", "backend" or nothing
+  local f log=""
+  for f in "$HOME/Library/Logs/com.codechum.chum-mem-tunnel.log" "$HOME/Library/Logs/chum-mem-tunnel.log"; do
+    [[ -f "$f" ]] && { [[ -z "$log" || "$f" -nt "$log" ]] && log="$f"; }
+  done
+  [[ -n "$log" && -n "$(find "$log" -mmin -10 2>/dev/null)" ]] || return 0
+  case "$(tail -n 60 "$log" 2>/dev/null | grep -oE '\[40(03|33):|invalid_grant|[Rr]eauthentication' | tail -1)" in
+    "[4033:"|invalid_grant|[Rr]eauthentication) echo auth ;;
+    "[4003:") echo backend ;;
+  esac
+}
+__gcloud_account() {  # active gcloud account, read from its config file (no gcloud spawn)
+  local d="${CLOUDSDK_CONFIG:-$HOME/.config/gcloud}" c
+  c="$(cat "$d/active_config" 2>/dev/null || echo default)"
+  sed -n 's/^account *= *//p' "$d/configurations/config_${c}" 2>/dev/null | head -1
+}
 if [[ "$API_HEALTHY" -eq 0 ]]; then
   UNAVAIL_MSG="ChumMemory API unreachable at ${API_URL} — memory retrieval unavailable this turn; session events are being spooled locally and will sync later."
+  TUNNEL_CAUSE="$(__tunnel_cause)"
+  if [[ "$TUNNEL_CAUSE" == "auth" ]]; then
+    LOGIN_CMD="gcloud auth login $(__gcloud_account)"; LOGIN_CMD="${LOGIN_CMD% }"
+    UNAVAIL_MSG="ChumMemory is unreachable because the user's gcloud login has expired (IAP tunnel error 4033), so memory retrieval is unavailable. Tell the user to run \`! ${LOGIN_CMD}\` to sign in again; session events are spooled locally and sync once they do."
+    __notice_due gcloud-auth && __add_notice "chum-mem: your gcloud login expired, so the IAP tunnel is refused (4033). Sign in again with:  ! ${LOGIN_CMD}  - queued events send once you do."
+  elif [[ "$TUNNEL_CAUSE" == "backend" ]]; then
+    UNAVAIL_MSG="ChumMemory is unreachable: the IAP tunnel cannot reach the chum-mem VM (error 4003: firewall rule missing or VM down), so memory retrieval is unavailable. The user cannot fix this locally; the chum-mem admin must. Session events are spooled locally and sync later."
+    __notice_due backend && __add_notice "chum-mem: IAP cannot reach the chum-mem VM (4003: firewall rule missing or VM down). Not fixable from your machine - tell the chum-mem admin. Events are spooled and replayed later."
+  fi
   if [[ -x "${SCRIPTS_DIR}/session-sync.sh" ]]; then
     CHUM_MEM_FILE_PRE="${PROJECT_DIR}/.chum-mem"
     if [[ -f "$CHUM_MEM_FILE_PRE" ]]; then
@@ -179,7 +211,7 @@ if [[ "$API_HEALTHY" -eq 0 ]]; then
   # Only the two turn-start events may add context. Emitting additionalContext on
   # Stop/SessionEnd makes Claude Code continue the conversation until --max-turns
   # (observed overnight: 8 looped sessions, ~$1.1 each) — so stay silent there.
-  if __notice_due unreachable; then
+  if [[ -z "$TUNNEL_CAUSE" ]] && __notice_due unreachable; then
     __add_notice "chum-mem: API unreachable at ${API_URL} (no /health answer within ${HEALTH_TIMEOUT}s). Events are spooled to .chum-cache/outbox/ and replayed once it answers. If this persists, check the tunnel: ~/chum-mem/deploy/gcp/install-tunnel-agent.sh status"
   fi
   UNAVAIL_ESC=$(printf '%s' "$UNAVAIL_MSG" | jq -Rs '.' | sed 's/^"//;s/"$//')

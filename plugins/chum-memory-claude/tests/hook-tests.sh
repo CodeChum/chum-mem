@@ -355,6 +355,71 @@ test_health_down_cache() {
   check "a healthy answer clears the memory" '[[ ! -f "$r/.chum-cache/.health-down" ]]'
 }
 
+# ── A failed /health is explained from the tunnel log: 4033 = gcloud login expired ──
+test_tunnel_cause() {
+  echo "tunnel_cause"
+  local r p out logs="$TMP/home/Library/Logs" gc="$TMP/home/.config/gcloud"
+  r=$(mkrepo tcause)
+  p=$(payload UserPromptSubmit tcause "$r" '{"prompt":"why is the bonus toggle hidden?"}')
+  mkdir -p "$logs" "$gc/configurations"
+  echo work > "$gc/active_config"; printf '[core]\naccount = eng@codechum.com\n' > "$gc/configurations/config_work"
+  printf "ConnectionCreationError: Error while connecting [4003: 'failed to connect to backend'].\nConnectionCreationError: Error while connecting [4033: 'not authorized'].\n" \
+    > "$logs/com.codechum.chum-mem-tunnel.log"
+  out=$(hook "$r" "http://127.0.0.1:1" "$p" CHUM_NOTICES=1 CHUM_HEALTH_DOWN_SECS=0)
+  check "4033 -> context tells Claude to have the user sign in" \
+    '[[ "$(jq -r .hookSpecificOutput.additionalContext <<<"$out")" == *"! gcloud auth login eng@codechum.com"* ]]'
+  check "4033 -> notice names the login command" '[[ "$(jq -r .systemMessage <<<"$out")" == *"gcloud login expired"*"gcloud auth login eng@codechum.com"* ]]'
+  check "the event is still spooled" '[[ -n "$(ls "$r/.chum-cache/outbox/" 2>/dev/null)" ]]'
+  printf "Error while connecting [4033: 'not authorized'].\nError while connecting [4003: 'failed to connect to backend'].\n" \
+    > "$logs/com.codechum.chum-mem-tunnel.log"
+  rm -f "$r/.chum-cache/.notice-"*
+  out=$(hook "$r" "http://127.0.0.1:1" "$p" CHUM_NOTICES=1 CHUM_HEALTH_DOWN_SECS=0)
+  check "latest line wins: 4003 -> admin problem, no login advice" \
+    '[[ "$(jq -r .systemMessage <<<"$out")" == *"cannot reach the chum-mem VM"* && "$out" != *"auth login"* ]]'
+  touch -t 202001010000 "$logs/com.codechum.chum-mem-tunnel.log"
+  rm -f "$r/.chum-cache/.notice-"*
+  out=$(hook "$r" "http://127.0.0.1:1" "$p" CHUM_NOTICES=1 CHUM_HEALTH_DOWN_SECS=0)
+  check "a stale log -> the generic unreachable notice" '[[ "$(jq -r .systemMessage <<<"$out")" == *"API unreachable"* ]]'
+  rm -rf "$logs" "$TMP/home/.config/gcloud"
+}
+
+# ── tunnel-auth-check.sh: asks to sign in on 4033, runs the login, snoozes on Later ──
+test_auth_check() {
+  echo "auth_check"
+  local h="$TMP/authhome" bin="$TMP/auth-bin" port
+  mkdir -p "$h/.config/gcloud/configurations" "$bin"
+  echo default > "$h/.config/gcloud/active_config"; printf 'account = eng@codechum.com\n' > "$h/.config/gcloud/configurations/config_default"
+  start_fake authcheck || { bad "fake api"; return; }
+  port="${FAKE_URL##*:}"
+  # osascript stub: the dialog answers $ANSWER; notifications are recorded.
+  printf '#!/bin/bash\ncat >/dev/null; echo "$*" >> "%s/osascript.log"; [[ "$1" == "-" ]] && echo "$ANSWER"; exit 0\n' "$TMP" > "$bin/osascript"
+  # gcloud stub: records its args; the login "fixes" the tunnel.
+  printf '#!/bin/bash\necho "$*" >> "%s/gcloud.log"; rm -f "%s/health-down"\n' "$TMP" "$FAKE_STATE" > "$bin/gcloud"
+  chmod +x "$bin/osascript" "$bin/gcloud"
+  ac() {  # $1 dialog answer
+    env -i PATH="$bin:$PATH" HOME="$h" ANSWER="$1" CHUM_LOCAL_PORT="$port" CHUM_GCLOUD="$bin/gcloud" \
+      CHUM_TUNNEL_LOG="$h/tunnel.log" "$BASH_BIN" "$SCRIPTS/tunnel-auth-check.sh"
+  }
+  : > "$TMP/osascript.log"; : > "$TMP/gcloud.log"
+  ac "Sign in"
+  check "healthy tunnel -> no dialog" '[[ ! -s "$TMP/osascript.log" ]]'
+  : > "$FAKE_STATE/health-down"
+  echo "Error while connecting [4003: 'failed to connect to backend']." > "$h/tunnel.log"
+  ac "Sign in"
+  check "4003 -> no dialog (not the engineer's to fix)" '[[ ! -s "$TMP/osascript.log" ]]'
+  echo "Error while connecting [4033: 'not authorized']." > "$h/tunnel.log"
+  ac "Later"
+  check "4033 -> dialog shown with the account" '[[ "$(head -1 "$TMP/osascript.log")" == "- eng@codechum.com" ]]'
+  check "Later -> no login, snoozed" '[[ ! -s "$TMP/gcloud.log" && -f "$h/.config/chum-mem/.auth-snooze" ]]'
+  : > "$TMP/osascript.log"
+  ac "Sign in"
+  check "inside the snooze hour -> no dialog" '[[ ! -s "$TMP/osascript.log" ]]'
+  rm -f "$h/.config/chum-mem/.auth-snooze"
+  ac "Sign in"
+  check "Sign in -> gcloud auth login for that account" '[[ "$(cat "$TMP/gcloud.log")" == "auth login eng@codechum.com --brief" ]]'
+  check "reconnected -> success notification" 'grep -q "connected again" "$TMP/osascript.log"'
+}
+
 # ── `chum-quarantine.sh send` appends under the outbox lock ──
 test_quarantine_send_locked() {
   echo "quarantine_send_locked"
@@ -453,7 +518,7 @@ test_docs_sync_default_branch() {
   check "snapshot unchanged by the stale checkout" '[[ "$(export_files "$p")" == "docs/a.md " ]]'
 }
 
-ALL="concurrent_append fence_forgery tokenizer docs_relevance_gate deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked token_not_in_argv docs_sync_default_branch"
+ALL="concurrent_append fence_forgery tokenizer docs_relevance_gate deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked token_not_in_argv tunnel_cause auth_check docs_sync_default_branch"
 for t in ${*:-$ALL}; do "test_$t"; done
 echo "passed $PASS, failed $FAIL, skipped $SKIP  (scratch: $TMP)"
 [[ "$FAIL" -eq 0 ]]

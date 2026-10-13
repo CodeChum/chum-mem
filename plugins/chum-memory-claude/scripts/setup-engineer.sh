@@ -14,11 +14,12 @@
 #
 # Steps, each skipped when already done: jq + Google Cloud SDK (Homebrew),
 # `gcloud auth login` (browser), the launchd IAP tunnel agent on
-# localhost:63001, the token, the MCP env var in ~/.zshenv. Safe to re-run;
+# localhost:63001, a launchd sign-in check that asks you to log in again when
+# the gcloud login expires, the token, the MCP env var in ~/.zshenv. Safe to re-run;
 # re-run after an admin rotates your token.
 #
 # Env: CHUM_TOKEN_FILE=<path>  read the token from a file instead of Secret Manager
-#      CHUM_SETUP_LABEL / CHUM_LOCAL_PORT  launchd label / local port (tests)
+#      CHUM_SETUP_LABEL / CHUM_AUTH_CHECK_LABEL / CHUM_LOCAL_PORT  launchd labels / local port (tests)
 set -uo pipefail
 PROJECT="${CHUM_GCP_PROJECT:-gradechum}"
 ZONE="${CHUM_GCP_ZONE:-asia-east1-b}"
@@ -29,6 +30,9 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="$HOME/Library/Logs/$LABEL.log"
 TOKEN_DIR="$HOME/.config/chum-mem"
 TOKEN_FILE="$TOKEN_DIR/token"
+AUTH_LABEL="${CHUM_AUTH_CHECK_LABEL:-com.codechum.chum-mem-auth-check}"
+AUTH_PLIST="$HOME/Library/LaunchAgents/$AUTH_LABEL.plist"
+AUTH_CHECK="$TOKEN_DIR/tunnel-auth-check.sh"
 API="http://localhost:$PORT"
 ok()   { printf '  ok    %s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
@@ -54,7 +58,13 @@ fi
 ok "gcloud ($GCLOUD)"
 
 step "2/6 Google login"
-if "$GCLOUD" auth print-access-token >/dev/null 2>&1; then
+# print-access-token exits 0 with a dead token once session control has expired
+# the login, so ask Google whether the token is valid (POST keeps it out of argv).
+login_ok() {
+  local t; t="$("$GCLOUD" auth print-access-token 2>/dev/null)" || return 1
+  [[ -n "$t" ]] && curl -sf -o /dev/null --max-time 10 -X POST --data @- https://oauth2.googleapis.com/tokeninfo <<<"access_token=$t"
+}
+if login_ok; then
   ok "logged in as $("$GCLOUD" config get-value account 2>/dev/null)"
 else
   echo "  a browser window opens: log in with your @codechum.com Google account"
@@ -102,6 +112,33 @@ EOF
     fail "tunnel not up. Most likely an admin has not added you yet: ask them to run deploy-vm.sh add-user $("$GCLOUD" config get-value account 2>/dev/null), then re-run."
   fi
 fi
+# Sign-in check: every 5 minutes, asks you to sign in again once Workspace
+# session control expires the gcloud login (24 h). Copied out of the checkout so
+# switching branches cannot remove it.
+GPY="${GPY:-$("$GCLOUD" info --format='value(basic.python_location)' 2>/dev/null || true)}"
+mkdir -p "$TOKEN_DIR" && chmod 700 "$TOKEN_DIR"
+cp "$(cd "$(dirname "$0")" && pwd)/tunnel-auth-check.sh" "$AUTH_CHECK" || fail "could not copy tunnel-auth-check.sh to $AUTH_CHECK"
+cat > "$AUTH_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$AUTH_LABEL</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$AUTH_CHECK</string></array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/$AUTH_LABEL.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/$AUTH_LABEL.log</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>CLOUDSDK_PYTHON</key><string>${GPY:-/usr/bin/python3}</string>
+    <key>CHUM_GCLOUD</key><string>$GCLOUD</string>
+    <key>CHUM_TUNNEL_LOG</key><string>$LOG</string>
+    <key>CHUM_LOCAL_PORT</key><string>$PORT</string>
+  </dict>
+</dict></plist>
+EOF
+launchctl bootout "gui/$(id -u)" "$AUTH_PLIST" >/dev/null 2>&1 || true
+launchctl bootstrap "gui/$(id -u)" "$AUTH_PLIST" || fail "launchctl could not load $AUTH_PLIST"
+ok "sign-in check installed (asks you to sign in again when the gcloud login expires)"
 
 step "4/6 your token"
 check_token() { # $1 token -> HTTP code of an authenticated call
