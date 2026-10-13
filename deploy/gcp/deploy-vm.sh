@@ -73,12 +73,22 @@ require_secret_manager() {
 
 case "${1:-create}" in
   create)
-    # Firewall: allow SSH only from Google's IAP range, tagged instances only.
+    # Firewall: IAP's range only, tagged instances only. Two rules, each named for
+    # what breaks without it: on 2026-10-13 the old combined rule, named
+    # "...-allow-iap-ssh", was deleted as a duplicate SSH rule and every
+    # engineer's tunnel failed with IAP 4003. Priority 900 beats
+    # chum-mem-deny-api-non-iap (950).
+    if ! $G compute firewall-rules describe chum-mem-allow-iap-api >/dev/null 2>&1; then
+      $G compute firewall-rules create chum-mem-allow-iap-api \
+        --direction=INGRESS --action=ALLOW --rules=tcp:63001 --priority=900 \
+        --source-ranges=35.235.240.0/20 --target-tags=chum-mem \
+        --description="IAP TCP forwarding to chum-mem API (63001). Required by every engineer's tunnel; do not delete."
+    fi
     if ! $G compute firewall-rules describe chum-mem-allow-iap-ssh >/dev/null 2>&1; then
       $G compute firewall-rules create chum-mem-allow-iap-ssh \
-        --direction=INGRESS --action=ALLOW --rules=tcp:22,tcp:63001 \
+        --direction=INGRESS --action=ALLOW --rules=tcp:22 --priority=900 \
         --source-ranges=35.235.240.0/20 --target-tags=chum-mem \
-        --description="IAP TCP forwarding (SSH + API tunnel) to chum-mem"
+        --description="IAP SSH to chum-mem, used by deploy-vm.sh deploy/add-user/users"
     fi
     REF="$(resolve_ref "${CHUM_MEM_REF:-main}")"
     echo "Pinning the VM to chum-mem commit $REF"
