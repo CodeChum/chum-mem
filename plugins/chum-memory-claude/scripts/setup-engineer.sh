@@ -21,6 +21,10 @@
 # Env: CHUM_TOKEN_FILE=<path>  read the token from a file instead of Secret Manager
 #      CHUM_SETUP_LABEL / CHUM_AUTH_CHECK_LABEL / CHUM_LOCAL_PORT  launchd labels / local port (tests)
 set -uo pipefail
+# Bump whenever what this script installs changes (launchd jobs, their settings,
+# the copied tunnel-auth-check.sh). The hook compares it with the version this
+# script last recorded in ~/.config/chum-mem/setup-version and offers to re-run.
+SETUP_VERSION=2
 PROJECT="${CHUM_GCP_PROJECT:-gradechum}"
 ZONE="${CHUM_GCP_ZONE:-asia-east1-b}"
 VM="${CHUM_GCP_VM:-gradechum-chum-mem}"
@@ -185,6 +189,7 @@ step "6/6 check"
 code="$(check_token "$(tr -d '[:space:]' < "$TOKEN_FILE")")"
 [[ "$code" == "200" ]] || fail "authenticated call returned HTTP $code"
 ok "authenticated call works"
+printf '%s\n' "$SETUP_VERSION" > "$TOKEN_DIR/setup-version"
 
 cat <<'EOF'
 

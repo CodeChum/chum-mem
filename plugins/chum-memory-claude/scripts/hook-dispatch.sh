@@ -83,11 +83,14 @@ __notice_due() {  # $1 kind -> 0 when a notice of this kind may be shown now
 # the hook never waits on it. The hook is the only path that reaches an engineer
 # who never ran setup-engineer.sh (no launchd check yet). tunnel-auth-check.sh
 # keeps it to one dialog at a time and honours "Later". CHUM_FIX_DIALOG=0 disables.
-__fix_dialog() {
+__fix_dialog() {  # [$1 reason: "update"]
   [[ "${CHUM_FIX_DIALOG:-1}" == "1" && "$(uname -s)" == "Darwin" ]] || return 0
   case "$HOOK_EVENT" in SessionStart|UserPromptSubmit) ;; *) return 0 ;; esac
   [[ -f "${SCRIPTS_DIR}/tunnel-auth-check.sh" ]] || return 0
-  CHUM_REPO="$PROJECT_DIR" nohup /bin/bash "${SCRIPTS_DIR}/tunnel-auth-check.sh" </dev/null >/dev/null 2>&1 &
+  # Double fork: the dialog must not be a job of this shell. A bare `wait` later
+  # in the hook (auto-recall) would otherwise block, and under bash 5 spin, until
+  # the dialog is answered, holding the prompt.
+  ( CHUM_DIALOG_REASON="${1:-}" CHUM_REPO="$PROJECT_DIR" nohup /bin/bash "${SCRIPTS_DIR}/tunnel-auth-check.sh" </dev/null >/dev/null 2>&1 & )
 }
 __add_notice() {  # $1 text -> appended to SYSTEM_MSG, JSON-escaped (no surrounding quotes)
   local esc; esc=$(printf '%s' "$1" | jq -Rs '.' 2>/dev/null | sed 's/^"//;s/"$//')
@@ -239,6 +242,19 @@ if [[ "$API_HEALTHY" -eq 0 ]]; then
   esac
   exit 0
 fi
+
+# ── Setup update: setup-engineer.sh records the SETUP_VERSION it installed; when
+# the pulled scripts carry a newer one, offer to re-run it. Only for engineers
+# who ran setup (token file); the others get "Set up" once chum-mem fails.
+__setup_update_due() {
+  local want have
+  case "$HOOK_EVENT" in SessionStart|UserPromptSubmit) ;; *) return 1 ;; esac
+  [[ -s "$HOME/.config/chum-mem/token" ]] || return 1
+  want="$(sed -n 's/^SETUP_VERSION=\([0-9][0-9]*\).*/\1/p' "${SCRIPTS_DIR}/setup-engineer.sh" 2>/dev/null | head -1)"
+  have="$(tr -dc '0-9' 2>/dev/null < "$HOME/.config/chum-mem/setup-version")"
+  [[ -n "$want" && "${have:-0}" -lt "$want" ]]
+}
+__setup_update_due && __fix_dialog update
 
 # ── Resolve project identity (.chum-mem) ──
 CHUM_MEM_FILE="${PROJECT_DIR}/.chum-mem"
@@ -435,9 +451,11 @@ fetch_prompt_memory_escaped() {
   tmpd=$(mktemp -d "${TMPDIR:-/tmp}/chum-recall.XXXXXX") || return 1
   # A failed call (timeout, refused, HTTP error) leaves a .fail marker: it drops
   # the cached health result so the next hook checks /health again.
+  local pids=""
   if [[ "$AUTO_RECALL_SESSIONS" == "1" ]]; then
     { curl -sf $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
       -d "$body" "${api_url}/api/search" > "$tmpd/mem" 2>/dev/null || : > "$tmpd/mem.fail"; } &
+    pids="$pids $!"
   fi
   local docs_n="${CHUM_AUTO_RECALL_DOCS:-3}"
   if [[ "$docs_n" -gt 0 && -n "${CHUM_MEM_PROJECT_ID:-}" ]]; then
@@ -449,8 +467,11 @@ fetch_prompt_memory_escaped() {
     | curl -sf $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
         -H 'Accept: application/json, text/event-stream' --data-binary @- \
         "${api_url}/mcp?projectId=${CHUM_MEM_PROJECT_ID}" > "$tmpd/docs" 2>/dev/null || : > "$tmpd/docs.fail"; } &
+    pids="$pids $!"
   fi
-  wait
+  # Only these two calls: a bare `wait` also waits on jobs this subshell
+  # inherited, and bash 5 spins on those.
+  [[ -n "$pids" ]] && wait $pids
   resp=$(cat "$tmpd/mem" 2>/dev/null); docs=$(cat "$tmpd/docs" 2>/dev/null)
   if [[ -e "$tmpd/mem.fail" || -e "$tmpd/docs.fail" ]]; then __health_cache_drop; fi
   rm -rf "$tmpd"
