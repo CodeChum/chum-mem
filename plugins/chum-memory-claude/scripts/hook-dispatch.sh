@@ -454,7 +454,7 @@ fetch_prompt_memory_escaped() {
   local pids=""
   if [[ "$AUTO_RECALL_SESSIONS" == "1" ]]; then
     { curl -sf $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
-      -d "$body" "${api_url}/api/search" > "$tmpd/mem" 2>/dev/null || : > "$tmpd/mem.fail"; } &
+      -H 'X-Chum-Recall: auto' -d "$body" "${api_url}/api/search" > "$tmpd/mem" 2>/dev/null || : > "$tmpd/mem.fail"; } &
     pids="$pids $!"
   fi
   local docs_n="${CHUM_AUTO_RECALL_DOCS:-3}"
@@ -465,7 +465,7 @@ fetch_prompt_memory_escaped() {
       '{jsonrpc:"2.0", id:1, method:"tools/call", params:{name:"knowledge_query",
         arguments:{query:"search", text:$t, layer:"repository", projectId:$pid, limit:8}}}' \
     | curl -sf $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
-        -H 'Accept: application/json, text/event-stream' --data-binary @- \
+        -H 'Accept: application/json, text/event-stream' -H 'X-Chum-Recall: auto' --data-binary @- \
         "${api_url}/mcp?projectId=${CHUM_MEM_PROJECT_ID}" > "$tmpd/docs" 2>/dev/null || : > "$tmpd/docs.fail"; } &
     pids="$pids $!"
   fi

@@ -383,6 +383,20 @@ fn derive_atomic_claim_memories(
             }
             continue;
         }
+        // A subagent's final report reaches the session as a `prompt` event,
+        // but it is model output: taken as the engineer's words, every
+        // sentence naming an error became an admitted user-confirmed bug
+        // (412 of 607 live memories in the 2026-10-14 pilot review).
+        if is_subagent_report(&text) {
+            memories.extend(extract_model_text_claims(
+                session_id,
+                episode,
+                event,
+                &text,
+                ModelTextSource::SubagentReport,
+            ));
+            continue;
+        }
         if final_answers.contains(&event.id) {
             memories.extend(extract_model_text_claims(
                 session_id,
@@ -770,6 +784,9 @@ enum ModelTextSource {
     FinalAnswer,
     /// A compaction summary injected as a prompt: decision markers only (D5).
     CompactionSummary,
+    /// A subagent's final report delivered as a prompt: same rules as a final
+    /// answer.
+    SubagentReport,
 }
 
 fn extract_model_text_claims(
@@ -782,6 +799,7 @@ fn extract_model_text_claims(
     let (derivation, claim_source) = match source {
         ModelTextSource::FinalAnswer => ("assistant_answer_claim_v1", "assistant_final_answer"),
         ModelTextSource::CompactionSummary => ("compaction_summary_claim_v1", "compaction_summary"),
+        ModelTextSource::SubagentReport => ("subagent_report_claim_v1", "subagent_report"),
     };
     let cleaned = strip_template_noise(text);
     let mut claims = Vec::new();
@@ -1223,6 +1241,12 @@ fn reads_as_prose(text: &str) -> bool {
 /// and skill bodies, background-task notifications, local-command echoes and
 /// hook feedback. Checked on the start of the event text only, so a prompt
 /// that merely quotes one of these later on is still classified normally.
+/// Claude Code's frame around a subagent's final report
+/// (`<agent-message from="…">[Subagent hand-back] …`).
+fn is_subagent_report(text: &str) -> bool {
+    text.trim_start().starts_with("<agent-message")
+}
+
 fn is_compaction_summary(text: &str) -> bool {
     text.trim_start()
         .to_lowercase()
@@ -3325,6 +3349,56 @@ mod extraction_quality_tests {
             answer(2, "**The fix:** a request already in flight for a result now blocks a second one until it settles."),
         ]);
         assert!(got.iter().all(|(_, content)| !content.contains("**")), "{got:?}");
+    }
+
+    const SUBAGENT_REPORT: &str = "<agent-message from=\"ac5b0d5fdd6511b9b\">\n\
+        [Subagent hand-back] The text below is the final report of a subagent this session delegated to.\n\
+        Bug: 63 suites, 874 tests passed, none failed\n\
+        `src/services/connectivity-error.ts:19-21`: every ky `TimeoutError` is treated as device offline.\n\
+        You should get the \"camera is not running\" error rather than a crash.\n\
+        The root cause was the 10s ky default timeout; the fix was a 60s timeout on the upload client.\n\
+        </agent-message>";
+
+    #[test]
+    fn a_subagent_report_is_never_the_engineers_word() {
+        let memories = derive(&[prompt(1, SUBAGENT_REPORT)]);
+        assert!(
+            memories
+                .iter()
+                .all(|memory| memory.metadata["authorityClass"] != "user_confirmed"),
+            "{memories:?}"
+        );
+        assert!(
+            memories
+                .iter()
+                .all(|memory| memory.memory_type != MemoryType::Bug),
+            "{memories:?}"
+        );
+    }
+
+    #[test]
+    fn a_stated_fix_in_a_subagent_report_is_kept_as_model_text() {
+        let memories = derive(&[prompt(1, SUBAGENT_REPORT)]);
+        let fix = memories
+            .iter()
+            .find(|memory| memory.memory_type == MemoryType::Fix)
+            .expect("fix kept");
+        assert_eq!(fix.metadata["authorityClass"], "model_derived");
+        assert_eq!(fix.metadata["claimSource"], "subagent_report");
+        assert_eq!(fix.metadata["derivation"], "subagent_report_claim_v1");
+    }
+
+    #[test]
+    fn the_engineers_own_bug_report_is_still_user_confirmed() {
+        let memories = derive(&[prompt(
+            1,
+            "The export fails with a TimeoutError on sections over 200 students.",
+        )]);
+        let bug = memories
+            .iter()
+            .find(|memory| memory.memory_type == MemoryType::Bug)
+            .expect("bug kept");
+        assert_eq!(bug.metadata["authorityClass"], "user_confirmed");
     }
 
     #[test]

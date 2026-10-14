@@ -309,6 +309,8 @@ async fn ready(State(state): State<ApiState>) -> Result<Response, ApiError> {
 
 async fn search(
     State(state): State<ApiState>,
+    owner: Option<axum::Extension<TokenOwner>>,
+    headers: axum::http::HeaderMap,
     Json(input): Json<MemorySearchRequest>,
 ) -> Result<Response, ApiError> {
     input
@@ -317,7 +319,65 @@ async fn search(
     let response = perform_search(&state, input)
         .await
         .map_err(map_domain_error)?;
+    record_retrieval(
+        &state,
+        "memory.searched",
+        owner_email(&owner),
+        retrieval_via(&headers, "api"),
+        response.hits.iter().map(|hit| hit.id).collect(),
+    );
     Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// Pilot usage telemetry: who reads team memory, through which path, and what
+/// came back. The query text is never stored (a prompt can hold a secret the
+/// hook quarantines locally). Spawned and best effort: a failed write is
+/// logged and never fails or slows the read.
+fn record_retrieval(
+    state: &ApiState,
+    action: &'static str,
+    owner: Option<&str>,
+    via: String,
+    hit_ids: Vec<Uuid>,
+) {
+    let state = state.clone();
+    let owner = owner.map(str::to_string);
+    let hits = hit_ids.len();
+    let hit_ids: Vec<Uuid> = hit_ids.into_iter().take(10).collect();
+    tokio::spawn(async move {
+        let result: Result<(), DomainError> = async {
+            let mut tx = begin_tx(&state, &state.scope).await?;
+            insert_audit_log(
+                &mut tx,
+                &state.scope,
+                action,
+                "memory",
+                Uuid::new_v4(),
+                json!({ "tokenOwner": owner, "via": via, "hits": hits, "hitIds": hit_ids }),
+            )
+            .await?;
+            commit_tx(tx).await
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(?error, action, "could not record a retrieval audit log");
+        }
+    });
+}
+
+/// `auto-recall` when the hook made the call for a prompt (`X-Chum-Recall:
+/// auto`), else `default`: tells automatic recall apart from a search the
+/// model chose to run.
+fn retrieval_via(headers: &axum::http::HeaderMap, default: &str) -> String {
+    let auto = headers
+        .get("x-chum-recall")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("auto"));
+    if auto {
+        "auto-recall".to_string()
+    } else {
+        default.to_string()
+    }
 }
 
 
@@ -1050,6 +1110,7 @@ async fn handle_mcp_call(
     default_project_id: Option<Uuid>,
     is_admin: bool,
     owner: Option<&str>,
+    via: &str,
 ) -> Result<Value, String> {
     let raw_args = if let Some(a) = params.get("arguments") {
         a.clone()
@@ -1133,6 +1194,13 @@ async fn handle_mcp_call(
             let result = perform_search(state, input)
                 .await
                 .map_err(|e| format!("{e:?}"))?;
+            record_retrieval(
+                state,
+                "memory.searched",
+                owner,
+                format!("{via}:mem_search"),
+                result.hits.iter().map(|hit| hit.id).collect(),
+            );
             Ok(
                 json!({"content":[{"type":"text","text":serde_json::to_string(&result).unwrap_or_default()}],"structuredContent":result}),
             )
@@ -1198,6 +1266,13 @@ async fn handle_mcp_call(
             let result = perform_knowledge_query(state, input, layer.as_deref())
                 .await
                 .map_err(|e| format!("{e:?}"))?;
+            record_retrieval(
+                state,
+                "memory.searched",
+                owner,
+                format!("{via}:knowledge_query:{}", layer.as_deref().unwrap_or("any")),
+                Vec::new(),
+            );
             Ok(
                 json!({"content":[{"type":"text","text":serde_json::to_string(&result).unwrap_or_default()}],"structuredContent":result}),
             )
@@ -1224,6 +1299,13 @@ async fn handle_mcp_call(
             let result = perform_memory_get(state, memory_id)
                 .await
                 .map_err(|e| format!("{e:?}"))?;
+            record_retrieval(
+                state,
+                "memory.read",
+                owner,
+                format!("{via}:memory_get"),
+                vec![memory_id],
+            );
             Ok(
                 json!({"content":[{"type":"text","text":serde_json::to_string(&result).unwrap_or_default()}],"structuredContent":result}),
             )
@@ -1231,9 +1313,17 @@ async fn handle_mcp_call(
         "memory_get_batch" => {
             let input: MemoryBatchRequest =
                 serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
+            let ids = input.ids.clone();
             let result = perform_memory_batch(state, input.ids)
                 .await
                 .map_err(|e| format!("{e:?}"))?;
+            record_retrieval(
+                state,
+                "memory.read",
+                owner,
+                format!("{via}:memory_get_batch"),
+                ids,
+            );
             Ok(
                 json!({"content":[{"type":"text","text":serde_json::to_string(&result).unwrap_or_default()}],"structuredContent":{"memories":result}}),
             )
@@ -1319,6 +1409,7 @@ async fn mcp_post(State(state): State<ApiState>, request: Request) -> Result<Res
         .extensions()
         .get::<TokenOwner>()
         .map(|TokenOwner(email)| email.clone());
+    let via = retrieval_via(request.headers(), "mcp");
 
     let body_bytes = axum::body::to_bytes(request.into_body(), 8 * 1024 * 1024)
         .await
@@ -1407,7 +1498,7 @@ async fn mcp_post(State(state): State<ApiState>, request: Request) -> Result<Res
                 }
             }
 
-            let result = match handle_mcp_call(&state, method, &params, default_project_id, is_admin, owner.as_deref()).await {
+            let result = match handle_mcp_call(&state, method, &params, default_project_id, is_admin, owner.as_deref(), &via).await {
                 Ok(content) => jsonrpc_ok(&id, content),
                 Err(err) => jsonrpc_error(&id, -32000, &err),
             };
@@ -4193,9 +4284,12 @@ async fn derive_and_persist_session_memories(
         let keyed_by_claim = matches!(
             draft.memory_type,
             MemoryType::Decision | MemoryType::Constraint
-        ) || draft.metadata.get("proofType").and_then(Value::as_str) == Some("user_confirmation")
-            || draft.metadata.get("claimSource").and_then(Value::as_str)
-                == Some("assistant_final_answer");
+        ) || draft.metadata.get("proofType").and_then(Value::as_str)
+            == Some("user_confirmation")
+            || matches!(
+                draft.metadata.get("claimSource").and_then(Value::as_str),
+                Some("assistant_final_answer" | "subagent_report")
+            );
         let derivation_key = format!(
             "{}:{}:{}:{}{}",
             session_id,
