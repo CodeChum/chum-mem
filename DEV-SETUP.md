@@ -43,6 +43,48 @@ rebuild, restart). `/opt/chum-mem/deployed-refs.log` lists every deploy.
 The API refuses to start when `CHUM_MEM_API_TOKENS` is empty, unless
 `CHUM_MEM_ALLOW_NO_AUTH=1` is set (for a laptop-only stack; never on the VM).
 
+### Backups (enabled 2026-10-14)
+
+Two independent layers, both set up by `create` (or `enable-backups` on an
+older VM):
+
+- **Nightly database dump**: a systemd timer on the VM runs `pg_dump` at 02:30
+  PHT and uploads it to `gs://gradechum-chum-mem-backups/postgres/`
+  (`chum-mem-<UTC time>.dump`, custom format, about 25 MB in October 2026).
+  Dumps are deleted after 30 days. Embeddings live in Postgres, so a dump holds
+  everything; the typed vector partitions on disk can be rebuilt with
+  `POST /api/admin/reembed {projectId}`.
+- **Daily disk snapshot** at 06:00 PHT (`default-schedule-1`), kept 14 days,
+  also after the disk is deleted.
+
+The VM runs as `chum-mem-vm@gradechum.iam.gserviceaccount.com`, which may only
+write logs and metrics and *create* objects in the backup bucket. It cannot
+read, list, overwrite or delete a backup, so a compromised VM cannot destroy
+them.
+
+```bash
+deploy/gcp/deploy-vm.sh backups      # latest dumps and snapshots
+deploy/gcp/deploy-vm.sh backup-now   # run a dump now (prints the object name)
+```
+
+**Restore a dump** into a running stack. Stop the writers first, from
+`/opt/chum-mem/src` on the VM. The VM account cannot read the bucket, so stream
+the dump from your laptop:
+
+```bash
+deploy/gcp/deploy-vm.sh ssh   # then: cd /opt/chum-mem/src && sudo docker compose stop api worker web
+gcloud storage cat gs://gradechum-chum-mem-backups/postgres/<name>.dump \
+  | gcloud compute ssh gradechum-chum-mem --zone=asia-east1-b --tunnel-through-iap -- \
+    'cd /opt/chum-mem/src && sudo docker compose exec -T postgres sh -c "pg_restore -U \$POSTGRES_USER -d \$POSTGRES_DB --clean --if-exists --no-owner"'
+# then start the stack again: sudo google_metadata_script_runner startup
+```
+
+**Restore a snapshot**: create a disk from it
+(`gcloud compute disks create <name> --source-snapshot=<snapshot> --zone=asia-east1-b`)
+and boot a VM from it with the same service account, tags (`chum-mem`,
+`allow-ssh`) and metadata as `create` uses. Postgres recovers on its own: the
+snapshot is crash-consistent, like a power cut.
+
 ## 2. Monorepo (once)
 
 Branch `chum-mem-pilot/shared-project-id` was merged into `main` on 2026-10-09. It adds:
