@@ -367,8 +367,8 @@ test_tunnel_cause() {
     > "$logs/com.codechum.chum-mem-tunnel.log"
   out=$(hook "$r" "http://127.0.0.1:1" "$p" CHUM_NOTICES=1 CHUM_HEALTH_DOWN_SECS=0)
   check "4033 -> context tells Claude to have the user sign in" \
-    '[[ "$(jq -r .hookSpecificOutput.additionalContext <<<"$out")" == *"! gcloud auth login eng@codechum.com"* ]]'
-  check "4033 -> notice names the login command" '[[ "$(jq -r .systemMessage <<<"$out")" == *"gcloud login expired"*"gcloud auth login eng@codechum.com"* ]]'
+    '[[ "$(jq -r .hookSpecificOutput.additionalContext <<<"$out")" == *"! gcloud auth login eng@codechum.com --force"* ]]'
+  check "4033 -> notice names the login command" '[[ "$(jq -r .systemMessage <<<"$out")" == *"gcloud login expired"*"gcloud auth login eng@codechum.com --force"* ]]'
   check "the event is still spooled" '[[ -n "$(ls "$r/.chum-cache/outbox/" 2>/dev/null)" ]]'
   printf "Error while connecting [4033: 'not authorized'].\nError while connecting [4003: 'failed to connect to backend'].\n" \
     > "$logs/com.codechum.chum-mem-tunnel.log"
@@ -442,7 +442,7 @@ test_auth_check() {
   rmdir "$h/.config/chum-mem/.dialog-lock"
   ac "Sign in"
   check "4033 -> Sign in dialog naming the account" 'said "sign-in has expired" && said "eng@codechum.com"'
-  check "Sign in -> gcloud auth login for that account" '[[ "$(cat "$TMP/gcloud.log")" == "auth login eng@codechum.com --brief" ]]'
+  check "Sign in -> gcloud auth login for that account" '[[ "$(cat "$TMP/gcloud.log")" == "auth login eng@codechum.com --force --brief" ]]'
   check "reconnected -> success notification" 'said "connected again"'
   check "the lock is released" '[[ ! -d "$h/.config/chum-mem/.dialog-lock" ]]'
   : > "$h/tunnel.log"; : > "$FAKE_STATE/health-down"; reset
