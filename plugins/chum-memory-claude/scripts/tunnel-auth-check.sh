@@ -106,7 +106,9 @@ case "$CAUSE" in
 
 Sign in again as ${ACCOUNT:-your @codechum.com account}? A browser window opens." "Sign in")" == "Sign in" ]] || { snooze; exit 0; }
     # gcloud waits for the browser callback forever; give up after 10 minutes.
-    "$GCLOUD" auth login ${ACCOUNT:+"$ACCOUNT"} --brief >/dev/null 2>&1 &
+    # With an account named, gcloud reuses its stored (expired) credentials
+    # and opens no browser unless --force is given.
+    "$GCLOUD" auth login ${ACCOUNT:+"$ACCOUNT" --force} --brief >/dev/null 2>&1 &
     LOGIN_PID=$!
     for _ in $(seq 1 600); do kill -0 "$LOGIN_PID" 2>/dev/null || break; sleep 1; done
     kill "$LOGIN_PID" 2>/dev/null

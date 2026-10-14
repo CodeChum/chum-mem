@@ -207,7 +207,10 @@ if [[ "$API_HEALTHY" -eq 0 ]]; then
   TUNNEL_CAUSE="$(__tunnel_cause)"
   __fix_dialog
   if [[ "$TUNNEL_CAUSE" == "auth" ]]; then
-    LOGIN_CMD="gcloud auth login $(__gcloud_account)"; LOGIN_CMD="${LOGIN_CMD% }"
+    # With an account named, gcloud reuses its stored (expired) credentials
+    # and opens no browser unless --force is given.
+    LOGIN_ACCOUNT="$(__gcloud_account)"
+    LOGIN_CMD="gcloud auth login${LOGIN_ACCOUNT:+ $LOGIN_ACCOUNT --force}"
     UNAVAIL_MSG="ChumMemory is unreachable because the user's gcloud login has expired (IAP tunnel error 4033), so memory retrieval is unavailable. Tell the user to run \`! ${LOGIN_CMD}\` to sign in again; session events are spooled locally and sync once they do."
     __notice_due gcloud-auth && __add_notice "chum-mem: your gcloud login expired, so the IAP tunnel is refused (4033). Sign in again with:  ! ${LOGIN_CMD}  - queued events send once you do."
   elif [[ "$TUNNEL_CAUSE" == "backend" ]]; then
