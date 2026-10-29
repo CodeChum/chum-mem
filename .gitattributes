@@ -1,0 +1,6 @@
+# Bash and the files it reads: LF on every OS. Git for Windows checks text out as
+# CRLF by default, and a \r on each line breaks the secret patterns and jq input.
+*.sh text eol=lf
+*.txt text eol=lf
+*.py text eol=lf
+*.json text eol=lf
