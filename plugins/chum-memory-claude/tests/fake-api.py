@@ -12,6 +12,9 @@ Behaviour is switched at run time by files in <state-dir>:
   docs.json     body returned by POST /mcp             (default: no nodes)
   delay-ms      sleep this many milliseconds before every answer (tunnel latency)
   token-401     every request except GET /health answers 401 (token rejected)
+  tunnel-error  with health-down, each GET /health appends this file's first line
+                to the log named by its second line, as the tunnel agent logs
+                the IAP error of a refused connection
 Anything else is forwarded to [upstream-url] when given, else answered with a
 canned success.
 """
@@ -88,6 +91,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._log()
         self._delay()
         if self.path.startswith("/health"):
+            if flag("health-down") and flag("tunnel-error"):
+                with open(os.path.join(STATE, "tunnel-error")) as fh:
+                    line, log = fh.read().split("\n")[:2]
+                with open(log, "a") as fh:
+                    fh.write(line + "\n")
             return self._send(503 if flag("health-down") else 200, {"status": "ok"})
         if flag("token-401"):
             return self._send(401, {"error": "unauthorized"})

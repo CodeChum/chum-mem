@@ -376,6 +376,12 @@ test_tunnel_cause() {
   out=$(hook "$r" "http://127.0.0.1:1" "$p" CHUM_NOTICES=1 CHUM_HEALTH_DOWN_SECS=0)
   check "latest line wins: 4003 -> admin problem, no login advice" \
     '[[ "$(jq -r .systemMessage <<<"$out")" == *"cannot reach the chum-mem VM"* && "$out" != *"auth login"* ]]'
+  printf "Error while connecting [4033: 'not authorized'].\nERROR: [6401] Error during local connection to [('::1', 50122, 0, 0)]: [Errno 8] nodename nor servname provided, or not known\n" \
+    > "$logs/com.codechum.chum-mem-tunnel.log"
+  rm -f "$r/.chum-cache/.notice-"*
+  out=$(hook "$r" "http://127.0.0.1:1" "$p" CHUM_NOTICES=1 CHUM_HEALTH_DOWN_SECS=0)
+  check "a network error after a 4033 -> no login advice" \
+    '[[ "$(jq -r .systemMessage <<<"$out")" == *"API unreachable"* && "$out" != *"auth login"* ]]'
   touch -t 202001010000 "$logs/com.codechum.chum-mem-tunnel.log"
   rm -f "$r/.chum-cache/.notice-"*
   out=$(hook "$r" "http://127.0.0.1:1" "$p" CHUM_NOTICES=1 CHUM_HEALTH_DOWN_SECS=0)
@@ -429,12 +435,24 @@ test_auth_check() {
   check "no account -> plain gcloud auth login" '[[ "$(cat "$TMP/gcloud.log")" == "auth login --brief" ]]'
   printf 'account = eng@codechum.com\n' > "$h/.config/gcloud/configurations/config_default"
   : > "$FAKE_STATE/health-down"
-  echo "Error while connecting [4003: 'failed to connect to backend']." > "$h/tunnel.log"; reset
+  tunnel_logs() { printf '%s\n%s\n' "$1" "$h/tunnel.log" > "$FAKE_STATE/tunnel-error"; }
+  : > "$h/tunnel.log"; tunnel_logs "Error while connecting [4003: 'failed to connect to backend']."; reset
   ac "Set up" "http://127.0.0.1:1"
   check "offline -> no dialog" '[[ ! -s "$TMP/osascript.log" ]]'
   ac "OK"
   check "4003 -> server dialog, no login, no setup" 'said "cannot be reached" && [[ ! -s "$TMP/gcloud.log" && ! -s "$TMP/open.log" ]]'
-  echo "Error while connecting [4033: 'not authorized']." > "$h/tunnel.log"; reset
+  # A 4033 from an expiry already fixed stays in the log: it must not explain a later failure.
+  printf "ERROR: [6393] Error during local connection to [('::1', 63389, 0, 0)]: Error while connecting [4033: 'not authorized'].\n" > "$h/tunnel.log"
+  rm -f "$FAKE_STATE/tunnel-error"; reset
+  ac "Sign in"
+  check "old 4033 in the log, nothing new logged -> no Sign in" '! said "sign-in has expired" && [[ ! -s "$TMP/gcloud.log" ]]'
+  tunnel_logs "ERROR: [6401] Error during local connection to [('::1', 50122, 0, 0)]: [Errno 8] nodename nor servname provided, or not known"; : > "$FAKE_STATE/health-down"; reset
+  ac "Sign in"
+  check "old 4033, then a network error (Mac woke up) -> no Sign in" '! said "sign-in has expired" && [[ ! -s "$TMP/gcloud.log" ]]'
+  tunnel_logs "Error while connecting [4047: 'Failed to lookup instance']."; : > "$FAKE_STATE/health-down"; reset
+  ac "Sign in"
+  check "old 4033, then a different IAP error -> no Sign in" '! said "sign-in has expired" && [[ ! -s "$TMP/gcloud.log" ]]'
+  tunnel_logs "Error while connecting [4033: 'not authorized']."; reset
   : > "$FAKE_STATE/health-down"
   mkdir "$h/.config/chum-mem/.dialog-lock"
   ac "Sign in"
@@ -445,7 +463,7 @@ test_auth_check() {
   check "Sign in -> gcloud auth login for that account" '[[ "$(cat "$TMP/gcloud.log")" == "auth login eng@codechum.com --force --brief" ]]'
   check "reconnected -> success notification" 'said "connected again"'
   check "the lock is released" '[[ ! -d "$h/.config/chum-mem/.dialog-lock" ]]'
-  : > "$h/tunnel.log"; : > "$FAKE_STATE/health-down"; reset
+  : > "$h/tunnel.log"; rm -f "$FAKE_STATE/tunnel-error"; : > "$FAKE_STATE/health-down"; reset
   ac "Later"
   check "down, cause unknown, still down on retry -> Set up dialog" 'said "not connected on this Mac"'
   rm -f "$FAKE_STATE/health-down"

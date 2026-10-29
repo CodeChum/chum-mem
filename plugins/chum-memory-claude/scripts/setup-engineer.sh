@@ -24,7 +24,7 @@ set -uo pipefail
 # Bump whenever what this script installs changes (launchd jobs, their settings,
 # the copied tunnel-auth-check.sh). The hook compares it with the version this
 # script last recorded in ~/.config/chum-mem/setup-version and offers to re-run.
-SETUP_VERSION=3
+SETUP_VERSION=4
 PROJECT="${CHUM_GCP_PROJECT:-gradechum}"
 ZONE="${CHUM_GCP_ZONE:-asia-east1-b}"
 VM="${CHUM_GCP_VM:-gradechum-chum-mem}"
