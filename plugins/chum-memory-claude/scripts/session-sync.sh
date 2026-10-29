@@ -425,6 +425,8 @@ post_event() {
   # The two JSON documents are handed to jq as files, not --argjson arguments:
   # a 1 MB tool output made jq fail with "Argument list too long" (argv cap
   # 1 MB on macOS, 128 KB per argument on Linux) and the event was lost.
+  # cap mirrors the server's per-string limit, so a screenshot Read is not
+  # uploaded (twice) through the tunnel only to be cut there.
   local full_payload tmp_p="/tmp/chum-session-payload-resp.$$.json" tmp_r="/tmp/chum-session-raw-resp.$$.json"
   printf '%s' "$payload_json" > "$tmp_p"
   printf '%s' "$HOOK_PAYLOAD" > "$tmp_r"
@@ -437,15 +439,24 @@ post_event() {
     --arg provider "$PROVIDER" \
     --slurpfile payload "$tmp_p" \
     --slurpfile rawPayload "$tmp_r" \
-    '{
+    'def cap:
+       if type == "object" then
+         with_entries(if .key == "base64" and (.value | type) == "string"
+           then .value = "[chum-mem: \(.value | length) chars of base64 omitted]"
+           else .value |= cap end)
+       elif type == "array" then map(cap)
+       elif type == "string" and length > 16384 then
+         .[:12288] + "\n[chum-mem: \(length - 14336) chars omitted]\n" + .[-2048:]
+       else . end;
+    {
       sessionId: $sessionId,
       eventId: $eventId,
       idempotencyKey: $idempotencyKey,
       provider: $provider,
       eventType: $eventType,
       eventTime: $eventTime,
-      payload: $payload[0],
-      rawPayload: $rawPayload[0]
+      payload: ($payload[0] | cap),
+      rawPayload: ($rawPayload[0] | cap)
     }')
   rm -f "$tmp_p" "$tmp_r"
 

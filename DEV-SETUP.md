@@ -395,6 +395,11 @@ responsibility.
   Claude Desktop and Cowork: **not captured** (no tunnel, no hooks there). The
   public-hostname path (Cloudflare Tunnel + Access + API token) is built but
   not deployed; it is the next step if cloud sessions are wanted.
+- Size: any single string over 16,384 characters in a captured event keeps
+  its first 12,288 and last 2,048 characters, with a
+  `[chum-mem: N chars omitted]` marker between them; a `base64` value, such as
+  a screenshot that Claude read, is replaced by a marker. The hook does this
+  before upload and the API again at ingest, for older hooks.
 
 ## What you get, and what you do not (yet)
 
