@@ -25,6 +25,11 @@ if [[ -n "${CHUM_TEST_TOKEN_FILE:-}" ]]; then  # a token-protected test stack: t
   mkdir -p "$TMP/home/.config/chum-mem"; ( umask 077; cp "$CHUM_TEST_TOKEN_FILE" "$TMP/home/.config/chum-mem/token" )
 fi
 PASS=0; FAIL=0; SKIP=0; FAKE_PIDS=""
+DARWIN=0; [[ "$(uname -s)" == Darwin ]] && DARWIN=1  # the fix-it dialogs are macOS only
+# The Windows jq.exe writes CRLF unless told not to (the hooks do the same).
+if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]] && command jq -b -n 1 >/dev/null 2>&1; then
+  jq() { command jq -b "$@"; }
+fi
 PID_FAKE="cbcbcbcb-0000-4000-8000-0000000000ff"
 
 cleanup() { for p in $FAKE_PIDS; do kill "$p" 2>/dev/null; done; }
@@ -366,9 +371,10 @@ test_tunnel_cause() {
   printf "ConnectionCreationError: Error while connecting [4003: 'failed to connect to backend'].\nConnectionCreationError: Error while connecting [4033: 'not authorized'].\n" \
     > "$logs/com.codechum.chum-mem-tunnel.log"
   out=$(hook "$r" "http://127.0.0.1:1" "$p" CHUM_NOTICES=1 CHUM_HEALTH_DOWN_SECS=0)
+  local gc=gcloud; [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]] && gc=gcloud.cmd
   check "4033 -> context tells Claude to have the user sign in" \
-    '[[ "$(jq -r .hookSpecificOutput.additionalContext <<<"$out")" == *"! gcloud auth login eng@codechum.com --force"* ]]'
-  check "4033 -> notice names the login command" '[[ "$(jq -r .systemMessage <<<"$out")" == *"gcloud login expired"*"gcloud auth login eng@codechum.com --force"* ]]'
+    '[[ "$(jq -r .hookSpecificOutput.additionalContext <<<"$out")" == *"! $gc auth login eng@codechum.com --force"* ]]'
+  check "4033 -> notice names the login command" '[[ "$(jq -r .systemMessage <<<"$out")" == *"gcloud login expired"*"$gc auth login eng@codechum.com --force"* ]]'
   check "the event is still spooled" '[[ -n "$(ls "$r/.chum-cache/outbox/" 2>/dev/null)" ]]'
   printf "Error while connecting [4033: 'not authorized'].\nError while connecting [4003: 'failed to connect to backend'].\n" \
     > "$logs/com.codechum.chum-mem-tunnel.log"
@@ -386,12 +392,24 @@ test_tunnel_cause() {
   rm -f "$r/.chum-cache/.notice-"*
   out=$(hook "$r" "http://127.0.0.1:1" "$p" CHUM_NOTICES=1 CHUM_HEALTH_DOWN_SECS=0)
   check "a stale log -> the generic unreachable notice" '[[ "$(jq -r .systemMessage <<<"$out")" == *"API unreachable"* ]]'
-  rm -rf "$logs" "$TMP/home/.config/gcloud"
+  rm -rf "$logs"
+  # Windows: setup-engineer.sh logs the tunnel to ~/.config/chum-mem/tunnel.log, and
+  # Git Bash must call gcloud.cmd.
+  mkdir -p "$TMP/home/.config/chum-mem"
+  printf "Error while connecting [4033: 'not authorized'].\n" > "$TMP/home/.config/chum-mem/tunnel.log"
+  rm -f "$r/.chum-cache/.notice-"*
+  out=$(hook "$r" "http://127.0.0.1:1" "$p" CHUM_NOTICES=1 CHUM_HEALTH_DOWN_SECS=0)
+  local want_cmd="gcloud auth login eng@codechum.com --force"
+  [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]] && want_cmd="gcloud.cmd auth login eng@codechum.com --force"
+  check "4033 in the Windows tunnel log -> login notice ($want_cmd)" '[[ "$(jq -r .systemMessage <<<"$out")" == *"$want_cmd"* ]]'
+  rm -f "$TMP/home/.config/chum-mem/tunnel.log"
+  rm -rf "$TMP/home/.config/gcloud"
 }
 
 # ── tunnel-auth-check.sh: the right dialog for every way chum-mem can be disconnected ──
 test_auth_check() {
   echo "auth_check"
+  [[ "$DARWIN" == 1 ]] || { skip "macOS dialogs"; return; }
   local h="$TMP/authhome" bin="$TMP/auth-bin" repo="$TMP/auth-repo" port
   mkdir -p "$h/.config/gcloud/configurations" "$h/.config/chum-mem" "$h/Library/LaunchAgents" "$bin" "$repo/.claude/chum-mem/scripts"
   : > "$repo/.claude/chum-mem/scripts/setup-engineer.sh"
@@ -472,6 +490,7 @@ test_auth_check() {
 # ── the hook starts the dialog check when chum-mem is unreachable ──
 test_hook_fix_dialog() {
   echo "hook_fix_dialog"
+  [[ "$DARWIN" == 1 ]] || { skip "macOS dialogs"; return; }
   local r p bin="$TMP/hookdlg-bin"
   r=$(mkrepo hookdlg)
   mkdir -p "$bin"
@@ -493,7 +512,7 @@ test_hook_fix_dialog() {
 # ── a newer SETUP_VERSION in the pulled scripts offers [Update] once setup has run ──
 test_setup_update() {
   echo "setup_update"
-  local r bin="$TMP/upd-bin" conf="$TMP/home/.config/chum-mem" want
+  local r bin="$TMP/upd-bin" conf="$TMP/home/.config/chum-mem" want out
   r=$(mkrepo upd)
   start_fake upd || { bad "fake api"; return; }
   mkdir -p "$bin" "$conf"
@@ -508,6 +527,14 @@ test_setup_update() {
     for _ in 1 2 3 4 5 6; do [[ -s "$TMP/upd-osascript.log" ]] && break; sleep 0.5; done
   }
   shown() { grep -q "update is available" "$TMP/upd-osascript.log"; }
+  if [[ "$DARWIN" != 1 ]]; then  # no dialogs: a notice that names the setup command
+    echo tok > "$conf/token"; echo "$((want - 1))" > "$conf/setup-version"; rm -f "$r/.chum-cache/.notice-"*
+    out=$(hook "$r" "$FAKE_URL" "$(payload UserPromptSubmit upd "$r" '{"prompt":"where is the bonus toggle?"}')" CHUM_NOTICES=1)
+    check "older version -> update notice naming the setup command" \
+      '[[ "$(jq -r .systemMessage <<<"$out")" == *"update is available"*"setup-engineer.sh"* ]]'
+    rm -f "$conf/token" "$conf/setup-version"
+    return
+  fi
   up UserPromptSubmit
   check "never set up (no token) -> no update dialog" '! shown'
   echo tok > "$conf/token"
@@ -533,6 +560,7 @@ test_setup_update() {
 # ── an open dialog never holds the hook (it is not the hook's job, so no `wait` sees it) ──
 test_dialog_detached() {
   echo "dialog_detached"
+  [[ "$DARWIN" == 1 ]] || { skip "macOS dialogs"; return; }
   local r bin="$TMP/det-bin" conf="$TMP/home/.config/chum-mem" b bashes="$BASH_BIN" hb
   # Claude Code runs the hook with the `bash` on PATH (Homebrew bash 5 on most
   # Macs), which treats a leftover background job differently from /bin/bash 3.2.
@@ -600,6 +628,21 @@ test_token_not_in_argv() {
   check "curl was called" '[[ $(wc -l < "$wrap/argv.log") -ge 3 ]]'
   check "the API received X-Chum-Token" 'grep -qxF "$tok" "$FAKE_STATE/tokens.log" 2>/dev/null'
   check "the token is in no curl argv" '! grep -qF "$tok" "$wrap/argv.log"'
+  check "the session's events reached the API" 'grep -q "^POST /v1/ingest/session/event" "$FAKE_STATE/requests.log"'
+}
+
+# ── the token header still works when HOME has a space (Windows: C:\Users\First Last) ──
+test_token_home_with_space() {
+  echo "token_home_with_space"
+  local r tok home="$TMP/home with space"
+  tok="space-token-$RANDOM$RANDOM"
+  r=$(mkrepo tokspace)
+  start_fake tokspace || { bad "fake api"; return; }
+  mkdir -p "$home/.config/chum-mem"; ( umask 077; printf '%s' "$tok" > "$home/.config/chum-mem/token" )
+  printf '%s' "$(payload UserPromptSubmit tsp-1 "$r" '{"prompt":"please check the export queue"}')" \
+    | env -i PATH="$PATH" HOME="$home" TMPDIR="$TMP" CHUM_MEMORY_API_URL="$FAKE_URL" CLAUDE_PROJECT_DIR="$r" \
+        CHUM_NOTICES=0 CHUM_FIX_DIALOG=0 "$BASH_BIN" "$r/.claude/chum-mem/scripts/hook-dispatch.sh" >/dev/null 2>&1
+  check "token file under a HOME with a space -> the API received it" 'grep -qxF "$tok" "$FAKE_STATE/tokens.log" 2>/dev/null'
 }
 
 # ── review 2, finding 5: docs sync follows the default branch, needs no python3 ──
@@ -660,7 +703,7 @@ test_docs_sync_default_branch() {
   check "snapshot unchanged by the stale checkout" '[[ "$(export_files "$p")" == "docs/a.md " ]]'
 }
 
-ALL="concurrent_append fence_forgery tokenizer docs_relevance_gate deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked token_not_in_argv tunnel_cause auth_check hook_fix_dialog setup_update dialog_detached docs_sync_default_branch"
+ALL="concurrent_append fence_forgery tokenizer docs_relevance_gate deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked token_not_in_argv token_home_with_space tunnel_cause auth_check hook_fix_dialog setup_update dialog_detached docs_sync_default_branch"
 for t in ${*:-$ALL}; do "test_$t"; done
 echo "passed $PASS, failed $FAIL, skipped $SKIP  (scratch: $TMP)"
 [[ "$FAIL" -eq 0 ]]
