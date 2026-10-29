@@ -324,7 +324,7 @@ async fn search(
         "memory.searched",
         owner_email(&owner),
         retrieval_via(&headers, "api"),
-        response.hits.iter().map(|hit| hit.id).collect(),
+        response.hits.iter().map(|hit| hit.id.to_string()).collect(),
     );
     Ok((StatusCode::OK, Json(response)).into_response())
 }
@@ -338,12 +338,12 @@ fn record_retrieval(
     action: &'static str,
     owner: Option<&str>,
     via: String,
-    hit_ids: Vec<Uuid>,
+    hit_ids: Vec<String>,
 ) {
     let state = state.clone();
     let owner = owner.map(str::to_string);
     let hits = hit_ids.len();
-    let hit_ids: Vec<Uuid> = hit_ids.into_iter().take(10).collect();
+    let hit_ids: Vec<String> = hit_ids.into_iter().take(10).collect();
     tokio::spawn(async move {
         let result: Result<(), DomainError> = async {
             let mut tx = begin_tx(&state, &state.scope).await?;
@@ -1199,7 +1199,7 @@ async fn handle_mcp_call(
                 "memory.searched",
                 owner,
                 format!("{via}:mem_search"),
-                result.hits.iter().map(|hit| hit.id).collect(),
+                result.hits.iter().map(|hit| hit.id.to_string()).collect(),
             );
             Ok(
                 json!({"content":[{"type":"text","text":serde_json::to_string(&result).unwrap_or_default()}],"structuredContent":result}),
@@ -1271,7 +1271,7 @@ async fn handle_mcp_call(
                 "memory.searched",
                 owner,
                 format!("{via}:knowledge_query:{}", layer.as_deref().unwrap_or("any")),
-                Vec::new(),
+                result.nodes.iter().map(|node| node.id.clone()).collect(),
             );
             Ok(
                 json!({"content":[{"type":"text","text":serde_json::to_string(&result).unwrap_or_default()}],"structuredContent":result}),
@@ -1304,7 +1304,7 @@ async fn handle_mcp_call(
                 "memory.read",
                 owner,
                 format!("{via}:memory_get"),
-                vec![memory_id],
+                vec![memory_id.to_string()],
             );
             Ok(
                 json!({"content":[{"type":"text","text":serde_json::to_string(&result).unwrap_or_default()}],"structuredContent":result}),
@@ -1322,7 +1322,7 @@ async fn handle_mcp_call(
                 "memory.read",
                 owner,
                 format!("{via}:memory_get_batch"),
-                ids,
+                ids.iter().map(Uuid::to_string).collect(),
             );
             Ok(
                 json!({"content":[{"type":"text","text":serde_json::to_string(&result).unwrap_or_default()}],"structuredContent":{"memories":result}}),
@@ -1918,10 +1918,10 @@ async fn perform_session_event(
             event_time: input.event_time.clone(),
             event_id: input.event_id.clone(),
             idempotency_key: input.idempotency_key.clone(),
-            payload: sanitize_json_value(
+            payload: cap_event_strings(sanitize_json_value(
                 serde_json::to_value(input.payload).expect("payload serializes"),
-            ),
-            raw_payload: sanitize_json_value(input.raw_payload),
+            )),
+            raw_payload: cap_event_strings(sanitize_json_value(input.raw_payload)),
             turn_id: input.turn_id.clone(),
         },
     )
@@ -2055,10 +2055,10 @@ async fn perform_session_events_batch(
                 event_time: event.event_time,
                 event_id: event.event_id,
                 idempotency_key: event.idempotency_key,
-                payload: sanitize_json_value(
+                payload: cap_event_strings(sanitize_json_value(
                     serde_json::to_value(event.payload).expect("payload serializes"),
-                ),
-                raw_payload: sanitize_json_value(event.raw_payload),
+                )),
+                raw_payload: cap_event_strings(sanitize_json_value(event.raw_payload)),
                 turn_id: event.turn_id,
             })
         })
@@ -2115,10 +2115,10 @@ async fn perform_session_events_bulk(
                 event_time: event.event_time,
                 event_id: event.event_id,
                 idempotency_key: event.idempotency_key,
-                payload: sanitize_json_value(
+                payload: cap_event_strings(sanitize_json_value(
                     serde_json::to_value(event.payload).expect("payload serializes"),
-                ),
-                raw_payload: sanitize_json_value(event.raw_payload),
+                )),
+                raw_payload: cap_event_strings(sanitize_json_value(event.raw_payload)),
                 turn_id: event.turn_id,
             })
         })
@@ -6400,6 +6400,48 @@ fn sanitize_json_value(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+const EVENT_STRING_MAX_CHARS: usize = 16_384;
+const EVENT_STRING_HEAD_CHARS: usize = 12_288;
+const EVENT_STRING_TAIL_CHARS: usize = 2_048;
+
+/// Bounds what one captured event can store. Tool results arrive whole: a Read
+/// of a screenshot is ~680 KB of base64, and every event is stored twice
+/// (payload and raw_payload). Long text keeps its head and tail, where commands
+/// print their result; base64 is dropped, since no part of it is useful.
+fn cap_event_strings(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => serde_json::Value::String(cap_event_text(text)),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(cap_event_strings).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, value)| match value {
+                    serde_json::Value::String(text)
+                        if key == "base64" && !text.starts_with("[chum-mem:") =>
+                    {
+                        let omitted = format!("[chum-mem: {} chars of base64 omitted]", text.len());
+                        (key, serde_json::Value::String(omitted))
+                    }
+                    other => (key, cap_event_strings(other)),
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn cap_event_text(text: String) -> String {
+    let total = text.chars().count();
+    if total <= EVENT_STRING_MAX_CHARS {
+        return text;
+    }
+    let head: String = text.chars().take(EVENT_STRING_HEAD_CHARS).collect();
+    let tail: String = text.chars().skip(total - EVENT_STRING_TAIL_CHARS).collect();
+    let omitted = total - EVENT_STRING_HEAD_CHARS - EVENT_STRING_TAIL_CHARS;
+    format!("{head}\n[chum-mem: {omitted} chars omitted]\n{tail}")
+}
+
 fn truncate(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         return value.to_string();
@@ -6484,6 +6526,43 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
     use uuid::Uuid;
+
+    #[test]
+    fn capped_event_keeps_head_and_tail_and_drops_base64() {
+        let long = format!("{}{}", "a".repeat(20_000), "TAIL-RESULT");
+        let image = "Q".repeat(500_000);
+        let capped = cap_event_strings(json!({
+            "metadata": {"output": {"stdout": long, "file": {"base64": image, "type": "image/png"}},
+                         "short": "unchanged"},
+            "list": ["x".repeat(16_384)]
+        }));
+        let stdout = capped["metadata"]["output"]["stdout"].as_str().unwrap();
+        assert!(stdout.starts_with(&"a".repeat(12_288)));
+        assert!(stdout.ends_with("TAIL-RESULT"));
+        assert!(stdout.contains("[chum-mem: 5675 chars omitted]"));
+        assert!(stdout.chars().count() < 16_384 + 64);
+        assert_eq!(
+            capped["metadata"]["output"]["file"]["base64"],
+            "[chum-mem: 500000 chars of base64 omitted]"
+        );
+        assert_eq!(capped["metadata"]["output"]["file"]["type"], "image/png");
+        assert_eq!(capped["metadata"]["short"], "unchanged");
+        assert_eq!(capped["list"][0].as_str().unwrap().len(), 16_384);
+    }
+
+    #[test]
+    fn a_hook_capped_base64_keeps_its_original_length() {
+        let marker = "[chum-mem: 680342 chars of base64 omitted]";
+        let capped = cap_event_strings(json!({"file": {"base64": marker}}));
+        assert_eq!(capped["file"]["base64"], marker);
+    }
+
+    #[test]
+    fn capped_event_counts_characters_not_bytes() {
+        let text = "é".repeat(16_385);
+        let capped = cap_event_text(text);
+        assert!(capped.contains("[chum-mem: 2049 chars omitted]"));
+    }
 
     pub(super) fn test_state() -> ApiState {
         let values = std::collections::HashMap::from([
@@ -6934,6 +7013,51 @@ mod tests {
                 .await
                 .expect("reconcile chunk should succeed");
             tx.commit().await.expect("reconcile tx commit");
+        }
+    }
+
+    #[tokio::test]
+    async fn integration_search_accepts_tsquery_syntax_in_the_query() {
+        let Some(state) = integration_state(Uuid::new_v4()).await else {
+            return;
+        };
+        ingest_session(
+            &state,
+            "tsquery-syntax-1",
+            "app.py",
+            &[(
+                "Decision: read the grading row with select_for_update in app.py:69",
+                CanonicalEventType::Prompt,
+            )],
+        )
+        .await;
+
+        for query in [
+            "grading row -77 | api | app.py:69 | approv",
+            "it's O'Brien\\path c:\\x foo:bar <-> !x & (y)",
+        ] {
+            let result = perform_search(
+                &state,
+                MemorySearchRequest {
+                    query: query.to_string(),
+                    project_id: state.scope.project_id,
+                    session_id: None,
+                    provider: None,
+                    branch: None,
+                    types: Vec::new(),
+                    tags: Vec::new(),
+                    from: None,
+                    to: None,
+                    mode: SearchMode::Lexical,
+                    disclosure_level: DisclosureLevel::Overview,
+                    retrieval_intent: Some(RetrievalIntent::MemoryOnly),
+                    include_historical: Some(false),
+                    limit: 8,
+                    cursor: None,
+                },
+            )
+            .await;
+            assert!(result.is_ok(), "{query}: {result:?}");
         }
     }
 

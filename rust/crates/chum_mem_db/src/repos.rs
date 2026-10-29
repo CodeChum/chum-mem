@@ -2303,11 +2303,14 @@ pub async fn load_memory_search_rows(
           -- covers instead of 0.0 — otherwise every partial match ties at zero and
           -- the LIMIT below is decided by recency alone (a decision recorded a few
           -- minutes before unrelated chatter fell out of the top 5; F40).
+          -- Each lexeme is quoted before the OR'd tsquery is parsed: to_tsvector
+          -- keeps tokens such as `-77` or `app.py:69` that are tsquery syntax
+          -- when bare, and a prompt containing one failed the search with a 500.
           -- Normalisation 32 maps each rank to rank/(rank+1), so the sum stays
           -- below 1.5 and does not swamp the semantic score in the ranker.
           (ts_rank_cd(m.search_vector, websearch_to_tsquery('english', $4), 32)
            + 0.5 * ts_rank_cd(m.search_vector, coalesce(
-               (select to_tsquery('english', string_agg(lexeme, ' | '))
+               (select string_agg('''' || replace(replace(lexeme, '\', '\\'), '''', '''''') || '''', ' | ')::tsquery
                   from unnest(tsvector_to_array(to_tsvector('english', $4))) as lexeme),
                websearch_to_tsquery('english', $4)), 32))::float8 as lexical_score,
           null::float8 as semantic_score,
@@ -2392,7 +2395,7 @@ pub async fn load_memory_search_rows(
             -- require every word to match. Phrase/AND semantics still rank higher
             -- via ts_rank_cd on the full websearch query below.
             select coalesce(
-              (select to_tsquery('english', string_agg(lexeme, ' | '))
+              (select string_agg('''' || replace(replace(lexeme, '\', '\\'), '''', '''''') || '''', ' | ')::tsquery
                  from unnest(tsvector_to_array(to_tsvector('english', $4))) as lexeme),
               websearch_to_tsquery('english', $4))
           )

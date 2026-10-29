@@ -799,7 +799,7 @@ fn extract_model_text_claims(
     let (derivation, claim_source) = match source {
         ModelTextSource::FinalAnswer => ("assistant_answer_claim_v1", "assistant_final_answer"),
         ModelTextSource::CompactionSummary => ("compaction_summary_claim_v1", "compaction_summary"),
-        ModelTextSource::SubagentReport => ("subagent_report_claim_v1", "subagent_report"),
+        ModelTextSource::SubagentReport => ("subagent_report_claim_v2", "subagent_report"),
     };
     let cleaned = strip_template_noise(text);
     let mut claims = Vec::new();
@@ -812,6 +812,7 @@ fn extract_model_text_claims(
         if !(30..=400).contains(&length)
             || looks_like_code_line(&segment)
             || is_non_claim_fragment(&segment)
+            || (source == ModelTextSource::SubagentReport && is_report_only_fragment(&segment))
         {
             continue;
         }
@@ -945,6 +946,66 @@ fn is_non_claim_fragment(segment: &str) -> bool {
         return true;
     }
     trimmed.chars().count() < 80 && trimmed.matches('"').count() % 2 == 1
+}
+
+/// A subagent report is written for the session that dispatched it, so many of
+/// its lines only make sense next to the rest of the report: the reviewer's own
+/// process ("I verified by reading code only."), verdicts ("Overall: ...",
+/// "Verdict: ..."), pointers into the report ("Fix: close the previous
+/// finding.", "in F1, ...", "verified below"), and lines the segmenter cut
+/// mid-sentence ("update the subtotal ...", "... e.g.", an unmatched ")").
+fn is_report_only_fragment(segment: &str) -> bool {
+    let trimmed = segment.replace("**", "");
+    let trimmed = trimmed.trim();
+    let lower = trimmed.to_lowercase();
+    // "; " also splits segments, so "...; the fix was X." starts lowercase legitimately.
+    if trimmed.starts_with(|ch: char| ch.is_lowercase()) && !has_fix_marker(&lower) {
+        return true;
+    }
+    if [
+        "i ",
+        "i'",
+        "overall:",
+        "verdict:",
+        "confidence:",
+        "summary:",
+        "so ",
+        "same ",
+    ]
+    .iter()
+    .any(|opener| lower.starts_with(opener))
+    {
+        return true;
+    }
+    let end = lower.trim_end_matches(['*', '_']);
+    if !end.ends_with(['.', '!', ';', ')', '`', '"'])
+        || end.ends_with("e.g.")
+        || end.ends_with("i.e.")
+    {
+        return true;
+    }
+    if trimmed.matches('(').count() != trimmed.matches(')').count()
+        || trimmed.matches('`').count() % 2 == 1
+    {
+        return true;
+    }
+    let words: Vec<&str> = lower
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let report_label = words.iter().any(|word| {
+        let mut chars = word.chars();
+        chars.next() == Some('f') && word.len() > 1 && chars.all(|ch| ch.is_ascii_digit())
+    });
+    let points_into_report = words.windows(2).any(|pair| {
+        (matches!(pair[0], "previous" | "next" | "this" | "that")
+            && matches!(pair[1], "finding" | "point" | "item"))
+            || (matches!(pair[0], "point" | "item" | "step")
+                && pair[1].chars().all(|ch| ch.is_ascii_digit()))
+    });
+    report_label
+        || points_into_report
+        || words.iter().any(|word| matches!(*word, "above" | "below"))
 }
 
 /// Fix markers. "fix:" must start a word ("hotfix:" is not one), and a root
@@ -3385,7 +3446,48 @@ mod extraction_quality_tests {
             .expect("fix kept");
         assert_eq!(fix.metadata["authorityClass"], "model_derived");
         assert_eq!(fix.metadata["claimSource"], "subagent_report");
-        assert_eq!(fix.metadata["derivation"], "subagent_report_claim_v1");
+        assert_eq!(fix.metadata["derivation"], "subagent_report_claim_v2");
+    }
+
+    const SUBAGENT_REPORT_WITH_FRAGMENTS: &str = "<agent-message from=\"bd61c2e0aa5512c7f\">\n\
+        [Subagent hand-back] The text below is the final report of a subagent this session delegated to.\n\
+        I verified by reading code only.\n\
+        Overall: no verified defects, the fix is confirmed and ready for PR.\n\
+        Fix: close the previous finding before opening the next review round.\n\
+        Fix: in F1, limit the check script to pages that have exactly one entry.\n\
+        the user confirmed the FE/API pairing for the release flag).\n\
+        Fix: add a lock-protected flag to `SessionState`, e.g.\n\
+        Fix: read the row with `select_for_update()` so the check and the write happen under one row lock.\n\
+        Root cause: `hasRubrics` was `rubrics.length > 0`, which only sees the old criteria rubrics.\n\
+        </agent-message>";
+
+    #[test]
+    fn report_only_lines_of_a_subagent_report_are_not_stored() {
+        let memories = derive(&[prompt(1, SUBAGENT_REPORT_WITH_FRAGMENTS)]);
+        let contents: Vec<&str> = memories
+            .iter()
+            .filter(|memory| memory.metadata["claimSource"] == "subagent_report")
+            .map(|memory| memory.content.as_str())
+            .collect();
+        assert_eq!(
+            contents,
+            vec![
+                "Fix: read the row with `select_for_update()` so the check and the write happen under one row lock.",
+                "Root cause: `hasRubrics` was `rubrics.length > 0`, which only sees the old criteria rubrics.",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_report_fragment_filter_leaves_final_answers_alone() {
+        let got = claims(&[
+            prompt(1, "what was the fix?"),
+            answer(
+                2,
+                "I confirmed the fix: the export now pages through sections in batches of 50.",
+            ),
+        ]);
+        assert!(!got.is_empty(), "{got:?}");
     }
 
     #[test]
