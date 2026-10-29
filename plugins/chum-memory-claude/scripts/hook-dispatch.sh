@@ -192,9 +192,10 @@ __tunnel_cause() {  # -> "auth", "backend" or nothing
     [[ -f "$f" ]] && { [[ -z "$log" || "$f" -nt "$log" ]] && log="$f"; }
   done
   [[ -n "$log" && -n "$(find "$log" -mmin -10 2>/dev/null)" ]] || return 0
-  case "$(tail -n 60 "$log" 2>/dev/null | grep -oE '\[40(03|33):|invalid_grant|[Rr]eauthentication' | tail -1)" in
-    "[4033:"|invalid_grant|[Rr]eauthentication) echo auth ;;
-    "[4003:") echo backend ;;
+  # The latest error decides: a failure logged after a 4033 is not a login problem.
+  case "$(tail -n 60 "$log" 2>/dev/null | grep -iE 'error|invalid_grant|reauthentication' | tail -1)" in
+    *"[4033:"*|*invalid_grant*|*[Rr]eauthentication*) echo auth ;;
+    *"[4003:"*) echo backend ;;
   esac
 }
 __gcloud_account() {  # active gcloud account, read from its config file (no gcloud spawn)

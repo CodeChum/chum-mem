@@ -56,6 +56,14 @@ token_rejected() {
 CFG="${CLOUDSDK_CONFIG:-$HOME/.config/gcloud}"
 ACCOUNT="$(sed -n 's/^account *= *//p' "$CFG/configurations/config_$(cat "$CFG/active_config" 2>/dev/null || echo default)" 2>/dev/null | head -1)"
 
+# Only what the tunnel logs for the probes below explains this failure. An
+# older 4033 from an expiry already fixed by signing in stays in the log, and
+# reading it would ask for a sign-in whenever chum-mem drops for another reason
+# (Mac waking from sleep, network change, VM redeploy).
+LOG_START=0
+[[ -n "$LOG" ]] && LOG_START="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
+LOG_START="${LOG_START:-0}"
+
 if [[ "${CHUM_DIALOG_REASON:-}" == "update" ]]; then
   CAUSE=update
 elif curl -sf --max-time 10 "$API/health" >/dev/null 2>&1; then
@@ -70,10 +78,13 @@ elif ! curl -s -o /dev/null --max-time 5 "${CHUM_ONLINE_URL:-https://www.gstatic
 else
   sleep 1  # the failed /health above is what makes the tunnel log its IAP error
   CAUSE=setup
-  if [[ -n "$LOG" && -n "$(find "$LOG" -mmin -10 2>/dev/null)" ]]; then
-    case "$(tail -n 60 "$LOG" 2>/dev/null | grep -oE '\[40(03|33):|invalid_grant|[Rr]eauthentication|active account' | tail -1)" in
-      "[4033:"|invalid_grant|[Rr]eauthentication|"active account") CAUSE=signin ;;
-      "[4003:") CAUSE=server ;;
+  if [[ -n "$LOG" ]]; then
+    LOG_NOW="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
+    (( ${LOG_NOW:-0} < LOG_START )) && LOG_START=0  # rotated or truncated
+    # The latest error decides: a failure logged after a 4033 is not a login problem.
+    case "$(tail -c +"$((LOG_START + 1))" "$LOG" 2>/dev/null | grep -iE 'error|invalid_grant|reauthentication|active account' | tail -1)" in
+      *"[4033:"*|*invalid_grant*|*[Rr]eauthentication*|*"active account"*) CAUSE=signin ;;
+      *"[4003:"*) CAUSE=server ;;
     esac
   fi
   # An unexplained failure is often a VM redeploy restarting the API: only
