@@ -1,0 +1,31 @@
+name: hook-tests
+on:
+  pull_request:
+    paths: ["plugins/chum-memory-claude/**", ".github/workflows/hook-tests.yml"]
+  push:
+    branches: [main]
+    paths: ["plugins/chum-memory-claude/**", ".github/workflows/hook-tests.yml"]
+permissions:
+  contents: read
+jobs:
+  hooks:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: hook tests (macOS /bin/bash 3.2)
+        if: runner.os == 'macOS'
+        run: BASH_BIN=/bin/bash bash plugins/chum-memory-claude/tests/hook-tests.sh
+      - name: hook tests (Git Bash)
+        if: runner.os == 'Windows'
+        run: BASH_BIN=bash bash plugins/chum-memory-claude/tests/hook-tests.sh
+      - name: setup on Windows
+        if: runner.os == 'Windows'
+        run: bash plugins/chum-memory-claude/tests/windows-setup-test.sh

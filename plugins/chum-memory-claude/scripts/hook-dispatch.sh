@@ -40,8 +40,13 @@ HOOK_PAYLOAD=$(cat)
 # jq is the one dependency macOS does not ship. Without it nothing below can parse
 # the payload; say so plainly instead of failing silently on every event.
 if ! command -v jq >/dev/null 2>&1; then
-  printf '{"systemMessage":"chum-mem: jq is not installed (brew install jq) - team memory is OFF; nothing from this session is captured or recalled."}\n'
+  case "$OSTYPE" in msys*|cygwin*) JQ_INSTALL="winget install jqlang.jq, then restart Claude Code" ;; *) JQ_INSTALL="brew install jq" ;; esac
+  printf '{"systemMessage":"chum-mem: jq is not installed (%s) - team memory is OFF; nothing from this session is captured or recalled."}\n' "$JQ_INSTALL"
   exit 0
+fi
+# The Windows jq.exe writes CRLF line ends unless told not to (-b).
+if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]] && command jq -b -n 1 >/dev/null 2>&1; then
+  jq() { command jq -b "$@"; }
 fi
 
 # Pause switch: CHUM_CAPTURE=0 (e.g. `CHUM_CAPTURE=0 claude` while handling
@@ -92,6 +97,10 @@ __fix_dialog() {  # [$1 reason: "update"]
   # the dialog is answered, holding the prompt.
   ( CHUM_DIALOG_REASON="${1:-}" CHUM_REPO="$PROJECT_DIR" nohup /bin/bash "${SCRIPTS_DIR}/tunnel-auth-check.sh" </dev/null >/dev/null 2>&1 & )
 }
+__uuid4() {  # uuidgen is missing on Windows and python3 there may be the Store stub
+  local h; h=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')
+  printf '%s-%s-4%s-%x%s-%s' "${h:0:8}" "${h:8:4}" "${h:13:3}" $(( (0x${h:16:1} & 3) | 8 )) "${h:17:3}" "${h:20:12}"
+}
 __add_notice() {  # $1 text -> appended to SYSTEM_MSG, JSON-escaped (no surrounding quotes)
   local esc; esc=$(printf '%s' "$1" | jq -Rs '.' 2>/dev/null | sed 's/^"//;s/"$//')
   [[ -n "$esc" ]] || return 0
@@ -108,8 +117,9 @@ if [[ -z "$API_URL" && -f "${PROJECT_DIR}/.chum-mem" ]]; then
 fi
 API_URL="${API_URL:-http://localhost:63001}"
 export CHUM_MEMORY_API_URL="$API_URL"
-# ── API token (optional): sent as X-Chum-Token on every call. Single-word
-# header so it can be expanded unquoted under bash 3.2 with `set -u`.
+# ── API token (optional): sent as X-Chum-Token on every call. Call sites expand
+# it as ${AUTH_HEADER:+"$AUTH_HEADER"}: nothing when unset (bash 3.2, `set -u`),
+# one word when the Windows header path has spaces.
 AUTH_HEADER=""
 # Token: env var first, else the file the installer writes (~/.config/chum-mem/token).
 if [[ -z "${CHUM_MEMORY_API_TOKEN:-}" && -r "${HOME}/.config/chum-mem/token" ]]; then
@@ -119,7 +129,18 @@ fi
 # (`-H @/dev/fd/9`), never in curl's argv where `ps` shows it to every user.
 # Each curl that sends $AUTH_HEADER also carries 9<<<"$AUTH_LINE".
 AUTH_LINE=""
-if [[ -n "${CHUM_MEMORY_API_TOKEN:-}" ]]; then AUTH_HEADER="-H@/dev/fd/9"; AUTH_LINE="X-Chum-Token: ${CHUM_MEMORY_API_TOKEN}"; fi
+if [[ -n "${CHUM_MEMORY_API_TOKEN:-}" ]]; then
+  AUTH_HEADER="-H@/dev/fd/9"; AUTH_LINE="X-Chum-Token: ${CHUM_MEMORY_API_TOKEN}"
+  # Git for Windows' curl is a native program and cannot open bash's /dev/fd/9,
+  # so there it reads the header from a file beside the token file. Backslash
+  # path: Git Bash rewrites a joined -H@C:/... argument into a broken one.
+  if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]; then
+    __hdr="$HOME/.config/chum-mem/token.header"
+    [[ "$(cat "$__hdr" 2>/dev/null)" == "$AUTH_LINE" ]] \
+      || ( umask 077; mkdir -p "${__hdr%/*}" && printf '%s\n' "$AUTH_LINE" > "$__hdr.$$" && mv -f "$__hdr.$$" "$__hdr" )
+    AUTH_HEADER="-H@$(cygpath -w "$__hdr")"
+  fi
+fi
 API_HEALTHY=1
 # Health gate. The default budget is 5 s (was 2 s): through the IAP tunnel a
 # healthy API answers in ~0.5 s idle but 1-2 s when several sessions share the
@@ -165,7 +186,7 @@ if __health_cached; then
   :
 elif __health_down_recent; then
   API_HEALTHY=0
-elif curl -sf $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time "$HEALTH_TIMEOUT" "${API_URL}/health" >/dev/null 2>&1; then
+elif curl -sf ${AUTH_HEADER:+"$AUTH_HEADER"} 9<<<"$AUTH_LINE" --max-time "$HEALTH_TIMEOUT" "${API_URL}/health" >/dev/null 2>&1; then
   rm -f "$HEALTH_DOWN" 2>/dev/null || true
   if [[ "$HEALTH_CACHE_SECS" -gt 0 ]] && mkdir -p "${PROJECT_DIR}/.chum-cache" 2>/dev/null; then
     printf '%s %s\n' "$(date +%s)" "$API_URL" > "${HEALTH_CACHE}.$$" 2>/dev/null \
@@ -188,7 +209,7 @@ export CHUM_API_HEALTHY="$API_HEALTHY"
 # says nothing about this failure.
 __tunnel_cause() {  # -> "auth", "backend" or nothing
   local f log=""
-  for f in "$HOME/Library/Logs/com.codechum.chum-mem-tunnel.log" "$HOME/Library/Logs/chum-mem-tunnel.log"; do
+  for f in "$HOME/Library/Logs/com.codechum.chum-mem-tunnel.log" "$HOME/Library/Logs/chum-mem-tunnel.log" "$HOME/.config/chum-mem/tunnel.log"; do
     [[ -f "$f" ]] && { [[ -z "$log" || "$f" -nt "$log" ]] && log="$f"; }
   done
   [[ -n "$log" && -n "$(find "$log" -mmin -10 2>/dev/null)" ]] || return 0
@@ -200,8 +221,9 @@ __tunnel_cause() {  # -> "auth", "backend" or nothing
 }
 __gcloud_account() {  # active gcloud account, read from its config file (no gcloud spawn)
   local d="${CLOUDSDK_CONFIG:-$HOME/.config/gcloud}" c
-  c="$(cat "$d/active_config" 2>/dev/null || echo default)"
-  sed -n 's/^account *= *//p' "$d/configurations/config_${c}" 2>/dev/null | head -1
+  [[ -z "${CLOUDSDK_CONFIG:-}" && -n "${APPDATA:-}" && ( "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ) ]] && d="$(cygpath -u "$APPDATA")/gcloud"
+  c="$(tr -d '\r' < "$d/active_config" 2>/dev/null || echo default)"
+  sed -n 's/^account *= *//p' "$d/configurations/config_${c:-default}" 2>/dev/null | tr -d '\r' | head -1
 }
 if [[ "$API_HEALTHY" -eq 0 ]]; then
   UNAVAIL_MSG="ChumMemory API unreachable at ${API_URL} — memory retrieval unavailable this turn; session events are being spooled locally and will sync later."
@@ -212,6 +234,8 @@ if [[ "$API_HEALTHY" -eq 0 ]]; then
     # and opens no browser unless --force is given.
     LOGIN_ACCOUNT="$(__gcloud_account)"
     LOGIN_CMD="gcloud auth login${LOGIN_ACCOUNT:+ $LOGIN_ACCOUNT --force}"
+    # In Git Bash the extensionless gcloud is the Linux sh script; gcloud.cmd is the Windows one.
+    [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]] && LOGIN_CMD="gcloud.cmd${LOGIN_CMD#gcloud}"
     UNAVAIL_MSG="ChumMemory is unreachable because the user's gcloud login has expired (IAP tunnel error 4033), so memory retrieval is unavailable. Tell the user to run \`! ${LOGIN_CMD}\` to sign in again; session events are spooled locally and sync once they do."
     __notice_due gcloud-auth && __add_notice "chum-mem: your gcloud login expired, so the IAP tunnel is refused (4033). Sign in again with:  ! ${LOGIN_CMD}  - queued events send once you do."
   elif [[ "$TUNNEL_CAUSE" == "backend" ]]; then
@@ -230,7 +254,11 @@ if [[ "$API_HEALTHY" -eq 0 ]]; then
   # Stop/SessionEnd makes Claude Code continue the conversation until --max-turns
   # (observed overnight: 8 looped sessions, ~$1.1 each) — so stay silent there.
   if [[ -z "$TUNNEL_CAUSE" ]] && __notice_due unreachable; then
-    __add_notice "chum-mem: API unreachable at ${API_URL} (no /health answer within ${HEALTH_TIMEOUT}s). Events are spooled to .chum-cache/outbox/ and replayed once it answers. If this persists, check the tunnel: ~/chum-mem/deploy/gcp/install-tunnel-agent.sh status"
+    if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]; then
+      __add_notice "chum-mem: API unreachable at ${API_URL} (no /health answer within ${HEALTH_TIMEOUT}s). Events are spooled to .chum-cache/outbox/ and replayed once it answers. Run the setup, which starts the tunnel and repairs whatever is missing:  ! bash .claude/chum-mem/scripts/setup-engineer.sh"
+    else
+      __add_notice "chum-mem: API unreachable at ${API_URL} (no /health answer within ${HEALTH_TIMEOUT}s). Events are spooled to .chum-cache/outbox/ and replayed once it answers. If this persists, check the tunnel: ~/chum-mem/deploy/gcp/install-tunnel-agent.sh status"
+    fi
   fi
   UNAVAIL_ESC=$(printf '%s' "$UNAVAIL_MSG" | jq -Rs '.' | sed 's/^"//;s/"$//')
   case "$HOOK_EVENT" in
@@ -258,7 +286,12 @@ __setup_update_due() {
   have="$(tr -dc '0-9' 2>/dev/null < "$HOME/.config/chum-mem/setup-version")"
   [[ -n "$want" && "${have:-0}" -lt "$want" ]]
 }
-__setup_update_due && __fix_dialog update
+if __setup_update_due; then
+  # No dialogs outside macOS: say it once per 10 minutes instead.
+  if [[ "$(uname -s)" == "Darwin" ]]; then __fix_dialog update
+  elif __notice_due update; then __add_notice "chum-mem: an update is available for this machine. Run:  ! bash .claude/chum-mem/scripts/setup-engineer.sh"
+  fi
+fi
 
 # ── Resolve project identity (.chum-mem) ──
 CHUM_MEM_FILE="${PROJECT_DIR}/.chum-mem"
@@ -283,15 +316,8 @@ elif [[ -n "${CHUM_MEM_PROJECT_ID:-}" ]]; then
   CANDIDATE_PROJECT_ID="$CHUM_MEM_PROJECT_ID"
 else
   # Auto-register project via API using a local project id, not a git remote.
-  if command -v uuidgen >/dev/null 2>&1; then
-    CANDIDATE_PROJECT_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
-  else
-    CANDIDATE_PROJECT_ID=$(python3 - <<'PY'
-import uuid
-print(uuid.uuid4())
-PY
-)
-  fi
+  CANDIDATE_PROJECT_ID=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]')
+  [[ -n "$CANDIDATE_PROJECT_ID" ]] || CANDIDATE_PROJECT_ID=$(__uuid4)
 fi
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 # A committed .chum-mem id is registered on the server once per checkout per day
@@ -304,7 +330,7 @@ if [[ "$CHUM_MEM_EXISTED" -eq 1 && -e "$RESOLVE_MARKER" && -z "$(find "$RESOLVE_
 else
   RESOLVE_PAYLOAD=$(jq -n --arg projectId "$CANDIDATE_PROJECT_ID" --arg name "$PROJECT_NAME" \
     '{projectId: $projectId, name: $name}')
-  RESOLVE_RESP=$(curl -sf $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time 5 -X POST -H "Content-Type: application/json" \
+  RESOLVE_RESP=$(curl -sf ${AUTH_HEADER:+"$AUTH_HEADER"} 9<<<"$AUTH_LINE" --max-time 5 -X POST -H "Content-Type: application/json" \
     -d "$RESOLVE_PAYLOAD" "${API_URL}/v1/projects/resolve" 2>/dev/null) || RESOLVE_RESP=""
   if [[ -n "$RESOLVE_RESP" ]]; then
     RESOLVED_PROJECT_ID=$(echo "$RESOLVE_RESP" | jq -r '.projectId // ""' 2>/dev/null || echo "")
@@ -457,7 +483,7 @@ fetch_prompt_memory_escaped() {
   # the cached health result so the next hook checks /health again.
   local pids=""
   if [[ "$AUTO_RECALL_SESSIONS" == "1" ]]; then
-    { curl -sf $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
+    { curl -sf ${AUTH_HEADER:+"$AUTH_HEADER"} 9<<<"$AUTH_LINE" --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
       -H 'X-Chum-Recall: auto' -d "$body" "${api_url}/api/search" > "$tmpd/mem" 2>/dev/null || : > "$tmpd/mem.fail"; } &
     pids="$pids $!"
   fi
@@ -468,7 +494,7 @@ fetch_prompt_memory_escaped() {
     { jq -n --arg t "${prompt:0:300}" --arg pid "$CHUM_MEM_PROJECT_ID" \
       '{jsonrpc:"2.0", id:1, method:"tools/call", params:{name:"knowledge_query",
         arguments:{query:"search", text:$t, layer:"repository", projectId:$pid, limit:8}}}' \
-    | curl -sf $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
+    | curl -sf ${AUTH_HEADER:+"$AUTH_HEADER"} 9<<<"$AUTH_LINE" --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
         -H 'Accept: application/json, text/event-stream' -H 'X-Chum-Recall: auto' --data-binary @- \
         "${api_url}/mcp?projectId=${CHUM_MEM_PROJECT_ID}" > "$tmpd/docs" 2>/dev/null || : > "$tmpd/docs.fail"; } &
     pids="$pids $!"
@@ -589,7 +615,7 @@ fetch_knowledge_report_escaped() {
   local qs="layer=unified"
   [[ -n "${CHUM_MEM_PROJECT_ID:-}" ]] && qs="${qs}&projectId=${CHUM_MEM_PROJECT_ID}"
   local report=""
-  report=$(curl -sf $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time 5 "${api_url}/api/knowledge/report?${qs}" 2>/dev/null) || return 1
+  report=$(curl -sf ${AUTH_HEADER:+"$AUTH_HEADER"} 9<<<"$AUTH_LINE" --max-time 5 "${api_url}/api/knowledge/report?${qs}" 2>/dev/null) || return 1
   [[ -z "$report" ]] && return 1
   if echo "$report" | jq -e '.report.markdown? // empty' >/dev/null 2>&1; then
     report=$(printf '%s' "$report" | jq -r '.report.markdown')

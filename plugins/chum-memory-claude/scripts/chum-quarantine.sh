@@ -36,6 +36,7 @@ mask() { # replace every matched secret with *** so a listing never prints one
   # the command, the fallback printed the text UNMASKED, and `list` showed the
   # password it was supposed to hide.
   while IFS='|' read -r name flags re; do
+    re="${re%$'\r'}"  # a CRLF checkout (Git for Windows default) leaves \r on every pattern
     [[ -z "$name" || "$name" == \#* || -z "$re" ]] && continue
     if [[ "$flags" == *i* ]]; then text=$(printf '%s' "$text" | sed -E "s${d}${re}${d}***${d}Ig" 2>/dev/null || printf '***')
     else text=$(printf '%s' "$text" | sed -E "s${d}${re}${d}***${d}g" 2>/dev/null || printf '***'); fi

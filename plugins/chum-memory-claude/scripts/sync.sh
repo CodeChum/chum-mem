@@ -49,6 +49,10 @@ fail() {  # $1 message: loud on stderr and as JSON on stdout
   exit 2
 }
 command -v jq >/dev/null 2>&1 || { echo "chum-mem sync.sh: jq is required (brew install jq)" >&2; echo '{"status":"ERROR","error":"jq not found"}'; exit 2; }
+# The Windows jq.exe writes CRLF line ends unless told not to (-b).
+if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]] && command jq -b -n 1 >/dev/null 2>&1; then
+  jq() { command jq -b "$@"; }
+fi
 command -v git >/dev/null 2>&1 || fail "git is required"
 
 # ── API token: sent as X-Chum-Token from a here-string on fd 9 (curl -H @file),
@@ -57,7 +61,18 @@ if [[ -z "${CHUM_MEMORY_API_TOKEN:-}" && -r "${HOME}/.config/chum-mem/token" ]];
   CHUM_MEMORY_API_TOKEN="$(tr -d '[:space:]' < "${HOME}/.config/chum-mem/token")"; export CHUM_MEMORY_API_TOKEN
 fi
 AUTH_HEADER=""; AUTH_LINE=""
-if [[ -n "${CHUM_MEMORY_API_TOKEN:-}" ]]; then AUTH_HEADER="-H@/dev/fd/9"; AUTH_LINE="X-Chum-Token: ${CHUM_MEMORY_API_TOKEN}"; fi
+if [[ -n "${CHUM_MEMORY_API_TOKEN:-}" ]]; then
+  AUTH_HEADER="-H@/dev/fd/9"; AUTH_LINE="X-Chum-Token: ${CHUM_MEMORY_API_TOKEN}"
+  # Git for Windows' curl is a native program and cannot open bash's /dev/fd/9,
+  # so there it reads the header from a file beside the token file. Backslash
+  # path: Git Bash rewrites a joined -H@C:/... argument into a broken one.
+  if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]; then
+    __hdr="$HOME/.config/chum-mem/token.header"
+    [[ "$(cat "$__hdr" 2>/dev/null)" == "$AUTH_LINE" ]] \
+      || ( umask 077; mkdir -p "${__hdr%/*}" && printf '%s\n' "$AUTH_LINE" > "$__hdr.$$" && mv -f "$__hdr.$$" "$__hdr" )
+    AUTH_HEADER="-H@$(cygpath -w "$__hdr")"
+  fi
+fi
 
 cd "$ROOT_DIR" 2>/dev/null || fail "cannot cd to $ROOT_DIR"
 TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || { out '{"status":"SKIPPED","reason":"not a git checkout"}'; exit 0; }
@@ -91,7 +106,7 @@ if git cat-file -e "${COMMIT}:.chum-sync-rules.json" 2>/dev/null; then
   git show "${COMMIT}:.chum-sync-rules.json" > "$TMP/rules.json"
 else
   if [[ ! -s "$SERVER_RULES" ]]; then
-    curl -sf $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time 5 "${API_URL}/api/knowledge/sync-rules" > "$SERVER_RULES.tmp" 2>/dev/null \
+    curl -sf ${AUTH_HEADER:+"$AUTH_HEADER"} 9<<<"$AUTH_LINE" --max-time 5 "${API_URL}/api/knowledge/sync-rules" > "$SERVER_RULES.tmp" 2>/dev/null \
       && jq -e 'type == "object"' "$SERVER_RULES.tmp" >/dev/null 2>&1 && mv -f "$SERVER_RULES.tmp" "$SERVER_RULES"
     rm -f "$SERVER_RULES.tmp"
   fi
@@ -169,7 +184,7 @@ post() {
      manifestComplete: true, sourceRef: $ref, sourceCommit: $c, sourceCommitTime: $t}
     + (if $p != "" then {projectId: $p} else {} end)' > "$TMP/body.json" || return 1
   local t0=$SECONDS
-  HTTP="$(curl -sS $AUTH_HEADER 9<<<"$AUTH_LINE" -o "$TMP/resp.json" -w '%{http_code}' --max-time "$TIMEOUT" \
+  HTTP="$(curl -sS ${AUTH_HEADER:+"$AUTH_HEADER"} 9<<<"$AUTH_LINE" -o "$TMP/resp.json" -w '%{http_code}' --max-time "$TIMEOUT" \
     -X POST -H 'Content-Type: application/json' -H "X-Chum-Repo-Remote: ${REMOTE}" -H "X-Chum-Repo-Root: ${ROOT_HDR}" \
     --data-binary @"$TMP/body.json" "${API_URL}/api/knowledge/repository-sync" 2>/dev/null)" || HTTP="${HTTP:-000}"
   REQUESTS=$((REQUESTS + 1))

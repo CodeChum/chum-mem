@@ -24,8 +24,9 @@ trap 'rm -f /tmp/chum-session-*-resp.$$.json' EXIT
 API_URL="${CHUM_MEMORY_API_URL:-http://localhost:63001}"
 FLUSH_ONLY=0
 if [[ "${1:-}" == "--flush" ]]; then FLUSH_ONLY=1; fi
-# ── API token (optional): sent as X-Chum-Token on every call. Single-word
-# header so it can be expanded unquoted under bash 3.2 with `set -u`.
+# ── API token (optional): sent as X-Chum-Token on every call. Call sites expand
+# it as ${AUTH_HEADER:+"$AUTH_HEADER"}: nothing when unset (bash 3.2, `set -u`),
+# one word when the Windows header path has spaces.
 AUTH_HEADER=""
 # Token: env var first, else the file the installer writes (~/.config/chum-mem/token).
 if [[ -z "${CHUM_MEMORY_API_TOKEN:-}" && -r "${HOME}/.config/chum-mem/token" ]]; then
@@ -35,7 +36,27 @@ fi
 # (`-H @/dev/fd/9`), never in curl's argv where `ps` shows it to every user.
 # Each curl that sends $AUTH_HEADER also carries 9<<<"$AUTH_LINE".
 AUTH_LINE=""
-if [[ -n "${CHUM_MEMORY_API_TOKEN:-}" ]]; then AUTH_HEADER="-H@/dev/fd/9"; AUTH_LINE="X-Chum-Token: ${CHUM_MEMORY_API_TOKEN}"; fi
+if [[ -n "${CHUM_MEMORY_API_TOKEN:-}" ]]; then
+  AUTH_HEADER="-H@/dev/fd/9"; AUTH_LINE="X-Chum-Token: ${CHUM_MEMORY_API_TOKEN}"
+  # Git for Windows' curl is a native program and cannot open bash's /dev/fd/9,
+  # so there it reads the header from a file beside the token file. Backslash
+  # path: Git Bash rewrites a joined -H@C:/... argument into a broken one.
+  if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]; then
+    __hdr="$HOME/.config/chum-mem/token.header"
+    [[ "$(cat "$__hdr" 2>/dev/null)" == "$AUTH_LINE" ]] \
+      || ( umask 077; mkdir -p "${__hdr%/*}" && printf '%s\n' "$AUTH_LINE" > "$__hdr.$$" && mv -f "$__hdr.$$" "$__hdr" )
+    AUTH_HEADER="-H@$(cygpath -w "$__hdr")"
+  fi
+fi
+# The Windows jq.exe writes CRLF line ends unless told not to (-b).
+if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]] && command jq -b -n 1 >/dev/null 2>&1; then
+  jq() { command jq -b "$@"; }
+fi
+__uuid4() {  # uuidgen is missing on Windows and python3 there may be the Store stub
+  local h; h=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')
+  printf '%s-%s-4%s-%x%s-%s' "${h:0:8}" "${h:8:4}" "${h:13:3}" $(( (0x${h:16:1} & 3) | 8 )) "${h:17:3}" "${h:20:12}"
+}
+__sha256() { if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi; }  # no shasum in Git for Windows
 # Budget for the live session/start and session/event calls. It must stay well
 # under the shortest hook timeout (PostToolUse, Notification, SubagentStop:
 # 10 s): with 10 s here, an API that accepted the connection but hung got the
@@ -181,12 +202,12 @@ flush_one() {
     api=$(printf '%s' "$line" | jq -r '.api // empty'); api="${api:-$API_URL}"
     start=$(printf '%s' "$line" | jq -c '.start')
     body=$(printf '%s' "$line" | jq -c '.body')
-    sid=$(printf '%s' "$start" | curl -sS $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- \
+    sid=$(printf '%s' "$start" | curl -sS ${AUTH_HEADER:+"$AUTH_HEADER"} 9<<<"$AUTH_LINE" --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- \
       "${api}/v1/ingest/session/start" 2>/dev/null | jq -r '.sessionId // empty' 2>/dev/null) || sid=""
     [[ -n "$sid" ]] || break
     body=$(printf '%s' "$body" | jq -c --arg sid "$sid" '.sessionId = $sid')
     case "$kind" in end) ep="session/end" ;; *) ep="session/event" ;; esac
-    code=$(printf '%s' "$body" | curl -sS $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time 15 -o /dev/null -w "%{http_code}" -X POST \
+    code=$(printf '%s' "$body" | curl -sS ${AUTH_HEADER:+"$AUTH_HEADER"} 9<<<"$AUTH_LINE" --max-time 15 -o /dev/null -w "%{http_code}" -X POST \
       -H 'Content-Type: application/json' --data-binary @- "${api}/v1/ingest/${ep}" 2>/dev/null) || code="000"
     [[ "$code" == 2* ]] || break
     sent=$((sent + 1))
@@ -242,7 +263,7 @@ close_stale_sessions() {
       rm -f "$st"; continue   # never reached the server; its spooled lines replay on their own
     fi
     code=$(jq -c -n --arg sid "$sid" '{sessionId:$sid, summary:"[session ended without a Stop hook; closed by chum-mem at the next session start]"}' \
-      | curl -sS $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time 5 -o /dev/null -w "%{http_code}" -X POST -H 'Content-Type: application/json' \
+      | curl -sS ${AUTH_HEADER:+"$AUTH_HEADER"} 9<<<"$AUTH_LINE" --max-time 5 -o /dev/null -w "%{http_code}" -X POST -H 'Content-Type: application/json' \
           --data-binary @- "${API_URL}/v1/ingest/session/end" 2>/dev/null) || code="000"
     case "$code" in 2*|404) rm -f "$st"; echo "session-sync: closed stale session $sid" >&2 ;; esac
   done < <(find "$CACHE_DIR" -maxdepth 1 -name "session-${PROVIDER}-*.json" -mmin +720 2>/dev/null)
@@ -261,6 +282,7 @@ scan_sensitive() {  # $1 text -> prints matched rule names; exit 0 when any matc
   [[ "${CHUM_SENSITIVE_GUARD:-1}" == "1" ]] || return 1
   local text="$1" name flags re hits=""
   while IFS='|' read -r name flags re; do
+    re="${re%$'\r'}"  # a CRLF checkout (Git for Windows default) leaves \r on every pattern
     [[ -z "$name" || "$name" == \#* || -z "$re" ]] && continue
     if [[ "$flags" == *i* ]]; then
       printf '%s' "$text" | grep -Eiq -- "$re" 2>/dev/null && hits="${hits:+$hits,}$name"
@@ -334,7 +356,7 @@ ensure_session_started() {
   payload=$(session_start_payload)
 
   local response http_code
-  response=$(curl -sS $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time "$LIVE_CALL_TIMEOUT" \
+  response=$(curl -sS ${AUTH_HEADER:+"$AUTH_HEADER"} 9<<<"$AUTH_LINE" --max-time "$LIVE_CALL_TIMEOUT" \
     -o /tmp/chum-session-start-resp.$$.json \
     -w "%{http_code}" \
     -X POST \
@@ -417,10 +439,10 @@ post_event() {
   # No python3 here: two interpreter spawns per event were a visible share of hook
   # latency under load (overnight D7). uuidgen + perl ship with macOS and Debian.
   event_id=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]') || event_id=""
-  [[ -n "$event_id" ]] || event_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+  [[ -n "$event_id" ]] || event_id=$(__uuid4)
   event_time=$(perl -MTime::HiRes=time -MPOSIX=strftime -e '$t=time; printf "%s.%03dZ", strftime("%Y-%m-%dT%H:%M:%S", gmtime($t)), ($t-int($t))*1000' 2>/dev/null) || event_time=""
   [[ -n "$event_time" ]] || event_time=$(date -u +%FT%T.000Z)
-  idempotency_key=$(printf '%s|%s|%s' "$chum_session_id" "$event_type" "$event_id" | shasum -a 256 | cut -d' ' -f1)
+  idempotency_key=$(printf '%s|%s|%s' "$chum_session_id" "$event_type" "$event_id" | __sha256 | cut -d' ' -f1)
 
   # The two JSON documents are handed to jq as files, not --argjson arguments:
   # a 1 MB tool output made jq fail with "Argument list too long" (argv cap
@@ -470,7 +492,7 @@ post_event() {
     spool_line event "$full_payload"
     return 0
   fi
-  http_code=$(printf '%s' "$full_payload" | curl -sS $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time "$LIVE_CALL_TIMEOUT" \
+  http_code=$(printf '%s' "$full_payload" | curl -sS ${AUTH_HEADER:+"$AUTH_HEADER"} 9<<<"$AUTH_LINE" --max-time "$LIVE_CALL_TIMEOUT" \
     -o /tmp/chum-session-event-resp.$$.json \
     -w "%{http_code}" \
     -X POST \
@@ -544,7 +566,7 @@ end_session() {
   local http_code
   # 20 s, under the Stop/SessionEnd hook timeout (30 s) so a hung API spools
   # the end instead of the hook being killed with it in flight.
-  http_code=$(curl -sS $AUTH_HEADER 9<<<"$AUTH_LINE" --max-time 20 \
+  http_code=$(curl -sS ${AUTH_HEADER:+"$AUTH_HEADER"} 9<<<"$AUTH_LINE" --max-time 20 \
     -o /tmp/chum-session-end-resp.$$.json \
     -w "%{http_code}" \
     -X POST \

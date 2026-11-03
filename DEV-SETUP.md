@@ -161,6 +161,31 @@ safe to re-run (and re-running is how you pick up a rotated token). Then
 restart Claude Code. The token is never printed and never goes through the
 Claude prompt.
 
+**Engineer, Windows.** Claude Code on Windows runs the hooks in Git Bash, so
+the same command works there, from a Claude Code session in the monorepo:
+
+```
+! bash .claude/chum-mem/scripts/setup-engineer.sh
+```
+
+What differs from a Mac:
+
+- jq and the Google Cloud SDK come from `winget` (`jqlang.jq`, `Google.CloudSDK`);
+  setup calls `gcloud.cmd`, because the extensionless `gcloud` in the SDK is
+  the Linux shell script.
+- The tunnel is a hidden PowerShell loop (`~/.config/chum-mem/tunnel.ps1`) that
+  restarts it when it exits, one per user. A shortcut in your Startup folder
+  (`chum-mem tunnel`) starts it at every login; no admin rights needed. Its
+  log is `~/.config/chum-mem/tunnel.log`.
+- The MCP token is the user environment variable `CHUM_MEMORY_API_TOKEN`.
+- The hooks send the token from `~/.config/chum-mem/token.header`, next to the
+  token file: Git for Windows' curl cannot read the `/dev/fd` header the Mac uses.
+- No dialogs. When the gcloud login expires (every 24 h, Workspace session
+  control), the prompt notice says to run `! gcloud.cmd auth login <you> --force`;
+  for anything else it says to re-run the setup.
+- To remove: delete the Startup shortcut, end the `powershell` process running
+  `tunnel.ps1`, and delete `~/.config/chum-mem` and the environment variable.
+
 **Attribution.** The server credits every session started with a personal
 token to the token's owner (`userEmail`), not to the client's git email (kept
 as `gitEmail`), and a personal token cannot write to another engineer's
