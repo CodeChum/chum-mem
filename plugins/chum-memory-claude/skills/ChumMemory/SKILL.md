@@ -7,24 +7,34 @@ description: "Always-on knowledge graph and memory retrieval for code work. USE 
 
 The plugin hook runs `sync.sh` on every `UserPromptSubmit`, so the repository graph is **already fresh** when your turn starts. Your job is to **query the graph instead of grepping**, then read the files the graph points to — and when you recall memory, **read proof, not prose**.
 
-## Always footnote what came from chum-mem
+## Always credit chum-mem in a side note
 
-Engineers need to tell team memory apart from your own reasoning, and see whose session it came from. Whenever an answer uses anything from chum-mem (a `mem_search` / `memory_get` result, a knowledge report, or an attached team memory or team docs block), put a footnote marker after each such point and end the answer with a footer:
+Engineers need to tell team memory apart from your own reasoning, and see whose session it came from, without the answer being cluttered by markers. Whenever an answer uses anything from chum-mem (a `mem_search` / `memory_get` result, a knowledge report, or an attached team memory or team docs block), write the answer with no citation markers, then end it with a side note: a short post-analysis of what team memory contributed.
 
 ```
-EDIT sharers get full edit access to the linked activity, except delete [1].
-The roster wall shipped as a separate frontend hotfix [2].
+EDIT sharers get full edit access to the linked activity, except delete.
+The roster wall shipped as a separate frontend hotfix.
 
-From chum-mem:
-[1] Ana Cruz (ana@codechum.com), session 2f3a91c0, 2026-10-12
-[2] repo doc .claude/workspaces/CODECHUM-23552.md
+---
+chum-mem side note
+- Ana Cruz, session 2f3a91c0, 2026-10-12: decided that EDIT sharers get everything except delete. Still matches `task_groups.py`.
+- repo doc .claude/workspaces/CODECHUM-23552.md: the roster-wall hotfix split.
 ```
 
-- Session memory: `[n] <author name> (<author email>), session <first 8 characters of the session id>, <date>`. Name and email come from `authorName` / `authorEmail`, the session from `sessionIds`, the date from `createdAt`. Leave out a part you do not have rather than guessing it.
-- A repository doc found through chum-mem: `[n] repo doc <path>`.
-- One number per source: points from the same session (or doc) reuse its number.
+- Session memory: `- <author name>, session <first 8 characters of the session id>, <date>: <what it added>`. The name comes from `authorName`, the session from `sessionIds`, the date from `createdAt`. Leave out a part you do not have rather than guessing it.
+- A repository doc found through chum-mem: `- repo doc <path>: <what it added>`.
+- One bullet per session or doc. Say whether the claim still matches the code, contradicts it, or was not checked.
 
-Never present chum-mem content as your own finding, never footnote something you worked out from the code yourself, and leave the footer out when nothing came from chum-mem. If you checked a recalled claim against the code, say both: what chum-mem said (footnoted) and what the code shows.
+Never present chum-mem content as your own finding: everything that came from it is credited in the side note, and nothing you worked out from the code yourself is. Leave out sources you did not use, and leave the side note out entirely when nothing came from chum-mem.
+
+## Dig for teammates' related sessions
+
+The automatic team memory block matches only the wording of the prompt, so it misses most related work. Before acting on any request to change, fix, investigate, plan or explain something in this codebase (not chit-chat or a short reply):
+
+1. Call `mem_search` two or three times, each with a different query built from concrete names: ticket keys, file paths, function, model or feature names, error text. Don't reuse the prompt's wording.
+2. Prefer hits from teammates other than the engineer you are working with (the git user of this checkout).
+3. Open the promising hits with `memory_get_batch` and check each against the current code before relying on it.
+4. Use only what is genuinely related, and credit it in the side note. When nothing is related, don't mention the search.
 
 ## The one rule
 

@@ -276,9 +276,11 @@ test_docs_only_default() {
   check "default: docs block attached" '[[ "$ctx" == *"--- Team docs"*"docs/bonus-toggle.md"* ]]'
   check "default: no session-memory block" '[[ "$ctx" != *"Team memory"* && "$ctx" != *"bonus toggle lives in section settings"* ]]'
   check "default: session memory is not even queried" '! grep -q "^POST /api/search" "$FAKE_STATE/requests.log"'
-  check "default: prompt preamble points to mem_search" '[[ "$ctx" == *"not attached automatically; for a question about past decisions"*"call the chum-memory MCP tool mem_search before answering"* ]]'
+  check "default: prompt asks for the side note" '[[ "$ctx" == *"chum-mem side note"* && "$ctx" != *"footnote"* ]]'
+  check "default: prompt preamble points to mem_search" '[[ "$ctx" == *"not attached automatically."*"look hard for related sessions"*"For a question about past decisions"*"call mem_search before answering"* ]]'
   ctx=$(hook "$r" "$FAKE_URL" "$p" CHUM_AUTO_RECALL_SESSIONS=1 | jq -r '.hookSpecificOutput.additionalContext // ""')
   check "CHUM_AUTO_RECALL_SESSIONS=1: memory and docs blocks" '[[ "$ctx" == *"--- Team memory"*"bonus toggle lives in section settings"*"--- Team docs"* ]]'
+  check "CHUM_AUTO_RECALL_SESSIONS=1: prompt also asks to dig and to add the side note" '[[ "$ctx" == *"look hard for related sessions"*"chum-mem side note"* ]]'
   jq '. + {autoRecallSessions: true}' "$r/.chum-mem" > "$r/.chum-mem.new" && mv "$r/.chum-mem.new" "$r/.chum-mem"
   ctx=$(hook "$r" "$FAKE_URL" "$p" | jq -r '.hookSpecificOutput.additionalContext // ""')
   check ".chum-mem autoRecallSessions:true: memory block back" '[[ "$ctx" == *"--- Team memory"* ]]'
@@ -288,6 +290,10 @@ test_docs_only_default() {
   ctx=$(hook "$r" "$FAKE_URL" "$(payload SessionStart docsonly "$r")" | jq -r '.hookSpecificOutput.additionalContext // ""')
   check "SessionStart says session memory is searchable on demand with mem_search" \
     '[[ "$ctx" == *"NOT attached automatically: it is searchable on demand"*"mem_search for session memory"* ]]'
+  check "SessionStart asks Claude to dig for teammates' sessions with concrete names" \
+    '[[ "$ctx" == *"look hard for related sessions from other teammates"*"ticket keys, file paths"*"memory_get"* ]]'
+  check "SessionStart asks for a chum-mem side note, not inline markers" \
+    '[[ "$ctx" == *"free of citation markers"*"chum-mem side note"* && "$ctx" != *"marker like [1]"* && "$ctx" != *"From chum-mem:"* ]]'
 }
 
 # ── R3: `chum-quarantine.sh list` never prints a held private key's body ──
