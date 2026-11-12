@@ -475,6 +475,14 @@ fetch_prompt_memory_escaped() {
   prompt=$(echo "$HOOK_PAYLOAD" | jq -r '.prompt // ""' 2>/dev/null)
   # skip trivial prompts (slash commands, one-word replies)
   [[ ${#prompt} -ge 12 && "$prompt" != /* ]] || return 1
+  # Claude Code also delivers machine messages as prompts: subagent hand-backs,
+  # task notifications, command output. They were about half of all lookups
+  # (2026-10/11), and the hand-back's fixed wording ranked one unrelated doc
+  # first for every one of them.
+  local lead="${prompt#"${prompt%%[![:space:]]*}"}"
+  case "$lead" in
+    "<agent-message"*|"<task-notification"*|"<local-command"*|"<command-"*|"<system-reminder>"*) return 1 ;;
+  esac
   limit="${CHUM_AUTO_RECALL_LIMIT:-5}"
   tmo="${CHUM_AUTO_RECALL_TIMEOUT_SECS:-6}"
   # Ask for a wider candidate pool than we show: the server's lexical path orders

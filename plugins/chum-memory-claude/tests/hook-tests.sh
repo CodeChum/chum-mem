@@ -637,6 +637,29 @@ test_token_not_in_argv() {
   check "the session's events reached the API" 'grep -q "^POST /v1/ingest/session/event" "$FAKE_STATE/requests.log"'
 }
 
+# ── machine messages delivered as prompts (subagent hand-backs, task
+# notifications) are not searched: their fixed wording matched one unrelated doc ──
+test_machine_prompts_not_recalled() {
+  echo "machine_prompts_not_recalled"
+  local r p ctx m
+  r=$(mkrepo machine)
+  start_fake machine || { bad "fake api"; return; }
+  jq -n '{jsonrpc:"2.0", id:1, result:{structuredContent:{nodes:[
+    {type:"file", label:"bonus-toggle.md", metadata:{fullPath:"docs/bonus-toggle.md"}}]}}}' > "$FAKE_STATE/docs.json"
+  for m in '<agent-message from="a419aaf206a2f0636"> [Subagent hand-back] The text below is the final report of a subagent' \
+           '  <task-notification> <task-id>b1</task-id> <status>completed</status> where does the bonus toggle live' \
+           '<local-command-stdout>Session renamed to: bonus toggle</local-command-stdout>'; do
+    : > "$FAKE_STATE/requests.log"
+    p=$(payload UserPromptSubmit machine "$r" "$(jq -cn --arg m "$m" '{prompt:$m}')")
+    ctx=$(hook "$r" "$FAKE_URL" "$p" | jq -r '.hookSpecificOutput.additionalContext // ""')
+    check "${m:0:24}... -> no docs search, nothing attached" '! grep -q "^POST /mcp" "$FAKE_STATE/requests.log" && [[ "$ctx" != *"Team docs"* ]]'
+  done
+  : > "$FAKE_STATE/requests.log"
+  p=$(payload UserPromptSubmit machine "$r" '{"prompt":"where does the bonus toggle flag live? see <agent-message> handling"}')
+  ctx=$(hook "$r" "$FAKE_URL" "$p" | jq -r '.hookSpecificOutput.additionalContext // ""')
+  check "a typed prompt that mentions a tag later is still searched" 'grep -q "^POST /mcp" "$FAKE_STATE/requests.log" && [[ "$ctx" == *"docs/bonus-toggle.md"* ]]'
+}
+
 # ── the token header still works when HOME has a space (Windows: C:\Users\First Last) ──
 test_token_home_with_space() {
   echo "token_home_with_space"
@@ -709,7 +732,7 @@ test_docs_sync_default_branch() {
   check "snapshot unchanged by the stale checkout" '[[ "$(export_files "$p")" == "docs/a.md " ]]'
 }
 
-ALL="concurrent_append fence_forgery tokenizer docs_relevance_gate deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked token_not_in_argv token_home_with_space tunnel_cause auth_check hook_fix_dialog setup_update dialog_detached docs_sync_default_branch"
+ALL="concurrent_append fence_forgery tokenizer docs_relevance_gate deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked token_not_in_argv token_home_with_space machine_prompts_not_recalled tunnel_cause auth_check hook_fix_dialog setup_update dialog_detached docs_sync_default_branch"
 for t in ${*:-$ALL}; do "test_$t"; done
 echo "passed $PASS, failed $FAIL, skipped $SKIP  (scratch: $TMP)"
 [[ "$FAIL" -eq 0 ]]
