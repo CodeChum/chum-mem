@@ -5,9 +5,12 @@
 # com.codechum.chum-mem-auth-check), and in the background from the hook whenever
 # chum-mem is unreachable, so an engineer who never ran setup is asked too.
 #
-#   gcloud not signed in, or login expired (IAP 4033)  -> [Sign in]: browser login.
-#     Workspace Cloud session control expires it every 24 h; the tunnel loads
-#     credentials per connection, so it recovers without a restart.
+#   gcloud not signed in, or login expired (IAP 4033    -> [Sign in]: browser login.
+#   and gcloud can no longer mint a token)                 The tunnel loads credentials
+#                                                          per connection, so it recovers
+#                                                          without a restart.
+#   IAP 4033 while the login still works, and still     -> told: wrong gcloud account or no
+#   refused a little later                                 tunnel access; signing in won't help
 #   VM or firewall down (IAP 4003)                      -> told; only the admin can fix it
 #   CHUM_DIALOG_REASON=update (from the hook: the pulled setup-engineer.sh is a
 #   newer SETUP_VERSION than this Mac ran)              -> [Update]: same as Set up
@@ -53,6 +56,15 @@ token_rejected() {
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H @/dev/fd/9 9<<<"X-Chum-Token: $t" "$API/api/dashboard/summary")"
   [[ "$code" == "401" ]]
 }
+login_works() {  # gcloud can still mint a token for the account, so the login has not expired
+  "$GCLOUD" auth print-access-token ${ACCOUNT:+"$ACCOUNT"} >/dev/null 2>&1 &
+  local pid=$! i
+  for i in $(seq 1 150); do
+    kill -0 "$pid" 2>/dev/null || { wait "$pid"; return; }
+    sleep 0.2
+  done
+  kill "$pid" 2>/dev/null; return 1
+}
 CFG="${CLOUDSDK_CONFIG:-$HOME/.config/gcloud}"
 ACCOUNT="$(sed -n 's/^account *= *//p' "$CFG/configurations/config_$(cat "$CFG/active_config" 2>/dev/null || echo default)" 2>/dev/null | head -1)"
 
@@ -87,9 +99,12 @@ else
       *"[4003:"*) CAUSE=server ;;
     esac
   fi
+  # IAP also answers 4033 for a moment after the Mac wakes or changes network,
+  # and for an account it does not let in. Signing in fixes neither.
+  [[ "$CAUSE" == signin ]] && login_works && CAUSE=access
   # An unexplained failure is often a VM redeploy restarting the API: only
   # ask when it is still failing a little later.
-  if [[ "$CAUSE" == setup ]]; then
+  if [[ "$CAUSE" == setup || "$CAUSE" == access ]]; then
     sleep "${CHUM_RETRY_SECS:-20}"
     curl -sf --max-time 10 "$API/health" >/dev/null 2>&1 && exit 0
   fi
@@ -128,6 +143,15 @@ Sign in again as ${ACCOUNT:-your @codechum.com account}? A browser window opens.
       sleep 3
     done
     notify "Sign-in did not complete. You will be asked again in 5 minutes."
+    ;;
+  access)
+    ask "Team memory (chum-mem) is disconnected: Google Cloud refuses ${ACCOUNT} for the chum-mem tunnel (IAP error 4033), although that sign-in is still valid.
+
+If ${ACCOUNT} is not your @codechum.com account, switch to it in Terminal:
+gcloud config set account you@codechum.com
+
+Otherwise ask the chum-mem admin for tunnel access. Your sessions are queued and sync once it works." "OK" >/dev/null
+    snooze
     ;;
   server)
     ask "The chum-mem team server cannot be reached (IAP error 4003: its firewall rule is missing or the VM is down).

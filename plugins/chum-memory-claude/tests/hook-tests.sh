@@ -424,16 +424,17 @@ test_auth_check() {
   port="${FAKE_URL##*:}"
   # osascript stub: records the dialog text; the dialog answers $ANSWER.
   printf '#!/bin/bash\nshift; cat >/dev/null; printf "%%s\\n" "$*" >> "%s/osascript.log"; echo "$ANSWER"\n' "$TMP" > "$bin/osascript"
-  # gcloud stub: records its args; the login "fixes" the tunnel.
-  printf '#!/bin/bash\necho "$*" >> "%s/gcloud.log"; rm -f "%s/health-down"\n' "$TMP" "$FAKE_STATE" > "$bin/gcloud"
+  # gcloud stub: records its args; the login "fixes" the tunnel. print-access-token
+  # succeeds when $TOKEN is ok or recover (recover: the tunnel comes back meanwhile).
+  printf '#!/bin/bash\nif [[ "$1 $2" == "auth print-access-token" ]]; then echo "$*" >> "%s/token.log"; [[ "$TOKEN" == recover ]] && rm -f "%s/health-down"; [[ "$TOKEN" == ok || "$TOKEN" == recover ]]; exit; fi\necho "$*" >> "%s/gcloud.log"; rm -f "%s/health-down"\n' "$TMP" "$FAKE_STATE" "$TMP" "$FAKE_STATE" > "$bin/gcloud"
   printf '#!/bin/bash\necho "$*" >> "%s/open.log"\n' "$TMP" > "$bin/open"
   chmod +x "$bin/osascript" "$bin/gcloud" "$bin/open"
   ac() {  # $1 dialog answer [$2 online url]
-    env -i PATH="$bin:$PATH" HOME="$h" ANSWER="$1" CHUM_LOCAL_PORT="$port" CHUM_GCLOUD="$bin/gcloud" \
+    env -i PATH="$bin:$PATH" HOME="$h" ANSWER="$1" TOKEN="${TOKEN:-}" CHUM_LOCAL_PORT="$port" CHUM_GCLOUD="$bin/gcloud" \
       CHUM_TUNNEL_LOG="$h/tunnel.log" CHUM_TUNNEL_LABEL=t CHUM_REPO="$repo" CHUM_RETRY_SECS=0 \
       CHUM_ONLINE_URL="${2:-$FAKE_URL/health-of-the-internet}" "$BASH_BIN" "$SCRIPTS/tunnel-auth-check.sh"
   }
-  reset() { : > "$TMP/osascript.log"; : > "$TMP/gcloud.log"; : > "$TMP/open.log"; rm -f "$h/.config/chum-mem/.dialog-snooze"; }
+  reset() { : > "$TMP/osascript.log"; : > "$TMP/gcloud.log"; : > "$TMP/token.log"; : > "$TMP/open.log"; rm -f "$h/.config/chum-mem/.dialog-snooze"; }
   said() { grep -q "$1" "$TMP/osascript.log"; }
   reset
   ac "Set up"
@@ -487,6 +488,18 @@ test_auth_check() {
   check "Sign in -> gcloud auth login for that account" '[[ "$(cat "$TMP/gcloud.log")" == "auth login eng@codechum.com --force --brief" ]]'
   check "reconnected -> success notification" 'said "connected again"'
   check "the lock is released" '[[ ! -d "$h/.config/chum-mem/.dialog-lock" ]]'
+  check "expired login checked with print-access-token for that account" \
+    '[[ "$(cat "$TMP/token.log")" == "auth print-access-token eng@codechum.com" ]]'
+  # A 4033 while gcloud can still mint a token is not an expired login.
+  : > "$FAKE_STATE/health-down"; reset
+  TOKEN=recover ac "Sign in"
+  check "4033, login still valid, back on retry (Mac woke up) -> no dialog" \
+    '[[ ! -s "$TMP/osascript.log" && ! -s "$TMP/gcloud.log" && -s "$TMP/token.log" ]]'
+  : > "$FAKE_STATE/health-down"; reset
+  TOKEN=ok ac "OK"
+  check "4033, login still valid, still refused -> access dialog naming the account, no Sign in" \
+    'said "refuses eng@codechum.com" && ! said "sign-in has expired" && [[ ! -s "$TMP/gcloud.log" && ! -s "$TMP/open.log" ]]'
+  check "access dialog -> snoozed an hour" '[[ -n "$(find "$h/.config/chum-mem/.dialog-snooze" -mmin -1)" ]]'
   : > "$h/tunnel.log"; rm -f "$FAKE_STATE/tunnel-error"; : > "$FAKE_STATE/health-down"; reset
   ac "Later"
   check "down, cause unknown, still down on retry -> Set up dialog" 'said "not connected on this Mac"'
