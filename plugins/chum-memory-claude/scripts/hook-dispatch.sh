@@ -346,6 +346,28 @@ else
 fi
 export CHUM_MEM_PROJECT_ID="${RESOLVED_PROJECT_ID:-${CHUM_MEM_PROJECT_ID:-}}"
 
+# ── Docs project (.chum-mem "docsProjectId") ──
+# Repos that share session memory (one projectId) need separate docs projects:
+# every docs sync sends its repo's complete manifest and the server deletes the
+# files missing from it, so two repos on one docs project would erase each
+# other's docs. Without docsProjectId the docs stay in projectId, as before.
+DOCS_PROJECT_ID="$CHUM_MEM_PROJECT_ID"
+if [[ "$CHUM_MEM_EXISTED" -eq 1 ]]; then
+  _docs_pid="$(jq -r '.docsProjectId // ""' "$CHUM_MEM_FILE" 2>/dev/null || echo "")"
+  if [[ "$_docs_pid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+    DOCS_PROJECT_ID="$_docs_pid"
+    DOCS_MARKER="${PROJECT_DIR}/.chum-cache/.resolved-${_docs_pid}"
+    if [[ ! -e "$DOCS_MARKER" || -n "$(find "$DOCS_MARKER" -mmin +1440 2>/dev/null)" ]]; then
+      _docs_resp=$(curl -sf ${AUTH_HEADER:+"$AUTH_HEADER"} 9<<<"$AUTH_LINE" --max-time 5 -X POST -H "Content-Type: application/json" \
+        -d "$(jq -n --arg projectId "$_docs_pid" --arg name "${PROJECT_NAME}-docs" '{projectId: $projectId, name: $name}')" \
+        "${API_URL}/v1/projects/resolve" 2>/dev/null) || _docs_resp=""
+      if [[ "$(jq -r '.projectId // ""' <<<"$_docs_resp" 2>/dev/null)" == "$_docs_pid" ]]; then
+        mkdir -p "${PROJECT_DIR}/.chum-cache" 2>/dev/null && : > "$DOCS_MARKER"
+      fi
+    fi
+  fi
+fi
+
 # ── Plugin layout only: keep the plugin's own .mcp.json pointed at this project ──
 # Claude Code's HTTP MCP transport uses the URL from .mcp.json, and a plugin's
 # file cannot expand the project id itself. In the vendored layout (scripts
@@ -407,7 +429,8 @@ case "$HOOK_EVENT" in
     if [[ "$API_DEGRADED" -eq 0 && -x "${SCRIPTS_DIR}/sync.sh" ]]; then
       # Bounded per request inside a hook; the manifest is reconciled per chunk,
       # so a cut-short cold sync resumes on the next prompt.
-      CHUM_SYNC_TIMEOUT_SECS="${CHUM_SYNC_TIMEOUT_SECS:-10}" bash "${SCRIPTS_DIR}/sync.sh" "$PROJECT_DIR" >/dev/null 2>&1 || true
+      CHUM_MEM_PROJECT_ID="$DOCS_PROJECT_ID" CHUM_SYNC_TIMEOUT_SECS="${CHUM_SYNC_TIMEOUT_SECS:-10}" \
+        bash "${SCRIPTS_DIR}/sync.sh" "$PROJECT_DIR" >/dev/null 2>&1 || true
     fi
     ;;
 esac
@@ -501,15 +524,15 @@ fetch_prompt_memory_escaped() {
     pids="$pids $!"
   fi
   local docs_n="${CHUM_AUTO_RECALL_DOCS:-3}"
-  if [[ "$docs_n" -gt 0 && -n "${CHUM_MEM_PROJECT_ID:-}" ]]; then
+  if [[ "$docs_n" -gt 0 && -n "${DOCS_PROJECT_ID:-}" ]]; then
     # Repository layer = the docs the team committed (CLAUDE files, rules, notes).
     # Same call as MCP knowledge_query(search, layer:repository).
-    { jq -n --arg t "${prompt:0:300}" --arg pid "$CHUM_MEM_PROJECT_ID" \
+    { jq -n --arg t "${prompt:0:300}" --arg pid "$DOCS_PROJECT_ID" \
       '{jsonrpc:"2.0", id:1, method:"tools/call", params:{name:"knowledge_query",
         arguments:{query:"search", text:$t, layer:"repository", projectId:$pid, limit:8}}}' \
     | curl -sf ${AUTH_HEADER:+"$AUTH_HEADER"} 9<<<"$AUTH_LINE" --max-time "$tmo" -X POST -H 'Content-Type: application/json' \
         -H 'Accept: application/json, text/event-stream' -H 'X-Chum-Recall: auto' --data-binary @- \
-        "${api_url}/mcp?projectId=${CHUM_MEM_PROJECT_ID}" > "$tmpd/docs" 2>/dev/null || : > "$tmpd/docs.fail"; } &
+        "${api_url}/mcp?projectId=${DOCS_PROJECT_ID}" > "$tmpd/docs" 2>/dev/null || : > "$tmpd/docs.fail"; } &
     pids="$pids $!"
   fi
   # Only these two calls: a bare `wait` also waits on jobs this subshell
