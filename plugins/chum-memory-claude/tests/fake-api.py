@@ -63,6 +63,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with open(os.path.join(STATE, "tokens.log"), "a") as fh:
                 fh.write(token + "\n")
 
+    def _log_project(self, body):
+        """Append "<path without query> <projectId in the JSON body>" to projects.log."""
+        try:
+            doc = json.loads(body or b"{}")
+        except ValueError:
+            return
+        if not isinstance(doc, dict):
+            return
+        pid = doc.get("projectId") or (doc.get("params") or {}).get("arguments", {}).get("projectId")
+        if pid:
+            with open(os.path.join(STATE, "projects.log"), "a") as fh:
+                fh.write("%s %s\n" % (self.path.split("?")[0], pid))
+
     def _send(self, code, body):
         raw = json.dumps(body).encode()
         self.send_response(code)
@@ -106,6 +119,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         self._log()
+        self._log_project(body)
         self._delay()
         if flag("token-401"):
             return self._send(401, {"error": "unauthorized"})

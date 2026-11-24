@@ -296,6 +296,43 @@ test_docs_only_default() {
     '[[ "$ctx" == *"free of citation markers"*"chum-mem side note"* && "$ctx" != *"marker like [1]"* && "$ctx" != *"From chum-mem:"* ]]'
 }
 
+# ── .chum-mem docsProjectId: sessions shared through projectId, docs in their own project ──
+test_docs_project_id() {
+  echo "docs_project_id"
+  local r ctx p docs="d0c5d0c5-0000-4000-8000-0000000000aa"
+  r=$(mkrepo docsproj)
+  git -C "$r" config user.name t
+  mkdir -p "$r/docs"; printf '# Notes\n\nThe design repo keeps its rules here.\n' > "$r/docs/notes.md"
+  git -C "$r" add docs/notes.md && git -C "$r" commit -q -m one
+  start_fake docsproj || { bad "fake api"; return; }
+  jq -n '{jsonrpc:"2.0", id:1, result:{structuredContent:{nodes:[
+    {type:"file", label:"design-repo-rules.md", metadata:{fullPath:"docs/design-repo-rules.md"}}]}}}' > "$FAKE_STATE/docs.json"
+  ids() { grep "^$1 " "$FAKE_STATE/projects.log" 2>/dev/null | awk '{print $2}' | sort -u | tr '\n' ' '; }
+  p=$(payload UserPromptSubmit docsproj "$r" '{"prompt":"where does the design repo keep its rules?"}')
+  : > "$FAKE_STATE/projects.log"
+  ctx=$(hook "$r" "$FAKE_URL" "$p" CHUM_SYNC_REF=HEAD CHUM_AUTO_RECALL_SESSIONS=1 | jq -r '.hookSpecificOutput.additionalContext // ""')
+  check "no docsProjectId: docs sync uses projectId" '[[ "$(ids /api/knowledge/repository-sync)" == "$PID_FAKE " ]]'
+  check "no docsProjectId: docs search uses projectId" '[[ "$(ids /mcp)" == "$PID_FAKE " ]]'
+  jq --arg d "$docs" '. + {docsProjectId: $d}' "$r/.chum-mem" > "$r/.chum-mem.new" && mv "$r/.chum-mem.new" "$r/.chum-mem"
+  rm -f "$r/.chum-cache/sync-state"; : > "$FAKE_STATE/projects.log"
+  p=$(payload UserPromptSubmit docsproj2 "$r" '{"prompt":"where does the design repo keep its rules?"}')
+  ctx=$(hook "$r" "$FAKE_URL" "$p" CHUM_SYNC_REF=HEAD CHUM_AUTO_RECALL_SESSIONS=1 | jq -r '.hookSpecificOutput.additionalContext // ""')
+  check "docsProjectId: registered on the server" '[[ "$(ids /v1/projects/resolve)" == *"$docs"* ]]'
+  check "docsProjectId: docs sync goes to the docs project only" '[[ "$(ids /api/knowledge/repository-sync)" == "$docs " ]]'
+  check "docsProjectId: docs search reads the docs project" '[[ "$(ids /mcp)" == "$docs " ]]'
+  check "docsProjectId: session recall stays on the shared projectId" '[[ "$(ids /api/search)" == "$PID_FAKE " ]]'
+  check "docsProjectId: session events stay on the shared projectId" \
+    '[[ "$(ids /v1/ingest/session/start)" == "$PID_FAKE " ]] && ! grep -q "^/v1/ingest.* $docs" "$FAKE_STATE/projects.log"'
+  check "docsProjectId: docs block still attached" '[[ "$ctx" == *"--- Team docs"*"docs/design-repo-rules.md"* ]]'
+  : > "$FAKE_STATE/projects.log"
+  hook "$r" "$FAKE_URL" "$p" CHUM_SYNC_REF=HEAD >/dev/null
+  check "docs project registered once a day, not on every hook" '[[ -z "$(ids /v1/projects/resolve)" ]]'
+  printf '{"projectId":"%s","name":"t","docsProjectId":"not-a-uuid"}\n' "$PID_FAKE" > "$r/.chum-mem"
+  rm -f "$r/.chum-cache/sync-state"; : > "$FAKE_STATE/projects.log"
+  hook "$r" "$FAKE_URL" "$p" CHUM_SYNC_REF=HEAD >/dev/null
+  check "an invalid docsProjectId is ignored (docs stay in projectId)" '[[ "$(ids /api/knowledge/repository-sync)" == "$PID_FAKE " ]]'
+}
+
 # ── R3: `chum-quarantine.sh list` never prints a held private key's body ──
 test_quarantine_list_masks_key_body() {
   echo "quarantine_list_masks_key_body"
@@ -745,7 +782,7 @@ test_docs_sync_default_branch() {
   check "snapshot unchanged by the stale checkout" '[[ "$(export_files "$p")" == "docs/a.md " ]]'
 }
 
-ALL="concurrent_append fence_forgery tokenizer docs_relevance_gate deferred_start_replay health_cache docs_only_default quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked token_not_in_argv token_home_with_space machine_prompts_not_recalled tunnel_cause auth_check hook_fix_dialog setup_update dialog_detached docs_sync_default_branch"
+ALL="concurrent_append fence_forgery tokenizer docs_relevance_gate deferred_start_replay health_cache docs_only_default docs_project_id quarantine_list_masks_key_body hung_api_spools health_down_cache quarantine_send_locked token_not_in_argv token_home_with_space machine_prompts_not_recalled tunnel_cause auth_check hook_fix_dialog setup_update dialog_detached docs_sync_default_branch"
 for t in ${*:-$ALL}; do "test_$t"; done
 echo "passed $PASS, failed $FAIL, skipped $SKIP  (scratch: $TMP)"
 [[ "$FAIL" -eq 0 ]]
